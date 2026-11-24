@@ -299,6 +299,95 @@ __attribute__((noreturn)) void _start(void) {
     finish(status);
 }
 
+enum { DATA_LIMIT = 2, PAGE = 4096, PRIVATE_ANON = 0x22, DATA_CAP = 16 * PAGE };
+
+struct limits {
+    word soft, hard;
+};
+
+static long prlimit(const struct limits *new_limit, struct limits *old_limit) {
+    return call(302, 0, DATA_LIMIT, (word)new_limit, (word)old_limit, 0, 0);
+}
+
+static long check_data_limit(void) {
+    struct limits inherited, old, current;
+    const struct limits cap = {DATA_CAP, DATA_CAP};
+    const struct limits lower = {DATA_CAP - PAGE, DATA_CAP};
+    const struct limits invalid = {DATA_CAP, DATA_CAP - PAGE};
+    if (prlimit(0, &inherited) || prlimit(&invalid, 0) != -22 ||
+        prlimit((void *)1, 0) != -14 || prlimit(&cap, &old) ||
+        old.soft != inherited.soft || old.hard != inherited.hard) return 110;
+    if (prlimit(&lower, (void *)1) != -14 || prlimit(0, &current) ||
+        current.soft != lower.soft || current.hard != lower.hard || prlimit(&cap, 0) ||
+        call(97, DATA_LIMIT, (word)&current, 0, 0, 0, 0) ||
+        current.soft != cap.soft || current.hard != cap.hard) return 111;
+    char system[390];
+    if (call(63, (word)system, 0, 0, 0, 0, 0)) return 112;
+    struct limits raised = {DATA_CAP, DATA_CAP + PAGE};
+    if (system[0] == 'M' && prlimit(&raised, 0) != -1) return 112;
+
+    long data = mmap(0, 12 * PAGE, 3, PRIVATE_ANON, -1, 0);
+    if (data < 0 || mmap(0, 3 * PAGE + 1, 3, PRIVATE_ANON, -1, 0) != -12) return 113;
+    long exact = mmap(0, 3 * PAGE, 3, PRIVATE_ANON, -1, 0);
+    if (exact < 0 || munmap(exact, 3 * PAGE) || discard(data, 12 * PAGE) ||
+        mmap(0, 4 * PAGE, 3, PRIVATE_ANON, -1, 0) != -12) return 114;
+    if (mmap(data, 12 * PAGE, 3, PRIVATE_ANON | 0x100000, -1, 0) != -17 ||
+        mmap(data, 12 * PAGE, 3, PRIVATE_ANON | 0x10, -1, 0) != data) return 115;
+
+    long file = open_data();
+    if (file < 0 || mmap(0, 4 * PAGE, 3, 2, file, 0) != -12 ||
+        call(3, file, 0, 0, 0, 0, 0)) return 116;
+    long shared = call(319, (word)"rlimit-test", 0, 0, 0, 0, 0);
+    if (shared < 0 || call(77, shared, 4 * PAGE, 0, 0, 0, 0)) return 117;
+    long shared_map = mmap(0, 4 * PAGE, 3, 1, shared, 0);
+    if (shared_map < 0 || munmap(shared_map, 4 * PAGE) || call(3, shared, 0, 0, 0, 0, 0))
+        return 117;
+
+    long sparse = mmap(0, 8 * PAGE, 0, PRIVATE_ANON, -1, 0);
+    if (sparse < 0 || mprotect(sparse, 8 * PAGE, 3) != -12 || munmap(data, 12 * PAGE) ||
+        mprotect(sparse, 8 * PAGE, 3) || mprotect(sparse, 8 * PAGE, 1)) return 118;
+    data = mmap(0, 12 * PAGE, 3, PRIVATE_ANON, -1, 0);
+    if (data < 0 || mprotect(sparse, 8 * PAGE, 3) != -12) return 119;
+
+    long child = call(57, 0, 0, 0, 0, 0, 0);
+    if (!child) {
+        if (prlimit(0, &current) || current.soft != cap.soft || current.hard != cap.hard ||
+            mmap(0, 4 * PAGE, 3, PRIVATE_ANON, -1, 0) != -12)
+            finish(120);
+        static const char path[] = FILE_PATH ".rlimit-exec";
+        const char *const argv[] = {path, 0};
+        if (system[0] == 'M') {
+            const struct limits too_small = {PAGE - 1, DATA_CAP};
+            volatile unsigned char *retained = (void *)data;
+            *retained = 0x5a;
+            if (prlimit(&too_small, 0) || call(59, (word)path, (word)argv, 0, 0, 0, 0) != -12 ||
+                *retained != 0x5a || munmap(data, 12 * PAGE))
+                finish(125);
+        }
+        if (prlimit(&lower, 0)) finish(120);
+        call(59, (word)path, (word)argv, 0, 0, 0, 0);
+        finish(121);
+    }
+    int status;
+    if (child < 0 || call(61, child, (word)&status, 0, 0, 0, 0) != child ||
+        status || prlimit(0, &current) || current.soft != cap.soft || current.hard != cap.hard)
+        return 122;
+    return 0;
+}
+
+__attribute__((noreturn)) void mmap_data_limit(void) {
+    finish(check_data_limit());
+}
+
+__attribute__((noreturn)) void mmap_data_limit_after_exec(void) {
+    struct limits inherited;
+    if (prlimit(0, &inherited) || inherited.soft != DATA_CAP - PAGE || inherited.hard != DATA_CAP)
+        finish(123);
+    if (mmap(0, 14 * PAGE, 3, PRIVATE_ANON, -1, 0) < 0 ||
+        mmap(0, 1, 3, PRIVATE_ANON, -1, 0) != -12) finish(124);
+    finish(0);
+}
+
 __attribute__((noreturn)) void mmap_memfd_nx(void) {
     long fd = call(319, (word)"", 0xb, 0, 0, 0, 0);
     if (fd < 0 || resize_fd(fd, 0x1000)) finish(56);

@@ -23,8 +23,12 @@ struct linux64_reserve_range {
 
 struct linux64_address_space {
     struct linux64_reserve_range reserves[LINUX64_RESERVE_COUNT];
-    uptr root;
+    uptr root, data_bytes;
     unsigned reserve_count, references;
+};
+
+struct linux64_rlimit {
+    u64 soft, hard;
 };
 
 struct linux64_sigaction {
@@ -118,6 +122,7 @@ struct linux64_fs {
 struct linux64_process {
     struct linux64_fd_slot fds[LINUX64_FD_COUNT];
     struct linux64_sigaction actions[LINUX64_SIGNAL_COUNT];
+    struct linux64_rlimit data_limit;
     char executable_path[LINUX64_PATH_LIMIT];
     uptr executable_path_length;
     u64 pid_ns_link_inode, fdinfo_inode, proc_fd_inode;
@@ -206,7 +211,7 @@ long linux64_userns_read(const struct linux64_userns *ns, enum linux64_proc_node
                          uptr buffer, uptr count, uptr offset);
 long linux64_userns_write(struct linux64_userns *ns, enum linux64_proc_node file,
                           uptr buffer, uptr count, uptr offset);
-void linux64_task_init(void);
+void linux64_task_init(uptr data_bytes);
 const struct linux64_process *linux64_process_by_pid(i32 pid);
 u16 linux64_task_count(void);
 void linux64_task_syscall(struct linux64_frame *frame);
@@ -266,7 +271,7 @@ bool linux64_special_node(const char *path, struct linux64_file *file);
 long linux64_proc_fd_entry(i32 owner, const char *name, uptr length, struct linux64_file *file);
 long linux64_user_string(uptr address, char *string, uptr limit);
 long linux64_execve(struct linux64_frame *frame, uptr filename, uptr argv, uptr envp);
-bool linux64_commit_exec(struct linux64_frame *frame, uptr root, uptr entry, uptr stack,
+bool linux64_commit_exec(struct linux64_frame *frame, uptr root, uptr entry, uptr stack, uptr data_bytes,
                         const char *path, uptr path_length);
 long linux64_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2,
                     uptr arg3, uptr arg4, uptr arg5);

@@ -46,17 +46,19 @@ u16 linux64_task_count(void) {
     return count;
 }
 
-void linux64_task_init(void) {
+void linux64_task_init(uptr data_bytes) {
     processes[0] = (struct linux64_process){
         .pid = LINUX64_PID, .sid = LINUX64_PID, .pgid = LINUX64_PID, .threads = 1,
         .pid_ns = linux64_pidns_init(), .pid_identity = linux64_pid_init(),
         .group_identity = linux64_pid_init(), .fs = linux64_initial_fs(),
+        .data_limit = {(u64)-1, (u64)-1},
     };
     linux64_current->tid = LINUX64_PID;
     linux64_current->visible_tid = LINUX64_PID;
     linux64_current->process = &processes[0];
     linux64_current->memory = &address_spaces[0];
     linux64_current->memory->root = paging64_active_root();
+    linux64_current->memory->data_bytes = data_bytes;
     linux64_current->memory->references = 1;
     linux64_current->state = TASK_RUNNABLE;
     xstate_supported = true;
@@ -117,6 +119,7 @@ static struct linux64_address_space *fork_memory(const struct linux64_address_sp
     if (!root) return NULL;
     child->root = root;
     child->references = 1;
+    child->data_bytes = parent->data_bytes;
     child->reserve_count = parent->reserve_count;
     for (unsigned i = 0; i < parent->reserve_count; ++i) child->reserves[i] = parent->reserves[i];
     return child;
@@ -401,7 +404,7 @@ static void complete_vfork(i32 child_pid) {
 }
 
 /* Новый CR3 уже активен, поэтому последнее освобождение старого корня безопасно. */
-bool linux64_commit_exec(struct linux64_frame *frame, uptr root, uptr entry, uptr stack,
+bool linux64_commit_exec(struct linux64_frame *frame, uptr root, uptr entry, uptr stack, uptr data_bytes,
                         const char *path, uptr path_length) {
     if (!xstate_supported) return false;
     struct linux64_task *task = linux64_current;
@@ -412,6 +415,7 @@ bool linux64_commit_exec(struct linux64_frame *frame, uptr root, uptr entry, upt
     if (memory == old) paging64_drop_root(old->root);
     else release_memory(task);
     memory->root = root;
+    memory->data_bytes = data_bytes;
     memory->references = 1;
     memory->reserve_count = 0;
     task->memory = memory;

@@ -33,8 +33,9 @@ enum paging64_protect_result {
 };
 enum paging64_protect_result paging64_protect(uptr start, uptr end, bool accessible,
                                              bool writable, bool executable,
-                                             uptr (*reserved_end)(uptr));
+                                             uptr (*reserved_end)(uptr), uptr *data_bytes, u64 data_limit);
 uptr paging64_first_mapped(uptr start, uptr end);
+uptr paging64_data_bytes(uptr start, uptr end);
 bool paging64_remove_mmap(uptr start, uptr end);
 enum paging64_discard_result {
     PAGING64_DISCARD_OK,

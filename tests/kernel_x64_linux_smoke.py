@@ -177,6 +177,20 @@ def check_mmap(build):
     assert ('vector=0x000000000000000e error=0x0000000000000015' in serial and
             'cr2=0x0000001000000000 cpl=3' in serial), serial
     print('OVMF: mmap, memfd, mprotect, MADV_DONTNEED, RELRO and Linux futex wake: PASS', flush=True)
+    limits = bytearray(elf)
+    struct.pack_into('<Q', limits, 24, symbols['mmap_data_limit'])
+    after_exec = bytearray(elf)
+    struct.pack_into('<Q', after_exec, 24, symbols['mmap_data_limit_after_exec'])
+    limits_host = build / 'linux-mmap-data-limit.elf'
+    exec_host = pathlib.Path(str(data) + '.rlimit-exec')
+    for path, payload in ((limits_host, limits), (exec_host, after_exec)):
+        path.write_bytes(payload)
+        path.chmod(0o755)
+    host = subprocess.run([str(limits_host.resolve())], env={}, capture_output=True, timeout=5)
+    assert (host.returncode, host.stdout, host.stderr) == (0, b'', b''), host
+    check_guest('mmap-data-limit', limits, 'Linux x86-64 exit status=0x00',
+                files={**files, exec_host: after_exec})
+    print('OVMF: RLIMIT_DATA, virtual mappings and inheritance across fork and execve: PASS', flush=True)
     sysinfo = bytearray(elf)
     struct.pack_into('<Q', sysinfo, 24, symbols['check_sysinfo'])
     check_guest('sysinfo', sysinfo, 'Linux x86-64 exit status=0x00')
