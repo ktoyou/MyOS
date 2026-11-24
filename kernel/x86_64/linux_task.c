@@ -348,22 +348,23 @@ static long new_session(void) {
     return task->sid;
 }
 
-static void schedule(struct linux64_frame *frame) {
-    struct linux64_task *old = linux64_current;
-    struct linux64_task *next = NULL;
-    unsigned index = (unsigned)(old - tasks);
+static struct linux64_task *pick_task(const struct linux64_task *current) {
+    unsigned index = (unsigned)(current - tasks);
     for (unsigned i = 1; i <= LINUX64_TASK_COUNT; ++i) {
         struct linux64_task *candidate = &tasks[(index + i) % LINUX64_TASK_COUNT];
-        if (candidate->state != TASK_RUNNABLE) continue;
-        next = candidate;
-        break;
+        if (candidate->state == TASK_RUNNABLE ||
+            (candidate->state == TASK_PIPE_WAIT && linux64_pipe_ready(&candidate->pipe_io)))
+            return candidate;
     }
+    static const char message[] = "Linux x86-64 scheduler has no runnable process\n";
+    for (unsigned i = 0; message[i]; ++i) kernel64_serial_char(message[i]);
+    for (;;) __asm__ volatile("cli; hlt");
+}
+
+static void schedule(struct linux64_frame *frame) {
+    struct linux64_task *old = linux64_current;
+    struct linux64_task *next = pick_task(old);
     if (next == old) return;
-    if (!next) {
-        static const char message[] = "Linux x86-64 scheduler has no runnable process\n";
-        for (unsigned i = 0; message[i]; ++i) kernel64_serial_char(message[i]);
-        for (;;) __asm__ volatile("cli; hlt");
-    }
     bool exited = old->state == TASK_ZOMBIE || old->state == TASK_DEAD;
     if (!exited) {
         old->frame = *frame;
@@ -374,6 +375,15 @@ static void schedule(struct linux64_frame *frame) {
     if (exited) {
         release_memory(old);
         if (old->state == TASK_DEAD) old->state = TASK_FREE;
+    }
+    while (next->state == TASK_PIPE_WAIT) {
+        next->state = TASK_RUNNABLE;
+        next->frame.rax = (u64)linux64_pipe_resume();
+        if (next->state == TASK_RUNNABLE) break;
+        /* Длинная запись могла продвинуться, но снова заполнить трубу. */
+        struct linux64_task *ready = pick_task(next);
+        if (ready->memory != next->memory) paging64_switch_root(ready->memory->root);
+        linux64_current = next = ready;
     }
     restore_state(next);
     if (next->child_tid) {

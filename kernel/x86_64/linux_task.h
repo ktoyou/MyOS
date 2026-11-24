@@ -36,7 +36,13 @@ struct linux64_fd_slot {
 };
 
 enum linux64_task_state {
-    TASK_FREE, TASK_RUNNABLE, TASK_WAITING, TASK_VFORK_WAIT, TASK_ZOMBIE, TASK_DEAD,
+    TASK_FREE, TASK_RUNNABLE, TASK_WAITING, TASK_VFORK_WAIT, TASK_PIPE_WAIT, TASK_ZOMBIE, TASK_DEAD,
+};
+
+struct linux64_pipe_io {
+    struct linux64_pipe *pipe;
+    uptr address, length, transferred;
+    bool write, nonblock;
 };
 
 struct linux64_wait {
@@ -56,6 +62,7 @@ struct linux64_task {
     uptr executable_path_length;
     u64 signal_mask, fs, gs;
     struct linux64_wait wait;
+    struct linux64_pipe_io pipe_io;
     uptr child_tid;
     i32 pid, ppid, sid, pgid, vfork_child, exit_status;
     u16 ds_selector, es_selector, fs_selector, gs_selector;
@@ -71,6 +78,11 @@ void linux64_task_syscall(struct linux64_frame *frame);
 void linux64_retain_files(struct linux64_task *task);
 void linux64_close_files(struct linux64_task *task);
 void linux64_close_on_exec(struct linux64_task *task);
+struct linux64_pipe *linux64_pipe_create(void);
+void linux64_pipe_close(struct linux64_pipe *pipe, bool writer);
+long linux64_pipe_io(struct linux64_pipe *pipe, bool write, bool nonblock, uptr address, uptr length);
+bool linux64_pipe_ready(const struct linux64_pipe_io *io);
+long linux64_pipe_resume(void);
 const struct linux64_file_source *linux64_file_source(void);
 long linux64_user_string(uptr address, char *string, uptr limit);
 long linux64_execve(struct linux64_frame *frame, uptr filename, uptr argv, uptr envp);

@@ -156,6 +156,16 @@ def check_socket(build):
     print('OVMF: AF_UNIX seqpacket, SO_PASSCRED, shutdown and descriptor cleanup: PASS', flush=True)
 
 
+def check_pipe(build):
+    probe = (build / 'linux-pipe.elf').resolve()
+    marker = 'Linux ELF64 pipe probe'
+    host = subprocess.run([str(probe)], env={}, capture_output=True, timeout=5)
+    assert (host.returncode, host.stdout, host.stderr) == (0, (marker + '\n').encode(), b''), host
+    serial = check_guest('pipe', probe.read_bytes(), 'Linux x86-64 exit status=0x00')
+    assert marker in serial, serial
+    print('OVMF: Linux pipes, FIFO, descriptor cleanup and blocking I/O: PASS', flush=True)
+
+
 def check_fork(build):
     probe = (build / 'linux-fork.elf').resolve()
     marker = 'Linux ELF64 fork probe'
@@ -247,6 +257,7 @@ def main():
     check_files(build)
     check_mmap(build)
     check_socket(build)
+    check_pipe(build)
     check_fork(build)
     check_vfork(build)
     check_exec(build)
