@@ -315,8 +315,8 @@ static int check_cpu_clock(void) {
     return 0;
 }
 
-static int check_elapsed_clocks(void) {
-    const unsigned clocks[] = {4, 7};
+static int check_elapsed_clocks(int guest) {
+    const unsigned clocks[] = {4, 7, 6};
     long before[sizeof(clocks) / sizeof(clocks[0])];
     const struct timespec timeout = {0, 20000000};
     volatile unsigned sleeping = 0;
@@ -326,8 +326,11 @@ static int check_elapsed_clocks(void) {
         if (before[i] < 0) return 38;
     }
     if (futex_timed(&sleeping, 0x80, 0, 0, &timeout) != -110) return 38;
-    for (unsigned i = 0; i < sizeof(clocks) / sizeof(clocks[0]); ++i)
-        if (clock_ns(clocks[i]) - before[i] < 10000000) return 38;
+    for (unsigned i = 0; i < sizeof(clocks) / sizeof(clocks[0]); ++i) {
+        long after = clock_ns(clocks[i]);
+        if (after - before[i] < 10000000 ||
+            (guest && clocks[i] == 6 && (before[i] % 1000000 || after % 1000000))) return 38;
+    }
     return 0;
 }
 
@@ -357,7 +360,7 @@ void _start(void) {
     int timed = check_timeout();
     if (!timed) timed = check_timeout_from_other_thread();
     if (!timed) timed = check_cpu_clock();
-    if (!timed) timed = check_elapsed_clocks();
+    if (!timed) timed = check_elapsed_clocks(system[0] == 'M');
     if (timed) finish(231, timed);
     for (int i = 0; i < 10; ++i) {
         int status = check_thread();
