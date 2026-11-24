@@ -19,6 +19,7 @@
 #define PF_X            1u
 #define PF_W            2u
 #define PF_R            4u
+#define AT_SECURE       23u
 #define AT_RANDOM       25u
 
 enum { ENOENT = 2, EIO = 5, E2BIG = 7, ENOEXEC = 8, ENOMEM = 12, EFAULT = 14,
@@ -205,10 +206,11 @@ static uptr make_stack(const struct elf_image *main, u64 interp_bias, const u64 
     vectors[used++] = 0;
     u32 uid = linux64_visible_id(ns, false, LINUX64_UID);
     u32 gid = linux64_visible_id(ns, true, LINUX64_GID);
+    /* execve сохраняет UID/GID и не выдаёт полномочия из метаданных файла. */
     const u64 auxv[] = {
         3, main->phdr, 4, main->header->phentsize, 5, main->header->phnum, 6, PMM_PAGE_SIZE,
         7, interp_bias, 9, main->entry, 11, uid, 12, uid,
-        13, gid, 14, gid, AT_RANDOM, random_address, 31, execfn_address, 0, 0,
+        13, gid, 14, gid, AT_SECURE, 0, AT_RANDOM, random_address, 31, execfn_address, 0, 0,
     };
     uptr vector_size = used * sizeof(*vectors);
     uptr stack = (random_address - sizeof(auxv) - vector_size) & ~15ul;

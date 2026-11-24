@@ -28,10 +28,16 @@ __attribute__((noreturn)) void exec_target(const word *stack, word rcx, word r11
     const word *aux = (const word *)p;
     const char *execfn = 0;
     const unsigned char *random = 0;
+    int secure_present = 0;
     for (; aux[0]; aux += 2) {
+        if (aux[0] == 23) {
+            if (aux[1] || secure_present) finish(48);
+            secure_present = 1;
+        }
         if (aux[0] == 31) execfn = (const char *)aux[1];
         if (aux[0] == 25) random = (const unsigned char *)aux[1];
     }
+    if (!secure_present) finish(48);
     if (!execfn || !equal(execfn, TARGET_PATH) || !random || (word)execfn == stack[1]) finish(34);
     unsigned char entropy = 0;
     for (unsigned i = 0; i < 16; ++i) entropy |= random[i];
