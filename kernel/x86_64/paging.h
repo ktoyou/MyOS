@@ -14,6 +14,7 @@ const u8 *paging64_user_read(uptr address);
 uptr paging64_copy_to_user(uptr address, const void *source, uptr length);
 bool paging64_put_user_u64(uptr address, u64 value);
 bool paging64_range_free(uptr start, uptr end);
+bool paging64_protect(uptr start, uptr end, bool accessible, bool writable, bool executable);
 uptr paging64_find_free(uptr start, uptr end, uptr length);
 bool paging64_map_private(uptr start, uptr end, const u8 *source, uptr file_bytes,
                           bool anonymous, bool accessible, bool writable, bool executable);

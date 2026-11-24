@@ -182,6 +182,33 @@ static void set_alias_write(uptr root, uptr physical, bool writable) {
     invalidate(direct);
 }
 
+bool paging64_protect(uptr start, uptr end, bool accessible, bool writable, bool executable) {
+    if (start < 0x400000ul || end > X64_USER_TOP || start >= end ||
+        ((start | end) & (PMM_PAGE_SIZE - 1)) || (writable && executable)) return false;
+    uptr root = active_root();
+    for (uptr address = start; address < end; address += PMM_PAGE_SIZE) {
+        const u64 *leaf = find_leaf(root, address);
+        if (!leaf || (*leaf != MMAP_OWNED && !((*leaf & USER) && (*leaf & ADDRESS_MASK))))
+            return false;
+    }
+    for (uptr address = start; address < end; address += PMM_PAGE_SIZE) {
+        u64 *leaf = find_leaf(root, address);
+        uptr physical = *leaf & ADDRESS_MASK;
+        /* Метка страницы за EOF сохраняет диапазон, но у неё нет данных. */
+        if (!physical) continue;
+        u64 value = (*leaf & ~(PRESENT | WRITE | NO_EXECUTE)) |
+                    (accessible ? PRESENT : 0) | (writable ? WRITE : 0) |
+                    (executable ? 0 : NO_EXECUTE);
+        if (value == *leaf) continue;
+        if (!writable) set_alias_write(root, physical, false);
+        *leaf = value;
+        invalidate(address);
+        /* Старое исполняемое отображение уже недоступно через TLB. */
+        if (writable) set_alias_write(root, physical, true);
+    }
+    return true;
+}
+
 /* Страницы и таблицы резервируются до замены старых отображений. */
 bool paging64_map_private(uptr start, uptr end, const u8 *source, uptr file_bytes,
                           bool anonymous, bool accessible, bool writable, bool executable) {

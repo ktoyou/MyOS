@@ -84,6 +84,7 @@ long linux64_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2,
                     uptr arg3, uptr arg4, uptr arg5) {
     if (number == 1) return linux_write(arg0, arg1, arg2);
     if (number == 9) return linux64_mmap(arg0, arg1, (u32)arg2, (u32)arg3, (i32)arg4, arg5);
+    if (number == 10) return linux64_mprotect(arg0, arg1, arg2);
     if (number == 158) return linux_arch_prctl((i32)arg0, arg1);
     if (number == 60) {
         static const char message[] = "Linux x86-64 exit status=0x";
