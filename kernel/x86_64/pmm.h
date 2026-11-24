@@ -18,6 +18,7 @@ uptr pmm64_alloc(void);
 bool pmm64_retain(uptr physical);
 bool pmm64_has_aliases(uptr physical);
 bool pmm64_free(uptr physical);
+void pmm64_page_counts(u32 *total, u32 *free);
 /* Только для физических страниц под управлением аллокатора. */
 void *pmm64_pointer(uptr physical);
 void pmm64_use_direct_map(void);

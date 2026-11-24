@@ -33,6 +33,16 @@ extern __attribute__((noreturn)) void linux64_task_resume(struct linux64_frame *
 _Static_assert(sizeof(struct linux64_frame) == 20 * sizeof(u64), "Linux syscall frame size");
 _Static_assert(__builtin_offsetof(struct linux64_frame, rip) == 15 * sizeof(u64), "Linux IRET frame");
 
+u16 linux64_task_count(void) {
+    u16 count = 0;
+    for (unsigned i = 0; i < LINUX64_TASK_COUNT; ++i) {
+        const struct linux64_process *process = &processes[i];
+        /* Завершённый процесс учитывается, пока родитель не забрал его статус. */
+        if (process->pid) count += process->threads ? process->threads : 1;
+    }
+    return count;
+}
+
 void linux64_task_init(void) {
     processes[0] = (struct linux64_process){
         .pid = LINUX64_PID, .sid = LINUX64_PID, .pgid = LINUX64_PID, .threads = 1, .umask = 022,

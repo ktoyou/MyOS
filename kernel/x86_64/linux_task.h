@@ -146,6 +146,7 @@ long linux64_userns_read(const struct linux64_userns *ns, enum linux64_proc_node
 long linux64_userns_write(struct linux64_userns *ns, enum linux64_proc_node file,
                           uptr buffer, uptr count, uptr offset);
 void linux64_task_init(void);
+u16 linux64_task_count(void);
 void linux64_task_syscall(struct linux64_frame *frame);
 void linux64_retain_files(struct linux64_process *process);
 void linux64_close_files(struct linux64_process *process);

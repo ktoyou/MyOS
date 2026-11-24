@@ -363,3 +363,48 @@ __attribute__((noreturn)) void mprotect_sparse_oom(void) {
         munmap(base, size)) finish(29);
     finish(0);
 }
+
+__attribute__((noreturn)) void check_sysinfo(void) {
+    enum { PAGE = 4096, SIZE = 16 * PAGE };
+    long area = mmap(0, 2 * PAGE, 3, 0x22, -1, 0);
+    if (area < 0) finish(62);
+    unsigned char *bytes = (void *)area;
+    word *info = (void *)(bytes + PAGE - 56);
+    for (unsigned i = PAGE - 57; i <= PAGE + 56; ++i) bytes[i] = 0xa5;
+    if (call(99, (word)info, 0, 0, 0, 0, 0) || bytes[PAGE - 57] != 0xa5 ||
+        bytes[PAGE + 56] != 0xa5 || !info[4] || !info[5] || info[5] > info[4] ||
+        info[4] % PAGE || info[5] % PAGE || info[10] != 1 || info[13] != 1)
+        finish(63);
+    for (unsigned i = 1; i <= 12; ++i)
+        if (i != 4 && i != 5 && i != 10 && info[i]) finish(64);
+    if (call(99, 0, 0, 0, 0, 0, 0) != -14 || mprotect(area + PAGE, PAGE, 0) ||
+        call(99, (word)info, 0, 0, 0, 0, 0) != -14 || mprotect(area + PAGE, PAGE, 3))
+        finish(65);
+
+    word before[2], after[2];
+    if (call(228, 1, (word)before, 0, 0, 0, 0) ||
+        call(99, (word)info, 0, 0, 0, 0, 0) ||
+        call(228, 1, (word)after, 0, 0, 0, 0) ||
+        info[0] < before[0] + (before[1] != 0) ||
+        info[0] > after[0] + (after[1] != 0)) finish(66);
+    word uptime = info[0], total = info[4], free = info[5];
+    long allocation = mmap(0, SIZE, 3, 0x22, -1, 0);
+    if (allocation < 0) finish(67);
+    volatile unsigned char *memory = (void *)allocation;
+    for (unsigned i = 0; i < SIZE; i += PAGE) memory[i] = 1;
+    if (call(99, (word)info, 0, 0, 0, 0, 0) || info[4] != total ||
+        free < SIZE || info[5] > free - SIZE || info[0] < uptime) finish(68);
+    word allocated = info[5];
+    if (munmap(allocation, SIZE) || call(99, (word)info, 0, 0, 0, 0, 0) ||
+        info[4] != total || info[5] < allocated + SIZE || info[5] > free) finish(69);
+
+    long child = call(57, 0, 0, 0, 0, 0, 0);
+    if (!child) finish(0);
+    word status[16];
+    if (child < 0 || call(99, (word)info, 0, 0, 0, 0, 0) || info[10] != 2 ||
+        call(247, 1, child, (word)status, 0x01000004, 0, 0) ||
+        call(99, (word)info, 0, 0, 0, 0, 0) || info[10] != 2 ||
+        call(61, child, 0, 0, 0, 0, 0) != child ||
+        call(99, (word)info, 0, 0, 0, 0, 0) || info[10] != 1) finish(70);
+    finish(0);
+}
