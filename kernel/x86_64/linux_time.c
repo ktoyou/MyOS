@@ -5,6 +5,11 @@
 #define PIT_COUNT 59659u
 #define NS_PER_SECOND 1000000000ul
 
+enum {
+    CLOCK_REALTIME = 0, CLOCK_MONOTONIC = 1, CLOCK_THREAD_CPUTIME_ID = 3,
+    CLOCK_MONOTONIC_RAW = 4, CLOCK_BOOTTIME = 7,
+};
+
 static u64 tsc_hz, tsc_start, last_elapsed;
 static long rtc_epoch;
 static u64 rtc_sample_ns;
@@ -168,10 +173,14 @@ long linux64_clock_gettime(i32 clock, uptr address) {
     long seconds;
     u64 nanos;
     switch (clock) {
-    case 0: case 1: /* CLOCK_REALTIME, CLOCK_MONOTONIC */
-        if (!linux64_clock_sample(clock == 0, &seconds, &nanos)) return -5;
+    case CLOCK_REALTIME:
+    case CLOCK_MONOTONIC:
+    case CLOCK_MONOTONIC_RAW:
+    case CLOCK_BOOTTIME:
+        /* Ядро не корректирует ход монотонных часов и не поддерживает системный сон. */
+        if (!linux64_clock_sample(clock == CLOCK_REALTIME, &seconds, &nanos)) return -5;
         break;
-    case 3: /* CLOCK_THREAD_CPUTIME_ID */
+    case CLOCK_THREAD_CPUTIME_ID:
         if (!linux64_task_cpu_ns(&nanos)) return -5;
         seconds = (long)(nanos / NS_PER_SECOND);
         nanos %= NS_PER_SECOND;

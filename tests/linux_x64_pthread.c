@@ -315,6 +315,22 @@ static int check_cpu_clock(void) {
     return 0;
 }
 
+static int check_elapsed_clocks(void) {
+    const unsigned clocks[] = {4, 7};
+    long before[sizeof(clocks) / sizeof(clocks[0])];
+    const struct timespec timeout = {0, 20000000};
+    volatile unsigned sleeping = 0;
+    for (unsigned i = 0; i < sizeof(clocks) / sizeof(clocks[0]); ++i) {
+        if (clock_time(clocks[i], (void *)1) != -14) return 38;
+        before[i] = clock_ns(clocks[i]);
+        if (before[i] < 0) return 38;
+    }
+    if (futex_timed(&sleeping, 0x80, 0, 0, &timeout) != -110) return 38;
+    for (unsigned i = 0; i < sizeof(clocks) / sizeof(clocks[0]); ++i)
+        if (clock_ns(clocks[i]) - before[i] < 10000000) return 38;
+    return 0;
+}
+
 static int check_process_exit(int test_mode) {
     long child = simple(57, 0);
     if (child < 0) return 11;
@@ -341,6 +357,7 @@ void _start(void) {
     int timed = check_timeout();
     if (!timed) timed = check_timeout_from_other_thread();
     if (!timed) timed = check_cpu_clock();
+    if (!timed) timed = check_elapsed_clocks();
     if (timed) finish(231, timed);
     for (int i = 0; i < 10; ++i) {
         int status = check_thread();
