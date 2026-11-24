@@ -5,7 +5,7 @@
 
 #define X64_USER_TOP 0x0000800000000000ul
 
-bool paging64_init(const struct boot_info *boot);
+bool paging64_init(const struct boot_info *boot, const struct gop64_framebuffer *fb);
 uptr paging64_active_root(void);
 void paging64_switch_root(uptr root);
 uptr paging64_fork_root(void);

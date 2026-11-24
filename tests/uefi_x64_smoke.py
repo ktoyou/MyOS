@@ -31,7 +31,8 @@ def test_disk(image, payload, kernel_end, live_root_header):
         disk.truncate(512 * (ROOT_START + root_sectors))
 
 
-def boot_x64(directory, name, payload, kernel_end, markers, *, live_root_header=None, cpu='max', rtc=None):
+def boot_x64(directory, name, payload, kernel_end, markers, *, live_root_header=None, cpu='max', rtc=None,
+             screenshot=None):
     image = directory / 'disk.img'
     test_disk(image, payload, kernel_end, live_root_header)
     args = uefi_firmware(directory, name) + [
@@ -46,6 +47,8 @@ def boot_x64(directory, name, payload, kernel_end, markers, *, live_root_header=
         vm.wait('UEFI: leaving boot services, entering x86-64 kernel')
         for marker in markers:
             vm.wait(marker)
+        if screenshot is not None:
+            vm.qmp('screendump', {'filename': str(screenshot.resolve())})
         return clean(vm.log)
     finally:
         vm.stop()

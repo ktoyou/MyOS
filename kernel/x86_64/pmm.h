@@ -13,7 +13,8 @@ struct boot_region {
 };
 
 /* Однократная инициализация из проверенной карты до запуска других CPU. */
-bool pmm64_init(const struct boot_info *boot);
+struct gop64_framebuffer;
+bool pmm64_init(const struct boot_info *boot, const struct gop64_framebuffer *fb);
 uptr pmm64_alloc(void);
 bool pmm64_retain(uptr physical);
 bool pmm64_has_aliases(uptr physical);

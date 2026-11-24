@@ -1,4 +1,5 @@
 #include "paging.h"
+#include "framebuffer.h"
 #include "segments.h"
 #ifdef X64_TEST_LINUX
 #include "linux.h"
@@ -16,10 +17,13 @@
 #endif
 
 #ifdef X64_TEST_PMM
-extern bool pmm64_check(const struct boot_info *boot);
+extern bool pmm64_check(const struct boot_info *boot, const struct gop64_framebuffer *fb);
 #endif
-#ifdef X64_TEST_RING3
+#if defined(X64_TEST_RING3) || defined(X64_TEST_GOP)
 extern bool ring3_check(unsigned mode);
+#endif
+#ifdef X64_TEST_GOP
+extern bool gop64_check(const struct boot_info *boot, const struct gop64_framebuffer *fb);
 #endif
 
 struct idt_gate {
@@ -333,22 +337,35 @@ __attribute__((noreturn)) void kernel64_main(const struct boot_info *boot, u32 e
         halt();
     }
     serial_puts("MyOS x86-64: UEFI memory map verified, IDT active\n");
-    if (!pmm64_init(boot)) {
+    struct gop64_framebuffer fb;
+    if (!gop64_from_boot(boot, &fb)) {
+        serial_puts("MyOS x86-64: invalid GOP framebuffer\n");
+        halt();
+    }
+    if (!pmm64_init(boot, &fb)) {
         serial_puts("MyOS x86-64: no free physical pages\n");
         halt();
     }
     serial_puts("MyOS x86-64: physical pages ready\n");
 #ifdef X64_TEST_PMM
-    if (!pmm64_check(boot)) serial_puts("x86-64 PMM FAIL\n");
+    if (!pmm64_check(boot, &fb)) serial_puts("x86-64 PMM FAIL\n");
     else if (boot->root_bytes) serial_puts("x86-64 PMM live PASS\n");
     else serial_puts("x86-64 PMM disk PASS\n");
 #else
-    if (!paging64_init(boot)) {
+    if (!paging64_init(boot, &fb)) {
         serial_puts("MyOS x86-64: cannot activate kernel page tables\n");
         halt();
     }
     serial_puts("MyOS x86-64: kernel CR3 active\n");
     segments64_init();
+#ifdef X64_TEST_GOP
+    if (!gop64_check(boot, &fb)) {
+        serial_puts("x86-64 GOP frame FAIL\n");
+        halt();
+    }
+    serial_puts("x86-64 GOP frame PASS\n");
+    if (!ring3_check(4)) serial_puts("x86-64 ring3 FAIL\n");
+#endif
 #if X64_TEST_EXCEPTION == 6
     __asm__ volatile("ud2");
 #elif X64_TEST_EXCEPTION == 13

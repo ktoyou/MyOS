@@ -1,4 +1,5 @@
 #include "pmm.h"
+#include "framebuffer.h"
 
 #define PAGE_COUNT    (BOOT_MEMORY_LIMIT / PMM_PAGE_SIZE)
 #define BITMAP_WORDS  (PAGE_COUNT / 64)
@@ -37,7 +38,7 @@ static void reserve(u64 start, u64 end) {
         available[page / 64] &= ~page_bit(page);
 }
 
-bool pmm64_init(const struct boot_info *boot) {
+bool pmm64_init(const struct boot_info *boot, const struct gop64_framebuffer *fb) {
     const struct boot_region *map = (const void *)(uptr)boot->map_phys;
     for (u32 i = 0; i < BITMAP_WORDS; ++i) available[i] = 0;
     for (u32 i = 0; i < PAGE_COUNT; ++i) references[i] = 0;
@@ -53,7 +54,7 @@ bool pmm64_init(const struct boot_info *boot) {
     /* В арене работают стек, GDT и текущие таблицы страниц. */
     reserve(boot->arena_phys, (u64)boot->arena_phys + boot->arena_bytes);
     reserve(boot->root_phys, (u64)boot->root_phys + boot->root_bytes);
-    reserve(boot->fb_phys, (u64)boot->fb_phys + (u64)boot->pitch * boot->height);
+    reserve(fb->physical, fb->physical + fb->page_bytes);
     free_pages = 0;
     for (u32 i = 0; i < BITMAP_WORDS; ++i)
         for (u64 bits = available[i]; bits; bits &= bits - 1) ++free_pages;
