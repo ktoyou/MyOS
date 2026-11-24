@@ -197,6 +197,120 @@ static int check_eventfd_blocking(void) {
     return 0;
 }
 
+struct epoll_event {
+    unsigned events;
+    word data;
+} __attribute__((packed));
+
+enum { ADD = 1, DEL = 2, MOD = 3, ONESHOT = 1u << 30 };
+
+static long epoll_ctl(int epoll, int op, int fd, struct epoll_event *event) {
+    return call(233, epoll, op, fd, (word)event);
+}
+
+static long epoll_wait(int epoll, struct epoll_event *events, int count, int timeout) {
+    return call(232, epoll, (word)events, count, (word)timeout);
+}
+
+static int check_epoll(void) {
+    struct epoll_event event = {IN | ONESHOT, 0x1234567800000001ul}, out[2];
+    long epoll = call(291, 0x80000, 0, 0, 0), wake = call(290, 0, 0x800, 0, 0);
+    long regular = call(319, (word)"", 0, 0, 0);
+    if (epoll < 3 || wake < 3 || regular < 3 || call(72, epoll, 1, 0, 0) != 1 ||
+        call(291, 1, 0, 0, 0) != -22 || call(213, 0, 0, 0, 0) != -22 ||
+        epoll_ctl(epoll, ADD, regular, &event) != -1 || close_fd(regular) ||
+        epoll_ctl(epoll, ADD, epoll, &event) != -22 || epoll_ctl(epoll, MOD, wake, &event) != -2 ||
+        epoll_ctl(epoll, ADD, wake, 0) != -14 || epoll_ctl(epoll, ADD, wake, &event) ||
+        epoll_ctl(epoll, ADD, wake, &event) != -17 || epoll_wait(epoll, out, 0, 0) != -22 ||
+        epoll_wait(-1, out, 1, 0) != -9 || epoll_wait(wake, out, 1, 0) != -22) return 46;
+    struct pollfd ready = {epoll, IN | OUT, 0};
+    if (poll(&ready, 1, 0) || epoll_wait(epoll, out, 2, 0) || event_write(wake, 1) != 8 ||
+        poll(&ready, 1, 0) != 1 || ready.revents != IN ||
+        epoll_wait(epoll, (struct epoll_event *)1, 1, 0) != -14 ||
+        epoll_wait(epoll, out, 2, 0) != 1 || out[0].events != IN || out[0].data != event.data ||
+        epoll_wait(epoll, out, 1, 0) || poll(&ready, 1, 0)) return 47;
+    event.data = 0xabcdef0198765432ul;
+    if (epoll_ctl(epoll, MOD, wake, &event) || epoll_wait(epoll, out, 1, 0) != 1 ||
+        out[0].events != IN || out[0].data != event.data || epoll_ctl(epoll, DEL, wake, 0) ||
+        epoll_ctl(epoll, DEL, wake, 0) != -2 || close_fd(wake) || close_fd(epoll)) return 48;
+    return 0;
+}
+
+static int check_epoll_aliases(void) {
+    long epoll = call(213, 1, 0, 0, 0), watched = call(290, 1, 0, 0, 0);
+    if (epoll < 3 || watched < 3) return 49;
+    long alias = call(32, watched, 0, 0, 0);
+    struct epoll_event event = {IN, 1}, out[2];
+    if (alias < 3 || epoll_ctl(epoll, ADD, watched, &event) || close_fd(watched)) return 49;
+    long reused = call(290, 1, 0, 0, 0);
+    event.data = 2;
+    if (reused != watched || epoll_ctl(epoll, ADD, reused, &event) ||
+        epoll_wait(epoll, out, 1, 0) != 1) return 50;
+    word first = out[0].data;
+    if (epoll_wait(epoll, out, 1, 0) != 1 ||
+        !((first == 1 && out[0].data == 2) || (first == 2 && out[0].data == 1))) return 50;
+    if (close_fd(alias) || epoll_wait(epoll, out, 2, 0) != 1 || out[0].data != 2 ||
+        close_fd(reused) || epoll_wait(epoll, out, 2, 0)) return 51;
+    int ends[2];
+    char byte;
+    if (call(22, (word)ends, 0, 0, 0) || epoll_ctl(epoll, ADD, ends[1], &event) || close_fd(ends[1]) ||
+        call(0, ends[0], (word)&byte, 1, 0) || close_fd(ends[0]) || close_fd(epoll)) return 52;
+    return 0;
+}
+
+static int check_epoll_blocking(void) {
+    long epoll = call(291, 0, 0, 0, 0), wake = call(290, 0, 0, 0, 0);
+    struct epoll_event event = {IN, 1}, out[2];
+    word before[2], after[2];
+    if (epoll < 3 || wake < 3 || epoll_ctl(epoll, ADD, wake, &event) ||
+        call(228, 1, (word)before, 0, 0) || epoll_wait(epoll, out, 2, 20) ||
+        call(228, 1, (word)after, 0, 0) ||
+        (after[0] - before[0]) * 1000000000ul + after[1] - before[1] < 19000000u) return 53;
+    long child = call(57, 0, 0, 0, 0);
+    if (child < 0) return 54;
+    if (!child) finish(poll(0, 0, 20) || event_write(wake, 1) != 8 ? 54 : 0);
+    int status;
+    if (epoll_wait(epoll, out, 2, -1) != 1 || out[0].events != IN || out[0].data != 1 ||
+        call(61, child, (word)&status, 0, 0) != child || status || close_fd(wake)) return 54;
+    int ends[2];
+    if (call(53, 1, 1, 0, (word)ends)) return 55;
+    event = (struct epoll_event){IN | RDHUP, 3};
+    if (epoll_ctl(epoll, ADD, ends[0], &event) || call(48, ends[1], 1, 0, 0) ||
+        epoll_wait(epoll, out, 2, 0) != 1 || out[0].events != (IN | RDHUP) || out[0].data != 3)
+        return 55;
+    event.events = 0;
+    if (epoll_ctl(epoll, MOD, ends[0], &event) || close_fd(ends[1]) ||
+        epoll_wait(epoll, out, 2, 0) != 1 || out[0].events != HUP ||
+        close_fd(ends[0]) || close_fd(epoll)) return 56;
+    return 0;
+}
+
+static int check_epoll_delivery(void) {
+    long epoll = call(291, 0, 0, 0, 0), first = call(290, 1, 0, 0, 0);
+    if (epoll < 3 || first < 3) return 57;
+    long alias = call(32, first, 0, 0, 0), last = call(290, 1, 0, 0, 0);
+    struct epoll_event event = {IN, 1}, out;
+    if (alias < 3 || last < 3 || epoll_ctl(epoll, ADD, first, &event)) return 57;
+    event.data = 2;
+    if (epoll_ctl(epoll, ADD, alias, &event)) return 57;
+    event.data = 3;
+    if (epoll_ctl(epoll, ADD, last, &event) || epoll_wait(epoll, &out, 1, 0) != 1 || out.data != 1 ||
+        epoll_wait(epoll, &out, 1, 0) != 1 || out.data != 2 || epoll_ctl(epoll, DEL, alias, 0) ||
+        epoll_wait(epoll, &out, 1, 0) != 1 || out.data != 3 || close_fd(alias)) return 58;
+
+    event.events = IN | ONESHOT;
+    if (epoll_ctl(epoll, MOD, last, &event)) return 59;
+    event.data = 1;
+    if (epoll_ctl(epoll, MOD, first, &event)) return 59;
+    word split = (word)(pages + 4096);
+    struct epoll_event *pair = (void *)(split - sizeof(*pair));
+    if (call(10, split, 4096, 0, 0) || epoll_wait(epoll, pair, 2, 0) != 1 ||
+        call(10, split, 4096, 3, 0) || epoll_wait(epoll, &out, 1, 0) != 1 ||
+        !((pair->data == 1 && out.data == 3) || (pair->data == 3 && out.data == 1)) ||
+        epoll_wait(epoll, &out, 1, 0) || close_fd(last) || close_fd(first) || close_fd(epoll)) return 59;
+    return 0;
+}
+
 static long ppoll(struct pollfd *fds, unsigned count, long *timeout, const word *mask) {
     return call5(271, (word)fds, count, (word)timeout, (word)mask, sizeof(*mask));
 }
@@ -270,6 +384,10 @@ void _start(void) {
     if (!error) error = check_ppoll();
     if (!error) error = check_eventfd();
     if (!error) error = check_eventfd_blocking();
+    if (!error) error = check_epoll();
+    if (!error) error = check_epoll_aliases();
+    if (!error) error = check_epoll_blocking();
+    if (!error) error = check_epoll_delivery();
     if (error) finish(error);
     static const char marker[] = "Linux ELF64 poll probe\n";
     if (call(1, 1, (word)marker, sizeof(marker) - 1, 0) != sizeof(marker) - 1) finish(26);

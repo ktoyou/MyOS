@@ -19,6 +19,9 @@ enum {
     F_SEAL_SEAL = 1, F_SEAL_SHRINK = 2, F_SEAL_GROW = 4, F_SEAL_EXEC = 0x20,
     MFD_CLOEXEC = 1, MFD_ALLOW_SEALING = 2, MFD_NOEXEC_SEAL = 8,
     EFD_SEMAPHORE = 1,
+    EPOLL_ADD = 1, EPOLL_DEL = 2, EPOLL_MOD = 3,
+    EPOLL_EXCLUSIVE = 1u << 28, EPOLL_WAKEUP = 1u << 29,
+    EPOLL_ONESHOT = 1u << 30, EPOLL_ET = 1u << 31,
     MEMFD_NAME_LIMIT = 249, MEMFD_CHUNKS = 128,
     FRAMES_PER_CHUNK = PMM_PAGE_SIZE / sizeof(uptr),
     FD_COUNT = LINUX64_FD_COUNT, OPEN_FILE_COUNT = LINUX64_TASK_COUNT * FD_COUNT,
@@ -27,7 +30,7 @@ enum {
 enum file_kind {
     FILE_REGULAR, FILE_SOCKET, FILE_PIPE, FILE_PROC_DIR, FILE_PROC_MAP, FILE_NULL, FILE_SERIAL,
     FILE_NAMESPACE, FILE_PROC_LINK, FILE_DIRECTORY, FILE_SYMLINK, FILE_NAMED_SOCKET, FILE_URANDOM,
-    FILE_EVENTFD,
+    FILE_EVENTFD, FILE_EPOLL,
 };
 #define EVENTFD_MAX ((u64)-2)
 static const struct linux64_file null_file = {.inode = 1};
@@ -58,6 +61,22 @@ static u64 next_pid_ns_link_inode = 1ull << 33;
 static u64 next_fdinfo_inode = 1ull << 34;
 static u64 next_proc_fd_inode = 1ull << 35;
 
+struct epoll_event {
+    u32 events;
+    u64 data;
+} __attribute__((packed));
+
+_Static_assert(sizeof(struct epoll_event) == 12 && __builtin_offsetof(struct epoll_event, data) == 4,
+               "Linux x86-64 epoll_event");
+
+struct epoll_watch {
+    struct epoll_watch *next;
+    struct file_handle *target;
+    struct epoll_event event;
+    i32 fd;
+    bool armed;
+};
+
 static struct file_handle {
     struct linux64_file file;
     struct memfd *memfd;
@@ -71,9 +90,10 @@ static struct file_handle {
     bool serial;
     uptr directory_path;
     uptr offset;
+    struct epoll_watch *watches, *epoll_next;
     u64 event_count;
     u32 flags;
-    unsigned references;
+    unsigned references, watched_by;
     bool event_semaphore;
 } open_files[OPEN_FILE_COUNT];
 
@@ -84,6 +104,8 @@ static struct file_handle *file_at(i32 fd) {
 _Static_assert(sizeof(struct linux64_pollfd) == 8, "Linux x86-64 pollfd size");
 _Static_assert(__builtin_offsetof(struct linux64_pollfd, revents) == 6, "Linux x86-64 revents");
 
+static bool epoll_ready(const struct file_handle *file);
+
 static u16 file_ready(const struct file_handle *file) {
     if (file->serial) return LINUX64_POLL_WRITE;
     if (file->pipe) return linux64_pipe_poll(file->pipe, (file->flags & O_ACCMODE) == O_WRONLY);
@@ -91,7 +113,20 @@ static u16 file_ready(const struct file_handle *file) {
     if (file->device == FILE_EVENTFD)
         return (file->event_count ? LINUX64_POLLIN : 0) |
                (file->event_count < EVENTFD_MAX ? LINUX64_POLLOUT : 0);
+    if (file->device == FILE_EPOLL)
+        return epoll_ready(file) ? LINUX64_POLLIN | LINUX64_POLLRDNORM : 0;
     return LINUX64_POLL_READ | LINUX64_POLL_WRITE;
+}
+
+static u16 epoll_watch_ready(const struct epoll_watch *watch) {
+    if (!watch->armed) return 0;
+    return file_ready(watch->target) & (watch->event.events | LINUX64_POLLERR | LINUX64_POLLHUP);
+}
+
+static bool epoll_ready(const struct file_handle *file) {
+    for (const struct epoll_watch *watch = file->watches; watch; watch = watch->next)
+        if (epoll_watch_ready(watch)) return true;
+    return false;
 }
 
 static u16 poll_fd(const struct linux64_process *process, i32 fd, u16 events) {
@@ -258,8 +293,29 @@ static void memfd_trim(struct memfd *memfd, uptr first, uptr end) {
     }
 }
 
+static void epoll_remove(struct file_handle *epoll, struct epoll_watch **link) {
+    struct epoll_watch *watch = *link;
+    *link = watch->next;
+    if (epoll->epoll_next == watch) epoll->epoll_next = watch->next;
+    --watch->target->watched_by;
+    pmm64_free((uptr)watch - (uptr)pmm64_pointer(0));
+}
+
+static void epoll_remove_target(struct file_handle *target) {
+    /* Регистрация не удерживает файл. Убираем все ссылки до повторного использования слота. */
+    for (unsigned i = 0; i < OPEN_FILE_COUNT && target->watched_by; ++i) {
+        struct file_handle *epoll = &open_files[i];
+        for (struct epoll_watch **link = &epoll->watches; *link;) {
+            if ((*link)->target == target) epoll_remove(epoll, link);
+            else link = &(*link)->next;
+        }
+    }
+}
+
 static void release_file(struct file_handle *file) {
     if (!file || --file->references) return;
+    epoll_remove_target(file);
+    while (file->watches) epoll_remove(file, &file->watches);
     if (file->socket) linux64_socket_close(file->socket);
     if (file->pipe) linux64_pipe_close(file->pipe, (file->flags & O_ACCMODE) == O_WRONLY);
     linux64_userns_release(file->proc_ns);
@@ -291,6 +347,48 @@ void linux64_socket_wait_finish(struct linux64_task *task) {
 void linux64_eventfd_wait_finish(struct linux64_task *task) {
     release_file(task->eventfd_wait.file);
     task->eventfd_wait.file = NULL;
+}
+
+void linux64_epoll_wait_finish(struct linux64_task *task) {
+    release_file(task->epoll_wait.file);
+    task->epoll_wait.file = NULL;
+}
+
+static bool epoll_expired(const struct linux64_epoll_wait *wait) {
+    u64 now;
+    return wait->deadline && linux64_monotonic_ns(&now) && now >= wait->deadline;
+}
+
+bool linux64_epoll_wait_ready(const struct linux64_epoll_wait *wait) {
+    return epoll_ready(wait->file) || epoll_expired(wait);
+}
+
+static long epoll_deliver(const struct linux64_epoll_wait *wait) {
+    struct file_handle *epoll = wait->file;
+    struct epoll_watch *first = epoll->epoll_next ? epoll->epoll_next : epoll->watches;
+    if (!first) return 0;
+    struct epoll_watch *watch = first;
+    unsigned copied = 0;
+    do {
+        u16 ready = epoll_watch_ready(watch);
+        if (ready) {
+            const struct epoll_event event = {.events = ready, .data = watch->event.data};
+            if (paging64_copy_to_user(wait->address + copied * sizeof(event), &event, sizeof(event)) !=
+                sizeof(event)) return copied ? (long)copied : -EFAULT;
+            epoll->epoll_next = watch->next ? watch->next : epoll->watches;
+            if (watch->event.events & EPOLL_ONESHOT) watch->armed = false;
+            if (++copied == wait->maxevents) break;
+        }
+        watch = watch->next ? watch->next : epoll->watches;
+    } while (watch != first);
+    return copied;
+}
+
+long linux64_epoll_resume(void) {
+    const struct linux64_epoll_wait *wait = &linux64_current->epoll_wait;
+    long result = epoll_deliver(wait);
+    if (!result && !epoll_expired(wait)) linux64_current->state = TASK_EPOLL_WAIT;
+    return result;
 }
 
 bool linux64_eventfd_ready(const struct linux64_eventfd_wait *wait) {
@@ -614,6 +712,70 @@ static long linux_eventfd(u32 initial, u32 flags) {
     file->event_semaphore = (flags & EFD_SEMAPHORE) != 0;
     file->file.inode = next_special_inode++;
     return fd;
+}
+
+static long linux_epoll_create(u32 flags) {
+    if (flags & ~O_CLOEXEC) return -EINVAL;
+    long fd = new_handle(NULL, NULL, O_RDWR | flags);
+    if (fd < 0) return fd;
+    struct file_handle *file = file_at((i32)fd);
+    file->device = FILE_EPOLL;
+    file->file.inode = next_special_inode++;
+    return fd;
+}
+
+static long linux_epoll_ctl(i32 fd, i32 operation, i32 target_fd, uptr address) {
+    struct epoll_event event;
+    if ((operation == EPOLL_ADD || operation == EPOLL_MOD) &&
+        paging64_copy_from_user(&event, address, sizeof(event)) != sizeof(event)) return -EFAULT;
+    if (!open_file(fd) || !open_file(target_fd)) return -EBADF;
+    struct file_handle *epoll = file_at(fd), *target = file_at(target_fd);
+    if (!target->pipe && !target->socket && !target->serial &&
+        target->device != FILE_EVENTFD && target->device != FILE_EPOLL)
+        return -EPERM;
+    if (epoll->device != FILE_EPOLL || epoll == target) return -EINVAL;
+    if (target->device == FILE_EPOLL) return -EOPNOTSUPP;
+    if (operation != EPOLL_ADD && operation != EPOLL_MOD && operation != EPOLL_DEL) return -EINVAL;
+    if (operation != EPOLL_DEL && (event.events & (EPOLL_ET | EPOLL_EXCLUSIVE))) return -EOPNOTSUPP;
+    struct epoll_watch **link = &epoll->watches;
+    while (*link && ((*link)->fd != target_fd || (*link)->target != target)) link = &(*link)->next;
+    if (operation == EPOLL_ADD) {
+        if (*link) return -EEXIST;
+        uptr page = pmm64_alloc();
+        if (!page) return -ENOMEM;
+        *link = pmm64_pointer(page);
+        **link = (struct epoll_watch){.target = target, .fd = target_fd};
+        ++target->watched_by;
+    } else if (!*link) return -ENOENT;
+    if (operation == EPOLL_DEL) epoll_remove(epoll, link);
+    else {
+        (*link)->event = event;
+        (*link)->event.events &= ~EPOLL_WAKEUP;
+        (*link)->armed = true;
+    }
+    return 0;
+}
+
+static long linux_epoll_wait(i32 fd, uptr address, i32 maxevents, i32 timeout) {
+    if (maxevents <= 0 || (unsigned)maxevents > ((1u << 31) - 1) / sizeof(struct epoll_event))
+        return -EINVAL;
+    if (address >= X64_USER_TOP || (uptr)maxevents * sizeof(struct epoll_event) > X64_USER_TOP - address)
+        return -EFAULT;
+    if (!open_file(fd)) return -EBADF;
+    struct file_handle *file = file_at(fd);
+    if (file->device != FILE_EPOLL) return -EINVAL;
+    struct linux64_epoll_wait wait = {.file = file, .address = address, .maxevents = (u32)maxevents};
+    if (timeout > 0) {
+        u64 now;
+        if (!linux64_monotonic_ns(&now)) return -EIO;
+        wait.deadline = now + (u64)timeout * 1000000;
+    }
+    long result = epoll_deliver(&wait);
+    if (result || !timeout || epoll_expired(&wait)) return result;
+    ++file->references;
+    linux64_current->epoll_wait = wait;
+    linux64_current->state = TASK_EPOLL_WAIT;
+    return 0;
 }
 
 static long linux_pipe2(uptr address, u32 flags) {
@@ -1198,6 +1360,7 @@ static long device_io(struct file_handle *file, bool write, uptr buffer, uptr co
     /* VFS проверяет диапазон даже у устройства, которое не обращается к буферу. */
     if (buffer >= X64_USER_TOP || count > X64_USER_TOP - buffer) return -EFAULT;
     if (file->device == FILE_EVENTFD) return eventfd_io(file, write, buffer, count);
+    if (file->device == FILE_EPOLL) return -EINVAL;
     if (file->device == FILE_URANDOM) {
         /* Запись требует пула энтропии, которого у источника RDRAND нет. */
         return write ? -ENOSYS : linux64_getrandom(buffer, count, 0);
@@ -1225,7 +1388,7 @@ static long linux_read(i32 fd, uptr buffer, uptr count, uptr offset, bool positi
     if (!open_file(fd)) return -EBADF;
     struct file_handle *handle = file_at(fd);
     if (handle->directory_path) return -EISDIR;
-    if (positioned && handle->device == FILE_EVENTFD) return -ESPIPE;
+    if (positioned && (handle->device == FILE_EVENTFD || handle->device == FILE_EPOLL)) return -ESPIPE;
     if (handle->device) return device_io(handle, false, buffer, count);
     if (handle->serial) return positioned ? -ESPIPE : -EBADF;
     if (handle->pipe) {
@@ -1288,7 +1451,7 @@ static long file_stat(const struct linux64_file *file, const struct memfd *memfd
     } else if (kind == FILE_PIPE) {
         mode = 0010600;
         device = 4;
-    } else if (kind == FILE_EVENTFD) {
+    } else if (kind == FILE_EVENTFD || kind == FILE_EPOLL) {
         mode = 0600;
         device = 10;
     } else if (kind == FILE_PROC_DIR) {
@@ -1435,6 +1598,7 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
         return file_stat(&file, memfd, kind_of(file_at(fd)), arg1);
     case 8: /* lseek */
         if (!open_file(fd)) return -EBADF;
+        if (file_at(fd)->device == FILE_EPOLL) return -ESPIPE;
         if (file_at(fd)->device) return (u32)arg2 <= 4 ? 0 : -EINVAL;
         if (file_at(fd)->proc_node == PROC_FDS) {
             long offset = (long)arg1;
@@ -1452,7 +1616,8 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
     case 18: /* pwrite64 */
         if ((long)arg3 < 0) return -EINVAL;
         if (!open_file(fd)) return -EBADF;
-        if (file_at(fd)->serial || file_at(fd)->socket || file_at(fd)->device == FILE_EVENTFD) return -ESPIPE;
+        if (file_at(fd)->serial || file_at(fd)->socket ||
+            file_at(fd)->device == FILE_EVENTFD || file_at(fd)->device == FILE_EPOLL) return -ESPIPE;
         return file_at(fd)->device ? device_io(file_at(fd), true, arg1, arg2) : -ENOSYS;
     case 21: /* access */
         if ((u32)arg1 & ~7u) return -EINVAL;
@@ -1543,9 +1708,17 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
         return linux_symlink((i32)arg1, arg2, arg0);
     case 267: /* readlinkat */
         return linux_readlink(fd, arg1, arg2, (i32)arg3);
+    case 213: /* epoll_create */
+        return fd > 0 ? linux_epoll_create(0) : -EINVAL;
+    case 232: /* epoll_wait */
+        return linux_epoll_wait(fd, arg1, (i32)arg2, (i32)arg3);
+    case 233: /* epoll_ctl */
+        return linux_epoll_ctl(fd, (i32)arg1, (i32)arg2, arg3);
     case 284: /* eventfd */
     case 290: /* eventfd2 */
         return linux_eventfd((u32)arg0, number == 290 ? (u32)arg1 : 0);
+    case 291: /* epoll_create1 */
+        return linux_epoll_create((u32)arg0);
     case 292: /* dup3 */
         if (((u32)arg2 & ~O_CLOEXEC) || fd == (i32)arg1) return -EINVAL;
         return dup_to(fd, (i32)arg1, (arg2 & O_CLOEXEC) != 0);

@@ -211,7 +211,7 @@ def check_poll(build):
     assert (host.returncode, host.stdout, host.stderr) == (0, (marker + '\n').encode(), b''), host
     serial = check_guest('poll', probe.read_bytes(), 'Linux x86-64 exit status=0x00')
     assert marker in serial, serial
-    print('OVMF: Linux poll, ppoll, and eventfd readiness and blocking wakeup: PASS', flush=True)
+    print('OVMF: Linux poll, ppoll, eventfd and epoll readiness and blocking wakeup: PASS', flush=True)
 
 
 def check_pthread(build):
