@@ -113,14 +113,22 @@ bool paging64_init(const struct boot_info *boot) {
     return active == root && active != previous;
 }
 
-static u64 *find_leaf(uptr root, uptr address) {
+static u64 *find_leaf_span(uptr root, uptr address, uptr *next) {
     u64 *table = pmm64_pointer(root);
     for (int shift = 39; shift > 12; shift -= 9) {
         u64 entry = table[(address >> shift) & 511u];
-        if (!(entry & PRESENT)) return NULL;
+        if (!(entry & PRESENT)) {
+            if (next) *next = (address | ((1ul << shift) - 1)) + 1;
+            return NULL;
+        }
         table = pmm64_pointer(entry & ADDRESS_MASK);
     }
+    if (next) *next = address + PMM_PAGE_SIZE;
     return &table[(address >> 12) & 511u];
+}
+
+static u64 *find_leaf(uptr root, uptr address) {
+    return find_leaf_span(root, address, NULL);
 }
 
 static void invalidate(uptr address) {
@@ -134,22 +142,16 @@ static uptr active_root(void) {
 }
 
 bool paging64_range_free(uptr start, uptr end) {
-    uptr root = active_root();
-    for (uptr page = start; page < end; page += PMM_PAGE_SIZE) {
-        const u64 *leaf = find_leaf(root, page);
-        if (leaf && *leaf) return false;
-    }
-    return true;
+    return paging64_first_mapped(start, end) == end;
 }
 
-uptr paging64_find_free(uptr start, uptr end, uptr length) {
-    uptr root = active_root(), first = start;
-    for (uptr address = start; address < end; address += PMM_PAGE_SIZE) {
-        const u64 *leaf = find_leaf(root, address);
-        if (leaf && *leaf) first = address + PMM_PAGE_SIZE;
-        if (address + PMM_PAGE_SIZE - first == length) return first;
+uptr paging64_first_mapped(uptr start, uptr end) {
+    uptr root = active_root(), next;
+    for (uptr address = start; address < end; address = next) {
+        const u64 *leaf = find_leaf_span(root, address, &next);
+        if (leaf && *leaf) return address;
     }
-    return 0;
+    return end;
 }
 
 static void prune_empty_tables(uptr root, uptr address) {
@@ -182,23 +184,72 @@ static void set_alias_write(uptr root, uptr physical, bool writable) {
     invalidate(direct);
 }
 
-bool paging64_protect(uptr start, uptr end, bool accessible, bool writable, bool executable) {
+static void clear_private(uptr root, uptr start, uptr end, u64 marker) {
+    uptr next, last = 0;
+    for (uptr address = start; address < end; address = next) {
+        u64 *leaf = find_leaf_span(root, address, &next);
+        if (!leaf || !(*leaf & marker)) continue;
+        if (last && (last ^ address) >= 512 * PMM_PAGE_SIZE) prune_empty_tables(root, last);
+        uptr physical = *leaf & ADDRESS_MASK;
+        *leaf = 0;
+        invalidate(address);
+        if (physical) {
+            set_alias_write(root, physical, true);
+            pmm64_free(physical);
+        }
+        last = address;
+    }
+    if (last) prune_empty_tables(root, last);
+}
+
+bool paging64_remove_private(uptr start, uptr end) {
+    uptr root = active_root(), next;
+    for (uptr address = start; address < end; address = next) {
+        const u64 *leaf = find_leaf_span(root, address, &next);
+        if (leaf && *leaf && !(*leaf & MMAP_OWNED)) return false;
+    }
+    clear_private(root, start, end, MMAP_OWNED);
+    return true;
+}
+
+bool paging64_protect(uptr start, uptr end, bool accessible, bool writable, bool executable,
+                      uptr (*reserved_end)(uptr)) {
     if (start < 0x400000ul || end > X64_USER_TOP || start >= end ||
         ((start | end) & (PMM_PAGE_SIZE - 1)) || (writable && executable)) return false;
-    uptr root = active_root();
-    for (uptr address = start; address < end; address += PMM_PAGE_SIZE) {
+    uptr root = active_root(), next;
+    bool needs_backing = false;
+    for (uptr address = start; address < end; address = next) {
+        next = address + PMM_PAGE_SIZE;
         const u64 *leaf = find_leaf(root, address);
-        if (!leaf || (*leaf != MMAP_OWNED && !((*leaf & USER) && (*leaf & ADDRESS_MASK))))
+        if (!leaf || !*leaf) {
+            next = reserved_end(address);
+            if (!next) return false;
+            needs_backing = accessible;
+        } else if (*leaf != MMAP_OWNED && !((*leaf & USER) && (*leaf & ADDRESS_MASK))) {
             return false;
+        }
     }
-    for (uptr address = start; address < end; address += PMM_PAGE_SIZE) {
-        u64 *leaf = find_leaf(root, address);
+    if (needs_backing) {
+        for (uptr address = start; address < end; address += PMM_PAGE_SIZE) {
+            const u64 *leaf = find_leaf(root, address);
+            if (leaf && *leaf) continue;
+            uptr physical = pmm64_alloc();
+            if (physical && map_entry(root, address, physical | MMAP_PENDING | USER)) continue;
+            if (physical) pmm64_free(physical);
+            clear_private(root, start, address, MMAP_PENDING);
+            return false;
+        }
+    }
+    for (uptr address = start; address < end; address = next) {
+        u64 *leaf = find_leaf_span(root, address, &next);
+        if (!leaf) continue;
         uptr physical = *leaf & ADDRESS_MASK;
         /* Метка страницы за EOF сохраняет диапазон, но у неё нет данных. */
         if (!physical) continue;
-        u64 value = (*leaf & ~(PRESENT | WRITE | NO_EXECUTE)) |
+        u64 value = (*leaf & ~(PRESENT | WRITE | NO_EXECUTE | MMAP_PENDING)) |
                     (accessible ? PRESENT : 0) | (writable ? WRITE : 0) |
                     (executable ? 0 : NO_EXECUTE);
+        if (*leaf & MMAP_PENDING) value |= MMAP_OWNED;
         if (value == *leaf) continue;
         if (!writable) set_alias_write(root, physical, false);
         *leaf = value;
@@ -265,13 +316,7 @@ fail:
         physical_list = *(uptr *)pmm64_pointer(physical);
         pmm64_free(physical);
     }
-    for (uptr address = start; address < prepared; address += PMM_PAGE_SIZE) {
-        u64 *leaf = find_leaf(root, address);
-        if (*leaf & MMAP_PENDING) *leaf = 0;
-    }
-    const uptr table_span = 512 * PMM_PAGE_SIZE;
-    for (uptr address = start & ~(table_span - 1); address < prepared; address += table_span)
-        prune_empty_tables(root, address);
+    clear_private(root, start, prepared, MMAP_PENDING);
     return false;
 }
 

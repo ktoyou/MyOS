@@ -24,6 +24,36 @@ static long mprotect(word address, word length, word protection) {
     return call(10, address, length, protection, 0, 0, 0);
 }
 
+static long munmap(word address, word length) {
+    return call(11, address, length, 0, 0, 0, 0);
+}
+
+static long check_sparse(void) {
+    const word size = 0x800000000ul;
+    const word hint = 0x30000000000ul;
+    long base = mmap(hint, size, 0, 0x22, -1, 0);
+    if (base != (long)hint || munmap(base, 0x1000) ||
+        munmap(base + size - 0x1000, 0x1000)) return 21;
+    word middle = base + 0x400002000ul;
+    if (mmap(middle, 0x1000, 0, 0x100022, -1, 0) != -17 ||
+        mprotect(middle, 0x3000, 3)) return 22;
+    volatile unsigned char *items = (void *)middle;
+    if (items[0] || items[0x1000] || items[0x2000]) return 23;
+    items[0] = 0x31;
+    items[0x1000] = 0x42;
+    items[0x2000] = 0x53;
+    if (mprotect(middle + 0x1000, 0x1000, 0) ||
+        mprotect(middle + 0x1000, 0x1000, 3) || items[0x1000] != 0x42) return 24;
+    if (munmap(middle + 0x1000, 0x1000) ||
+        mmap(middle + 0x1000, 0x1000, 3, 0x100022, -1, 0) != (long)(middle + 0x1000) ||
+        items[0] != 0x31 || items[0x1000] || items[0x2000] != 0x53) return 25;
+    if (mmap(middle, 0x1000, 0, 0x32, -1, 0) != (long)middle ||
+        mprotect(middle, 0x1000, 3) || items[0] || items[0x2000] != 0x53) return 26;
+    if (munmap(base, size) ||
+        mmap(base, size, 0, 0x100022, -1, 0) != base || munmap(base, size)) return 27;
+    return 0;
+}
+
 static long check_mprotect(long fd, word file_address) {
     long address = mmap(0, 0x1000, 0, 0x22, -1, 0);
     if (address < 0 || mprotect(address + 1, 0, 1) != -22 || mprotect(address, 0, 1) ||
@@ -74,6 +104,7 @@ static __attribute__((noreturn)) void finish(long status) {
 
 __attribute__((noreturn)) void _start(void) {
     long status = check_mmap();
+    if (!status) status = check_sparse();
     if (!status) {
         static const char message[] = "Linux ELF64 mmap and mprotect probe\n";
         if (call(1, 1, (word)message, sizeof(message) - 1, 0, 0, 0) != sizeof(message) - 1)
@@ -107,4 +138,17 @@ __attribute__((noreturn)) void mprotect_relro_fault(void) {
     if (mprotect((word)relro, sizeof(relro), 1)) finish(19);
     relro[0] = 0;
     finish(20);
+}
+
+__attribute__((noreturn)) void mprotect_sparse_oom(void) {
+    const word size = 0x800000000ul;
+    long base = mmap(0, size, 0, 0x22, -1, 0);
+    if (base < 0 || mprotect(base, 0x1000, 3)) finish(28);
+    volatile unsigned char *data = (void *)base;
+    data[0] = 0x5a;
+    if (mprotect(base, size, 3) != -12 || data[0] != 0x5a ||
+        mmap(base + 0x1000, 0x1000, 3, 0x100022, -1, 0) != -17 ||
+        mprotect(base + 0x1000, 0x1000, 3) || data[0x1000] != 0 ||
+        munmap(base, size)) finish(29);
+    finish(0);
 }
