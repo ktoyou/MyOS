@@ -209,5 +209,6 @@ bool linux64_run(const void *image, uptr size, const struct linux64_file_source 
     uptr stack = make_stack(&main, interpreter.bias, entropy);
     if (!stack || !linux64_enable_syscall()) return false;
     linux64_use_files(source);
+    linux64_clock_init();
     segments64_enter_user(main.interp ? interpreter.entry : main.entry, stack);
 }

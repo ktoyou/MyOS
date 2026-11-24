@@ -23,6 +23,8 @@ long linux64_mprotect(uptr address, uptr length, uptr protection);
 long linux64_munmap(uptr address, uptr length);
 uptr linux64_random_bytes(void *buffer, uptr length);
 long linux64_getrandom(uptr address, uptr length, u32 flags);
+void linux64_clock_init(void);
+long linux64_clock_gettime(i32 clock, uptr address);
 bool linux64_enable_syscall(void);
 void kernel64_serial_char(char ch);
 
