@@ -206,6 +206,50 @@ static long check_null(void) {
     return 0;
 }
 
+static long check_urandom(void) {
+    static const char dev[] = "/dev/urandom";
+    if (call(21, (word)dev, 6, 0, 0) || call(21, (word)dev, 1, 0, 0) != -13 ||
+        call(2, (word)"/dev/urandom/", 0, 0, 0) != -20 ||
+        call(2, (word)dev, 0x10000, 0, 0) != -20 ||
+        call(2, (word)dev, 0xc0, 0600, 0) != -17) return 77;
+    long dir = call(2, (word)"/dev", 0x10000, 0, 0);
+    long rd = call(257, dir, (word)"urandom", 0x80800, 0);
+    long wr = call(2, (word)dev, 1, 0, 0);
+    long flags = call(72, rd, 3, 0, 0);
+    if (dir < 3 || rd < 3 || wr < 3 || call(72, rd, 1, 0, 0) != 1 ||
+        flags < 0 || (flags & 0x803) != 0x800 || call(3, dir, 0, 0, 0) ||
+        call(1, rd, (word)buffer, 1, 0) != -9 ||
+        call(0, wr, (word)buffer, 1, 0) != -9) return 78;
+
+    word stat[18], opened[18], null_stat[18];
+    if (call(6, (word)dev, (word)stat, 0, 0) || call(5, rd, (word)opened, 0, 0) ||
+        call(4, (word)"/dev/null", (word)null_stat, 0, 0) ||
+        (stat[3] & 0170777) != 0020666 || stat[5] != 0x109 || stat[6] || stat[8] ||
+        (stat[0] == null_stat[0] && stat[1] == null_stat[1]) ||
+        opened[0] != stat[0] || opened[1] != stat[1] ||
+        opened[5] != stat[5]) return 79;
+    long dup = call(32, rd, 0, 0, 0);
+    if (dup < 3 || call(72, dup, 1, 0, 0) || call(8, dup, 12, 1, 0) ||
+        call(17, dup, (word)buffer, 1, -1) != -22 ||
+        call(0, dup, 0xffff800000000000ul, 1, 0) != -14 ||
+        call(0, dup, 0, 1, 0) != -14) return 80;
+
+    for (unsigned i = 1; i <= 513; ++i) buffer[i] = 0;
+    buffer[0] = 0x5a;
+    buffer[514] = 0x5a;
+    if (call(0, rd, (word)(buffer + 1), 513, 0) != 513 ||
+        buffer[0] != 0x5a || buffer[514] != 0x5a) return 81;
+    unsigned nonzero = 0;
+    for (unsigned i = 1; i <= 513; ++i) nonzero |= buffer[i];
+    if (!nonzero || call(17, dup, (word)buffer, 33, 12) != 33 ||
+        call(10, (word)(buffer + 4096), 4096, 0, 0) ||
+        call(0, rd, (word)(buffer + 4080), 32, 0) != 16 ||
+        call(10, (word)(buffer + 4096), 4096, 3, 0)) return 81;
+    if (call(3, dup, 0, 0, 0) || call(3, rd, 0, 0, 0) ||
+        call(3, wr, 0, 0, 0)) return 82;
+    return 0;
+}
+
 static long check_dup(void) {
     long rd = call(2, (word)"/dev/null", 0x80000, 0, 0);
     if (rd < 3 || call(33, rd, rd, 0, 0) != rd || call(72, rd, 1, 0, 0) != 1 ||
@@ -425,6 +469,7 @@ __attribute__((noreturn)) void _start(void) {
     if (!status) status = check_ids(118, 102, 107);
     if (!status) status = check_ids(120, 104, 108);
     if (!status) status = check_null();
+    if (!status) status = check_urandom();
     if (!status) status = check_dup();
     if (!status) status = check_directories();
     if (!status) status = check_realtime();
