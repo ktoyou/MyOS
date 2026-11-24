@@ -52,7 +52,7 @@ __attribute__((noreturn)) void linux64_invalid_return(void) {
     for (;;) __asm__ volatile("cli; hlt");
 }
 
-long linux64_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2) {
+long linux64_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg3) {
     if (number == 1) return linux_write(arg0, arg1, arg2);
     if (number == 60) {
         static const char message[] = "Linux x86-64 exit status=0x";
@@ -64,5 +64,5 @@ long linux64_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2) {
         kernel64_serial_char('\n');
         for (;;) __asm__ volatile("cli; hlt");
     }
-    return -38;
+    return linux64_file_syscall(number, arg0, arg1, arg2, arg3);
 }

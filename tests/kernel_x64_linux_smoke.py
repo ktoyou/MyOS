@@ -9,11 +9,20 @@ from kernel_x64_smoke import image
 from uefi_x64_smoke import boot_x64
 
 
-def check_guest(name, elf, marker, *, fault=False, path='', interpreter=b''):
+def linux_root(elf, files):
+    root = bytearray(b'MYOSLX63' + struct.pack('<QQ', len(elf), len(files)))
+    root.extend(elf)
+    for path, contents in files.items():
+        encoded = os.fsencode(path) + b'\0'
+        root.extend(struct.pack('<QQ', len(encoded), len(contents)))
+        root.extend(encoded)
+        root.extend(contents)
+    return root
+
+
+def check_guest(name, elf, marker, *, fault=False, files=None):
     payload, kernel_end = image('kernel-linux')
-    path = os.fsencode(path) + b'\0'
-    root_header = (b'MYOSLX62' + struct.pack('<QQQ', len(elf), len(path), len(interpreter))
-                   + elf + path + interpreter)
+    root_header = linux_root(elf, files or {})
     with tempfile.TemporaryDirectory(prefix='myos-linux-x64-') as temp:
         serial = boot_x64(pathlib.Path(temp), 'x64-linux-' + name, payload,
                           kernel_end, [marker], live_root_header=root_header)
@@ -46,18 +55,18 @@ def check_interpreter(build):
     assert (host.returncode, host.stdout, host.stderr) == (
         42, marker + b'OK', b' Linux ELF64 syscall probe\n'), host
     serial = check_guest('interp', elf, 'Linux x86-64 exit status=0x2a',
-                         path=path, interpreter=interp)
+                         files={path: interp})
     assert 'Linux ELF64 interpreter\nOK Linux ELF64 syscall probe' in serial, serial
     print('OVMF: same PIE and interpreter as Linux: PASS', flush=True)
 
     rejected = 'Linux x86-64 ELF rejected'
-    check_guest('interp-missing', elf, rejected, path=path)
-    check_guest('interp-wrong-path', elf, rejected, path='/missing/loader', interpreter=interp)
-    check_guest('interp-nested', elf, rejected, path=path, interpreter=elf)
+    check_guest('interp-missing', elf, rejected)
+    check_guest('interp-wrong-path', elf, rejected, files={'/missing/loader': interp})
+    check_guest('interp-nested', elf, rejected, files={path: elf})
 
     broken = bytearray(elf)
     broken[path_offset + path_length - 1] = ord('x')
-    check_guest('interp-unterminated', broken, rejected, path=path, interpreter=interp)
+    check_guest('interp-unterminated', broken, rejected, files={path: interp})
 
     # Переносим интерпретатор ET_EXEC туда, где MyOS размещает основной PIE.
     collision = bytearray(interp)
@@ -68,8 +77,19 @@ def check_interpreter(build):
         if struct.unpack_from('<I', interp, p)[0] == 1:
             address = struct.unpack_from('<Q', interp, p + 16)[0]
             struct.pack_into('<Q', collision, p + 16, address + bias)
-    check_guest('interp-overlap', elf, rejected, path=path, interpreter=collision)
+    check_guest('interp-overlap', elf, rejected, files={path: collision})
     print('OVMF: invalid interpreter paths, nesting and overlap: PASS', flush=True)
+
+
+def check_files(build):
+    probe = build / 'linux-files.elf'
+    data = (build / 'linux-interp.elf').absolute()
+    host = subprocess.run([str(probe.resolve())], env={}, capture_output=True, timeout=5)
+    assert (host.returncode, host.stdout, host.stderr) == (0, b'Linux ELF64 files probe\n', b''), host
+    serial = check_guest('files', probe.read_bytes(), 'Linux x86-64 exit status=0x00',
+                         files={data: data.read_bytes()})
+    assert 'Linux ELF64 files probe' in serial, serial
+    print('OVMF: Linux ELF64 file reads, metadata and descriptor errors: PASS', flush=True)
 
 
 def main():
@@ -101,6 +121,7 @@ def main():
             'cr2=0x00007fffffefb000 cpl=3' in serial), serial
     print('OVMF: malformed ELF, noncanonical stack and stack guard: PASS', flush=True)
     check_interpreter(build)
+    check_files(build)
 
 
 if __name__ == '__main__':

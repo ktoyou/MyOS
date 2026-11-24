@@ -1630,11 +1630,11 @@ $(X64_RING3_TESTS:.bin=.elf): $(X64BUILD)/kernel-ring3-%.elf: $(X64_CORE) $(X64B
 	$(LD) -m elf_x86_64 -T kernel/x86_64/linker.ld -nostdlib $(filter %.o,$^) -o $@
 $(X64BUILD)/early-linux.o: kernel/x86_64/early.c kernel/x86_64/linux.h $(X64_HEADERS) | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -DX64_TEST_LINUX -c $< -o $@
-$(X64BUILD)/linux_elf.o $(X64BUILD)/linux_syscall.o: $(X64BUILD)/%.o: kernel/x86_64/%.c kernel/x86_64/linux.h $(X64_HEADERS) | $(X64BUILD)
+$(X64BUILD)/linux_elf.o $(X64BUILD)/linux_syscall.o $(X64BUILD)/linux_file.o: $(X64BUILD)/%.o: kernel/x86_64/%.c kernel/x86_64/linux.h $(X64_HEADERS) | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
 $(X64BUILD)/linux-entry.o: kernel/x86_64/linux_syscall.asm | $(X64BUILD)
 	$(NASM) -f elf64 $< -o $@
-$(X64BUILD)/kernel-linux.elf: $(X64_CORE) $(X64BUILD)/early-linux.o $(X64BUILD)/linux_elf.o $(X64BUILD)/linux_syscall.o $(X64BUILD)/linux-entry.o kernel/x86_64/linker.ld
+$(X64BUILD)/kernel-linux.elf: $(X64_CORE) $(X64BUILD)/early-linux.o $(X64BUILD)/linux_elf.o $(X64BUILD)/linux_syscall.o $(X64BUILD)/linux_file.o $(X64BUILD)/linux-entry.o kernel/x86_64/linker.ld
 	$(LD) -m elf_x86_64 -T kernel/x86_64/linker.ld -nostdlib $(filter %.o,$^) -o $@
 $(X64BUILD)/linux-probe.o: tests/linux_x64_probe.S | $(X64BUILD)
 	$(CC) -m64 -c $< -o $@
@@ -1648,6 +1648,10 @@ $(X64BUILD)/linux-interp.elf: $(X64BUILD)/linux-interp.o
 	$(LD) -m elf_x86_64 -shared -e _start $< -o $@
 $(X64BUILD)/linux-pie.elf: $(X64BUILD)/linux-probe.o $(X64BUILD)/linux-interp.elf
 	$(LD) -m elf_x86_64 -pie --dynamic-linker "$(abspath $(X64BUILD)/linux-interp.elf)" $< -o $@
+$(X64BUILD)/linux-files.o: tests/linux_x64_files.c $(X64BUILD)/linux-interp.elf
+	$(CC) $(X64CFLAGS) -DFILE_PATH='"$(abspath $(X64BUILD)/linux-interp.elf)"' -c $< -o $@
+$(X64BUILD)/linux-files.elf: $(X64BUILD)/linux-files.o
+	$(LD) -m elf_x86_64 -static -no-pie $< -o $@
 $(X64BUILD)/kernel.bin $(X64BUILD)/kernel-6.bin $(X64BUILD)/kernel-13.bin $(X64BUILD)/kernel-pmm.bin $(X64BUILD)/kernel-linux.bin $(X64_PAGING_TESTS) $(X64_RING3_TESTS): %.bin: %.elf
 	$(OBJCOPY) -O binary $< $@
 
@@ -1662,7 +1666,7 @@ kernel-x64-paging-smoke: $(X64_PAGING_TESTS)
 kernel-x64-ring3-smoke: $(X64_RING3_TESTS)
 	python3 tests/kernel_x64_smoke.py --ring3
 .PHONY: kernel-x64-linux-smoke
-kernel-x64-linux-smoke: $(X64BUILD)/kernel-linux.bin $(X64BUILD)/linux-probe.elf $(X64BUILD)/linux-bad-stack.elf $(X64BUILD)/linux-pie.elf
+kernel-x64-linux-smoke: $(X64BUILD)/kernel-linux.bin $(X64BUILD)/linux-probe.elf $(X64BUILD)/linux-bad-stack.elf $(X64BUILD)/linux-pie.elf $(X64BUILD)/linux-files.elf
 	python3 tests/kernel_x64_linux_smoke.py
 
 uefi-smoke: $(HWBUILD)/kernel.bin $(BUILD)/myfs $(BUILD)/ld.so $(BUILD)/user/libc.so $(addprefix $(BUILD)/user/,sh cat stat poweroff sync)
