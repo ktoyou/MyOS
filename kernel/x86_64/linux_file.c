@@ -11,16 +11,16 @@ enum {
     O_NOCTTY = 0x100, O_TRUNC = 0x200, O_APPEND = 0x400, O_NONBLOCK = 0x800,
     O_DIRECT = 0x4000, O_LARGEFILE = 0x8000, O_DIRECTORY = 0x10000, O_NOFOLLOW = 0x20000,
     O_CLOEXEC = 0x80000,
-    F_GETFD = 1, F_SETFD = 2, F_GETFL = 3, F_SETFL = 4, F_ADD_SEALS = 1033, F_GET_SEALS = 1034,
+    F_DUPFD = 0, F_GETFD = 1, F_SETFD = 2, F_GETFL = 3, F_SETFL = 4,
+    F_DUPFD_CLOEXEC = 1030, F_ADD_SEALS = 1033, F_GET_SEALS = 1034,
     F_SEAL_SEAL = 1, F_SEAL_SHRINK = 2, F_SEAL_GROW = 4, F_SEAL_EXEC = 0x20,
     MFD_CLOEXEC = 1, MFD_ALLOW_SEALING = 2, MFD_NOEXEC_SEAL = 8,
     MEMFD_NAME_LIMIT = 249, MEMFD_CHUNKS = 128,
     FRAMES_PER_CHUNK = PMM_PAGE_SIZE / sizeof(uptr),
-    STDIO_COUNT = 3, FD_COUNT = LINUX64_FD_COUNT,
-    OPEN_FILE_COUNT = LINUX64_TASK_COUNT * (FD_COUNT - STDIO_COUNT),
+    FD_COUNT = LINUX64_FD_COUNT, OPEN_FILE_COUNT = LINUX64_TASK_COUNT * FD_COUNT,
 };
 
-enum file_kind { FILE_REGULAR, FILE_SOCKET, FILE_PIPE, FILE_PROC_DIR, FILE_PROC_MAP, FILE_NULL };
+enum file_kind { FILE_REGULAR, FILE_SOCKET, FILE_PIPE, FILE_PROC_DIR, FILE_PROC_MAP, FILE_NULL, FILE_SERIAL };
 static const struct linux64_file null_file = {.inode = 1};
 
 /* Linux x86-64 передаёт 144 байта; у i386 другая раскладка stat. */
@@ -54,6 +54,7 @@ static struct file_handle {
     enum linux64_proc_node proc_node;
     bool proc_admin;
     bool null_device;
+    bool serial;
     uptr offset;
     u32 flags;
     unsigned references;
@@ -69,16 +70,13 @@ _Static_assert(__builtin_offsetof(struct linux64_pollfd, revents) == 6, "Linux x
 static u16 poll_fd(const struct linux64_process *process, i32 fd, u16 events) {
     if (fd < 0) return 0;
     if (fd >= FD_COUNT) return LINUX64_POLLNVAL;
+    const struct file_handle *file = process->fds[fd].file;
+    if (!file) return LINUX64_POLLNVAL;
     u16 ready;
-    if (fd < STDIO_COUNT) {
-        ready = fd == 0 ? 0 : LINUX64_POLL_WRITE;
-    } else {
-        const struct file_handle *file = process->fds[fd].file;
-        if (!file) return LINUX64_POLLNVAL;
-        if (file->pipe) ready = linux64_pipe_poll(file->pipe, (file->flags & O_ACCMODE) == O_WRONLY);
-        else if (file->socket) ready = linux64_socket_poll(file->socket);
-        else ready = LINUX64_POLL_READ | LINUX64_POLL_WRITE;
-    }
+    if (file->serial) ready = LINUX64_POLL_WRITE;
+    else if (file->pipe) ready = linux64_pipe_poll(file->pipe, (file->flags & O_ACCMODE) == O_WRONLY);
+    else if (file->socket) ready = linux64_socket_poll(file->socket);
+    else ready = LINUX64_POLL_READ | LINUX64_POLL_WRITE;
     return ready & (events | LINUX64_POLLERR | LINUX64_POLLHUP);
 }
 
@@ -128,6 +126,7 @@ long linux64_poll(uptr address, u32 count, i32 timeout) {
 
 static enum file_kind kind_of(const struct file_handle *file) {
     if (file->null_device) return FILE_NULL;
+    if (file->serial) return FILE_SERIAL;
     if (file->proc_node >= PROC_ROOT) return FILE_PROC_DIR;
     if (file->proc_node) return FILE_PROC_MAP;
     if (file->pipe) return FILE_PIPE;
@@ -195,24 +194,31 @@ static void close_file(i32 fd) {
 }
 
 void linux64_close_files(struct linux64_process *process) {
-    for (unsigned fd = STDIO_COUNT; fd < FD_COUNT; ++fd) close_slot(&process->fds[fd]);
+    for (unsigned fd = 0; fd < FD_COUNT; ++fd) close_slot(&process->fds[fd]);
 }
 
 void linux64_close_on_exec(struct linux64_process *process) {
-    for (unsigned fd = STDIO_COUNT; fd < FD_COUNT; ++fd)
+    for (unsigned fd = 0; fd < FD_COUNT; ++fd)
         if (process->fds[fd].cloexec) close_slot(&process->fds[fd]);
 }
 
 void linux64_retain_files(struct linux64_process *process) {
-    for (unsigned fd = STDIO_COUNT; fd < FD_COUNT; ++fd)
+    for (unsigned fd = 0; fd < FD_COUNT; ++fd)
         if (process->fds[fd].file) ++process->fds[fd].file->references;
 }
 
 void linux64_use_files(const struct linux64_file_source *source, const char *path, uptr path_length) {
     files = source ? *source : (struct linux64_file_source){0};
-    linux64_current->process->executable_path_length = path_length;
-    for (uptr i = 0; i <= path_length; ++i) linux64_current->process->executable_path[i] = path[i];
-    linux64_close_files(linux64_current->process);
+    struct linux64_process *process = linux64_current->process;
+    process->executable_path_length = path_length;
+    for (uptr i = 0; i <= path_length; ++i) process->executable_path[i] = path[i];
+    /* При первой загрузке таблица и пул открытых файлов ещё пусты. */
+    open_files[0] = (struct file_handle){.file = null_file, .null_device = true, .references = 1};
+    for (unsigned fd = 1; fd <= 2; ++fd)
+        open_files[fd] = (struct file_handle){
+            .file.inode = 1, .serial = true, .flags = O_WRONLY, .references = 1,
+        };
+    for (unsigned fd = 0; fd <= 2; ++fd) process->fds[fd].file = &open_files[fd];
 }
 
 const struct linux64_file_source *linux64_file_source(void) {
@@ -220,7 +226,7 @@ const struct linux64_file_source *linux64_file_source(void) {
 }
 
 static bool open_file(i32 fd) {
-    return fd >= STDIO_COUNT && fd < FD_COUNT && file_at(fd);
+    return fd >= 0 && fd < FD_COUNT && file_at(fd);
 }
 
 long linux64_get_file(i32 fd, struct linux64_fd_view *view) {
@@ -271,7 +277,8 @@ static long memfd_proc_path(const char *path, i32 *fd) {
         ++prefix;
     }
     if (*prefix) return 0;
-    if (*path < '1' || *path > '9') return -ENOENT;
+    if (*path < '0' || *path > '9' || (*path == '0' && path[1] >= '0' && path[1] <= '9'))
+        return -ENOENT;
     unsigned number = 0;
     while (*path >= '0' && *path <= '9') {
         number = number * 10 + (unsigned)(*path++ - '0');
@@ -288,7 +295,7 @@ static long absolute_path(i32 dirfd, char *path, const char **absolute) {
     if (**absolute == '/') return 0;
     if (dirfd != AT_FDCWD) {
         if (open_file(dirfd) && file_at(dirfd)->proc_node == PROC_ROOT) return 0;
-        return (dirfd >= 0 && dirfd < STDIO_COUNT) || open_file(dirfd) ? -ENOTDIR : -EBADF;
+        return open_file(dirfd) ? -ENOTDIR : -EBADF;
     }
     *absolute = root_path(path);
     return 0;
@@ -323,9 +330,34 @@ static enum linux64_proc_node proc_path(const char *path) {
     return USERNS_NONE;
 }
 
-static long new_handle(const struct linux64_file *file, struct memfd *memfd, u32 flags) {
-    unsigned fd = STDIO_COUNT;
+static unsigned free_fd(unsigned fd) {
     while (fd < FD_COUNT && file_at(fd)) ++fd;
+    return fd;
+}
+
+static long copy_fd(i32 source, unsigned target, bool cloexec) {
+    struct file_handle *file = file_at(source);
+    struct linux64_fd_slot *slot = &linux64_current->process->fds[target];
+    ++file->references;
+    close_slot(slot);
+    *slot = (struct linux64_fd_slot){file, cloexec};
+    return target;
+}
+
+static long dup_fd(i32 source, u32 minimum, bool cloexec) {
+    if (!open_file(source)) return -EBADF;
+    if (minimum >= FD_COUNT) return -EINVAL;
+    unsigned target = free_fd(minimum);
+    return target == FD_COUNT ? -EMFILE : copy_fd(source, target, cloexec);
+}
+
+static long dup_to(i32 source, i32 target, bool cloexec) {
+    if (!open_file(source) || target < 0 || target >= FD_COUNT) return -EBADF;
+    return source == target ? target : copy_fd(source, (unsigned)target, cloexec);
+}
+
+static long new_handle(const struct linux64_file *file, struct memfd *memfd, u32 flags) {
+    unsigned fd = free_fd(0);
     if (fd == FD_COUNT) return -EMFILE;
     for (unsigned i = 0; i < OPEN_FILE_COUNT; ++i) {
         struct file_handle *description = &open_files[i];
@@ -389,7 +421,7 @@ static long linux_socketpair(i32 domain, u32 type, i32 protocol, uptr address) {
 }
 
 long linux64_sockopt(bool get, i32 fd, i32 level, i32 option, uptr value, uptr length) {
-    if (!open_file(fd)) return fd >= 0 && fd < STDIO_COUNT ? -ENOTSOCK : -EBADF;
+    if (!open_file(fd)) return -EBADF;
     if (!file_at(fd)->socket) return -ENOTSOCK;
     return linux64_socket_option(file_at(fd)->socket, get, level, option, value, length);
 }
@@ -462,6 +494,8 @@ static long linux_ftruncate(i32 fd, uptr size) {
 
 static long linux_fcntl(i32 fd, i32 command, u32 value) {
     if (!open_file(fd)) return -EBADF;
+    if (command == F_DUPFD || command == F_DUPFD_CLOEXEC)
+        return dup_fd(fd, value, command == F_DUPFD_CLOEXEC);
     struct memfd *memfd = file_at(fd)->memfd;
     if (command == F_GETFD) return linux64_current->process->fds[fd].cloexec;
     if (command == F_SETFD) {
@@ -626,10 +660,26 @@ static long null_io(const struct file_handle *file, bool write, uptr buffer, upt
     return write ? (long)count : 0;
 }
 
+static long serial_write(uptr address, uptr size) {
+    if (size > 0x7ffff000u) size = 0x7ffff000u;
+    uptr written = 0;
+    while (written < size) {
+        const u8 *bytes = paging64_user_read(address);
+        if (!bytes) return written ? (long)written : -EFAULT;
+        uptr chunk = PMM_PAGE_SIZE - (address & (PMM_PAGE_SIZE - 1));
+        if (chunk > size - written) chunk = size - written;
+        for (uptr i = 0; i < chunk; ++i) kernel64_serial_char((char)bytes[i]);
+        written += chunk;
+        address += chunk;
+    }
+    return (long)written;
+}
+
 static long linux_read(i32 fd, uptr buffer, uptr count, uptr offset, bool positioned) {
     if (!open_file(fd)) return -EBADF;
     struct file_handle *handle = file_at(fd);
     if (handle->null_device) return null_io(handle, false, buffer, count);
+    if (handle->serial) return positioned ? -ESPIPE : -EBADF;
     if (handle->pipe) {
         if (positioned) return -ESPIPE;
         if ((handle->flags & O_ACCMODE) == O_WRONLY) return -EBADF;
@@ -690,6 +740,10 @@ static long file_stat(const struct linux64_file *file, const struct memfd *memfd
         mode = 0020666;
         device = 5;
         rdev = 0x103;
+    } else if (kind == FILE_SERIAL) {
+        mode = 0020600;
+        device = 6;
+        rdev = 0x501;
     } else if (memfd) {
         mode = memfd->seals & F_SEAL_EXEC ? 0100666 : 0100777;
         device = 2;
@@ -716,6 +770,7 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
         return linux_read(fd, arg1, arg2, 0, false);
     case 1: /* write */
         if (!open_file(fd)) return -EBADF;
+        if (file_at(fd)->serial) return serial_write(arg1, arg2);
         if (file_at(fd)->null_device) return null_io(file_at(fd), true, arg1, arg2);
         if (file_at(fd)->proc_node) {
             struct file_handle *handle = file_at(fd);
@@ -753,6 +808,7 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
     case 18: /* pwrite64 */
         if ((long)arg3 < 0) return -EINVAL;
         if (!open_file(fd)) return -EBADF;
+        if (file_at(fd)->serial) return -ESPIPE;
         return file_at(fd)->null_device ? null_io(file_at(fd), true, arg1, arg2) : -ENOSYS;
     case 21: /* access */
         if ((u32)arg1 & ~7u) return -EINVAL;
@@ -762,13 +818,17 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
         return (arg1 & 3u) ? -EACCES : 0;
     case 22: /* pipe */
         return linux_pipe2(arg0, 0);
+    case 32: /* dup */
+        return dup_fd(fd, 0, false);
+    case 33: /* dup2 */
+        return dup_to(fd, (i32)arg1, false);
     case 46: /* sendmsg */
     case 47: /* recvmsg */
-        if (!open_file(fd)) return fd >= 0 && fd < STDIO_COUNT ? -ENOTSOCK : -EBADF;
+        if (!open_file(fd)) return -EBADF;
         if (!file_at(fd)->socket) return -ENOTSOCK;
         return linux64_socket_message(file_at(fd)->socket, number == 47, arg1, (u32)arg2);
     case 48: /* shutdown */
-        if (!open_file(fd)) return fd >= 0 && fd < STDIO_COUNT ? -ENOTSOCK : -EBADF;
+        if (!open_file(fd)) return -EBADF;
         if (!file_at(fd)->socket) return -ENOTSOCK;
         return linux64_socket_shutdown(file_at(fd)->socket, (i32)arg1);
     case 53: /* socketpair */
@@ -786,6 +846,9 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
             return -EINVAL;
         result = lookup(fd, arg1, (arg3 & AT_EMPTY_PATH) != 0, &file, &memfd, &kind);
         return result ? result : file_stat(&file, memfd, kind, arg2);
+    case 292: /* dup3 */
+        if (((u32)arg2 & ~O_CLOEXEC) || fd == (i32)arg1) return -EINVAL;
+        return dup_to(fd, (i32)arg1, (arg2 & O_CLOEXEC) != 0);
     case 293: /* pipe2 */
         return linux_pipe2(arg0, (u32)arg1);
     case 319: /* memfd_create */

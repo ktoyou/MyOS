@@ -48,6 +48,8 @@ __attribute__((noreturn)) void exec_target(const word *stack, word rcx, word r11
         sys(13, 10, 0, (word)caught, 8, 0, 0) || caught[0] ||
         sys(13, 12, 0, (word)ignored, 8, 0, 0) || ignored[0] != 1) finish(38);
     if (sys(72, 3, 1, 0, 0, 0, 0) || sys(72, 4, 1, 0, 0, 0, 0) != -9 ||
+        sys(72, 0, 1, 0, 0, 0, 0) || sys(0, 0, 1, 1, 0, 0, 0) ||
+        sys(72, 2, 1, 0, 0, 0, 0) != -9 ||
         sys(9, PRIVATE_ADDRESS, 4096, 3, 0x100022, -1, 0) != PRIVATE_ADDRESS) finish(39);
     long shared = sys(9, 0, 4096, 3, 1, 3, 0);
     if (shared < 0) finish(40);

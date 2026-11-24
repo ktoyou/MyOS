@@ -48,22 +48,6 @@ bool linux64_enable_syscall(void) {
     return true;
 }
 
-static long linux_write(uptr fd, uptr address, uptr size) {
-    if (fd != 1 && fd != 2) return -9;
-    if (size > 0x7ffff000u) size = 0x7ffff000u;
-    uptr written = 0;
-    while (written < size) {
-        const u8 *bytes = paging64_user_read(address);
-        if (!bytes) return written ? (long)written : -14;
-        uptr chunk = PMM_PAGE_SIZE - (address & (PMM_PAGE_SIZE - 1));
-        if (chunk > size - written) chunk = size - written;
-        for (uptr i = 0; i < chunk; ++i) kernel64_serial_char((char)bytes[i]);
-        written += chunk;
-        address += chunk;
-    }
-    return (long)written;
-}
-
 static long linux_uname(uptr address) {
     static const struct {
         char sysname[65], nodename[65], release[65], version[65], machine[65], domainname[65];
@@ -91,7 +75,6 @@ __attribute__((noreturn)) void linux64_invalid_return(void) {
 
 long linux64_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2,
                     uptr arg3, uptr arg4, uptr arg5) {
-    if (number == 1 && (arg0 == 1 || arg0 == 2)) return linux_write(arg0, arg1, arg2);
     if (number == 7) return linux64_poll(arg0, (u32)arg1, (i32)arg2);
     if (number == 9) return linux64_mmap(arg0, arg1, (u32)arg2, (u32)arg3, (i32)arg4, arg5);
     if (number == 10) return linux64_mprotect(arg0, arg1, arg2);
