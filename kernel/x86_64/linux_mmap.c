@@ -9,7 +9,7 @@
 
 enum {
     PROT_READ = 1, PROT_WRITE = 2, PROT_EXEC = 4,
-    MAP_PRIVATE = 2, MAP_FIXED = 0x10, MAP_ANONYMOUS = 0x20, MAP_DENYWRITE = 0x800,
+    MAP_SHARED = 1, MAP_PRIVATE = 2, MAP_FIXED = 0x10, MAP_ANONYMOUS = 0x20, MAP_DENYWRITE = 0x800,
     MAP_EXECUTABLE = 0x1000, MAP_NORESERVE = 0x4000, MAP_FIXED_NOREPLACE = 0x100000,
     EBADF = 9, ENOMEM = 12, EACCES = 13, EEXIST = 17, EINVAL = 22, EOVERFLOW = 75,
 };
@@ -95,8 +95,10 @@ long linux64_mprotect(uptr address, uptr length, uptr protection) {
     uptr end = address + ((length + PAGE_MASK) & ~PAGE_MASK);
     bool materialize = protection && overlap_end(address, end);
     if (materialize && !stage_range(address, end, false)) return -ENOMEM;
-    if (!paging64_protect(address, end, protection != 0, writable, executable, reserved_end))
-        return -ENOMEM;
+    enum paging64_protect_result result =
+        paging64_protect(address, end, protection != 0, writable, executable, reserved_end);
+    if (result != PAGING64_PROTECT_OK)
+        return result == PAGING64_PROTECT_DENIED ? -EACCES : -ENOMEM;
     if (materialize) commit_ranges();
     return 0;
 }
@@ -108,16 +110,17 @@ long linux64_munmap(uptr address, uptr length) {
     if (!in_arena(address, length)) return -EINVAL;
     uptr end = address + length;
     if (!stage_range(address, end, false)) return -ENOMEM;
-    if (!paging64_remove_private(address, end)) return -EINVAL;
+    if (!paging64_remove_mmap(address, end)) return -EINVAL;
     commit_ranges();
     return 0;
 }
 
 long linux64_mmap(uptr address, uptr length, u32 protection, u32 flags, i32 fd, uptr offset) {
+    u32 type = flags & (MAP_SHARED | MAP_PRIVATE);
     if (!length || (offset & PAGE_MASK) || (long)offset < 0 ||
         (protection & ~(PROT_READ | PROT_WRITE | PROT_EXEC)) ||
-        !(flags & MAP_PRIVATE) ||
-        (flags & ~(MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS | MAP_DENYWRITE |
+        (type != MAP_SHARED && type != MAP_PRIVATE) ||
+        (flags & ~(MAP_SHARED | MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS | MAP_DENYWRITE |
                    MAP_EXECUTABLE | MAP_NORESERVE | MAP_FIXED_NOREPLACE))) return -EINVAL;
     bool writable = (protection & PROT_WRITE) != 0;
     bool executable = (protection & PROT_EXEC) != 0;
@@ -125,6 +128,8 @@ long linux64_mmap(uptr address, uptr length, u32 protection, u32 flags, i32 fd, 
     if (length > MAP_END - MAP_START) return -ENOMEM;
     length = (length + PAGE_MASK) & ~PAGE_MASK;
     bool anonymous = (flags & MAP_ANONYMOUS) != 0;
+    bool shared = type == MAP_SHARED;
+    if (shared && anonymous) return -EINVAL;
     bool reserve = anonymous && !protection;
     if (!reserve && length > BOOT_MEMORY_LIMIT) return -ENOMEM;
     const u8 *source = NULL;
@@ -152,11 +157,12 @@ long linux64_mmap(uptr address, uptr length, u32 protection, u32 flags, i32 fd, 
             !paging64_range_free(address, address + length)) address = find_free(length);
         if (!address) return -ENOMEM;
     }
+    if (shared && writable) return -EACCES;
     uptr end = address + length;
     if (!stage_range(address, end, reserve)) return -ENOMEM;
-    if (reserve ? !paging64_remove_private(address, end)
-                : !paging64_map_private(address, end, source, file_bytes,
-                                        anonymous, protection != 0, writable, executable))
+    if (reserve ? !paging64_remove_mmap(address, end)
+                : !paging64_map_mmap(address, end, source, file_bytes,
+                                     anonymous, protection != 0, writable, executable, shared))
         return -ENOMEM;
     commit_ranges();
     return (long)address;

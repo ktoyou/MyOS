@@ -6,6 +6,8 @@
 #define MMAP_OWNED    (1ull << 9)
 #define MMAP_PENDING  (1ull << 10)
 #define FILE_BACKED   (1ull << 11)
+/* Бит 57 доступен ПО в листе x86-64 и не входит в физический адрес. */
+#define MMAP_NO_WRITE (1ull << 57)
 #define NO_EXECUTE    (1ull << 63)
 #define ADDRESS_MASK  0x000ffffffffff000ull
 #define CR0_WP        (1ul << 16)
@@ -203,7 +205,7 @@ static void clear_private(uptr root, uptr start, uptr end, u64 marker) {
     if (last) prune_empty_tables(root, last);
 }
 
-bool paging64_remove_private(uptr start, uptr end) {
+bool paging64_remove_mmap(uptr start, uptr end) {
     uptr root = active_root(), next;
     for (uptr address = start; address < end; address = next) {
         const u64 *leaf = find_leaf_span(root, address, &next);
@@ -213,10 +215,12 @@ bool paging64_remove_private(uptr start, uptr end) {
     return true;
 }
 
-bool paging64_protect(uptr start, uptr end, bool accessible, bool writable, bool executable,
-                      uptr (*reserved_end)(uptr)) {
+enum paging64_protect_result paging64_protect(uptr start, uptr end, bool accessible,
+                                             bool writable, bool executable,
+                                             uptr (*reserved_end)(uptr)) {
     if (start < 0x400000ul || end > X64_USER_TOP || start >= end ||
-        ((start | end) & (PMM_PAGE_SIZE - 1)) || (writable && executable)) return false;
+        ((start | end) & (PMM_PAGE_SIZE - 1))) return PAGING64_PROTECT_UNMAPPED;
+    if (writable && executable) return PAGING64_PROTECT_DENIED;
     uptr root = active_root(), next;
     bool needs_backing = false;
     for (uptr address = start; address < end; address = next) {
@@ -224,11 +228,13 @@ bool paging64_protect(uptr start, uptr end, bool accessible, bool writable, bool
         const u64 *leaf = find_leaf(root, address);
         if (!leaf || !*leaf) {
             next = reserved_end(address);
-            if (!next) return false;
+            if (!next) return PAGING64_PROTECT_UNMAPPED;
             needs_backing = accessible;
-        } else if (*leaf != MMAP_OWNED && !((*leaf & USER) && (*leaf & ADDRESS_MASK))) {
-            return false;
+            continue;
         }
+        if ((*leaf & ~MMAP_NO_WRITE) != MMAP_OWNED && !((*leaf & USER) && (*leaf & ADDRESS_MASK)))
+            return PAGING64_PROTECT_UNMAPPED;
+        if (writable && (*leaf & MMAP_NO_WRITE)) return PAGING64_PROTECT_DENIED;
     }
     if (needs_backing) {
         for (uptr address = start; address < end; address += PMM_PAGE_SIZE) {
@@ -238,7 +244,7 @@ bool paging64_protect(uptr start, uptr end, bool accessible, bool writable, bool
             if (physical && map_entry(root, address, physical | MMAP_PENDING | USER)) continue;
             if (physical) pmm64_free(physical);
             clear_private(root, start, address, MMAP_PENDING);
-            return false;
+            return PAGING64_PROTECT_UNMAPPED;
         }
     }
     for (uptr address = start; address < end; address = next) {
@@ -258,16 +264,19 @@ bool paging64_protect(uptr start, uptr end, bool accessible, bool writable, bool
         /* Старое исполняемое отображение уже недоступно через TLB. */
         if (writable) set_alias_write(root, physical, true);
     }
-    return true;
+    return PAGING64_PROTECT_OK;
 }
 
 /* Страницы и таблицы резервируются до замены старых отображений. */
-bool paging64_map_private(uptr start, uptr end, const u8 *source, uptr file_bytes,
-                          bool anonymous, bool accessible, bool writable, bool executable) {
+bool paging64_map_mmap(uptr start, uptr end, const u8 *source, uptr file_bytes,
+                       bool anonymous, bool accessible, bool writable, bool executable,
+                       bool immutable_shared) {
     if (start < 0x400000ul || end > X64_USER_TOP || start >= end ||
         ((start | end) & (PMM_PAGE_SIZE - 1)) || (writable && executable) ||
+        (immutable_shared && (anonymous || writable)) ||
         (file_bytes && !source) || file_bytes > end - start) return false;
     uptr root = active_root(), physical_list = 0, prepared = start;
+    const u64 owner = MMAP_OWNED | (immutable_shared ? MMAP_NO_WRITE : 0);
     for (uptr address = start; address < end; address += PMM_PAGE_SIZE) {
         const u64 *leaf = find_leaf(root, address);
         if (leaf && *leaf && !(*leaf & MMAP_OWNED)) return false;
@@ -287,7 +296,7 @@ bool paging64_map_private(uptr start, uptr end, const u8 *source, uptr file_byte
     for (uptr address = start; address < end; address += PMM_PAGE_SIZE) {
         u64 *leaf = find_leaf(root, address);
         uptr old = *leaf & ADDRESS_MASK;
-        *leaf = MMAP_OWNED;
+        *leaf = owner;
         invalidate(address);
         if (old) {
             set_alias_write(root, old, true);
@@ -305,7 +314,7 @@ bool paging64_map_private(uptr start, uptr end, const u8 *source, uptr file_byte
             for (uptr i = 0; i < count; ++i) target[i] = source[offset + i];
         }
         if (!writable) set_alias_write(root, physical, false);
-        *leaf = physical | MMAP_OWNED | USER | (anonymous ? 0 : FILE_BACKED) |
+        *leaf = physical | owner | USER | (anonymous ? 0 : FILE_BACKED) |
                 (accessible ? PRESENT : 0) |
                 (writable ? WRITE : 0) | (executable ? 0 : NO_EXECUTE);
         invalidate(address);

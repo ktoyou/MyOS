@@ -16,11 +16,18 @@ bool paging64_shared_futex_address(uptr address);
 uptr paging64_copy_to_user(uptr address, const void *source, uptr length);
 bool paging64_put_user_u64(uptr address, u64 value);
 bool paging64_range_free(uptr start, uptr end);
-bool paging64_protect(uptr start, uptr end, bool accessible, bool writable, bool executable,
-                      uptr (*reserved_end)(uptr));
+enum paging64_protect_result {
+    PAGING64_PROTECT_OK,
+    PAGING64_PROTECT_UNMAPPED,
+    PAGING64_PROTECT_DENIED,
+};
+enum paging64_protect_result paging64_protect(uptr start, uptr end, bool accessible,
+                                             bool writable, bool executable,
+                                             uptr (*reserved_end)(uptr));
 uptr paging64_first_mapped(uptr start, uptr end);
-bool paging64_remove_private(uptr start, uptr end);
-bool paging64_map_private(uptr start, uptr end, const u8 *source, uptr file_bytes,
-                          bool anonymous, bool accessible, bool writable, bool executable);
+bool paging64_remove_mmap(uptr start, uptr end);
+bool paging64_map_mmap(uptr start, uptr end, const u8 *source, uptr file_bytes,
+                       bool anonymous, bool accessible, bool writable, bool executable,
+                       bool immutable_shared);
 
 #endif
