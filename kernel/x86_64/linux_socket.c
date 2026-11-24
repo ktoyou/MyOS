@@ -45,9 +45,8 @@ _Static_assert(CRED_LENGTH == 28 && sizeof(struct credentials) == 32, "Linux x86
 
 struct packet {
     struct packet *next;
-    uptr physical;
-    u32 length;
-    struct identity sender;
+    struct linux64_pid *sender;
+    u32 length, uid, gid;
     u8 bytes[];
 };
 
@@ -200,13 +199,18 @@ long linux64_socket_name(const struct linux64_socket *socket, bool peer, uptr ad
     return 0;
 }
 
+static void free_packet(struct packet *packet) {
+    linux64_pid_release(packet->sender);
+    pmm64_free((uptr)packet - (uptr)pmm64_pointer(0));
+}
+
 static void drop_packet(struct linux64_socket *socket) {
     struct packet *packet = socket->head;
     socket->head = packet->next;
     if (!socket->head) socket->tail = NULL;
     --socket->queued;
     socket->head_offset = 0;
-    pmm64_free(packet->physical);
+    free_packet(packet);
 }
 
 static void close_endpoint(struct linux64_socket *socket) {
@@ -289,11 +293,14 @@ static struct packet *new_packet(const struct linux64_socket *socket) {
     uptr physical = pmm64_alloc();
     if (!physical) return NULL;
     struct packet *packet = pmm64_pointer(physical);
-    packet->physical = physical;
-    if (socket->passcred || socket->peer->passcred)
-        packet->sender = (struct identity){linux64_current->process->pid, LINUX64_UID, LINUX64_GID};
-    else
-        packet->sender = (struct identity){0, 65534, 65534};
+    if (socket->passcred || socket->peer->passcred) {
+        packet->sender = linux64_current->process->pid_identity;
+        linux64_pid_retain(packet->sender);
+        packet->uid = LINUX64_UID;
+        packet->gid = LINUX64_GID;
+    } else {
+        packet->uid = packet->gid = 65534;
+    }
     return packet;
 }
 
@@ -325,13 +332,20 @@ static long send_packet(struct linux64_socket *socket, const struct iovec *iov, 
     for (uptr i = 0; i < count; ++i) {
         uptr size = iov[i].length;
         if (paging64_copy_from_user(packet->bytes + copied, iov[i].base, size) != size) {
-            pmm64_free(packet->physical);
+            free_packet(packet);
             return -EFAULT;
         }
         copied += size;
     }
     enqueue(peer, packet);
     return (long)length;
+}
+
+static struct identity packet_identity(const struct packet *packet) {
+    return (struct identity){
+        .pid = linux64_pid_number(packet->sender, linux64_current->process->pid_ns),
+        .uid = packet->uid, .gid = packet->gid,
+    };
 }
 
 static void receive_credentials(struct identity sender, struct msghdr *message) {
@@ -377,7 +391,7 @@ static long receive_packet(struct linux64_socket *socket, const struct iovec *io
     if (!result) {
         if (message) {
             if (copied < packet->length) message->flags |= MSG_TRUNC;
-            if (socket->passcred) receive_credentials(packet->sender, message);
+            if (socket->passcred) receive_credentials(packet_identity(packet), message);
             else message->control_length = 0;
         }
         result = (long)(flags & MSG_TRUNC ? packet->length : copied);
@@ -432,7 +446,7 @@ static long send_stream(struct linux64_socket *socket, const struct iovec *iov, 
         if (packet->length) {
             done += packet->length;
             enqueue(peer, packet);
-        } else pmm64_free(packet->physical);
+        } else free_packet(packet);
         if (fault) return done ? (long)done : -EFAULT;
     }
     return (long)done;
@@ -451,12 +465,14 @@ static long receive_stream(struct linux64_socket *socket, const struct iovec *io
         }
         return socket->peer->open && !socket->read_shutdown ? -EAGAIN : 0;
     }
-    struct identity sender = packet->sender;
+    struct identity sender = packet_identity(packet);
+    struct linux64_pid *first_sender = packet->sender;
+    linux64_pid_retain(first_sender);
     bool fault = false;
     uptr done = 0;
     while (packet && iov_remaining(&cursor)) {
-        if (socket->passcred && (sender.pid != packet->sender.pid || sender.uid != packet->sender.uid ||
-                                 sender.gid != packet->sender.gid)) break;
+        if (socket->passcred && (first_sender != packet->sender || sender.uid != packet->uid ||
+                                 sender.gid != packet->gid)) break;
         unsigned offset = packet == socket->head ? socket->head_offset : 0;
         uptr available = packet->length - offset;
         uptr copied = stream_copy(&cursor, packet->bytes + offset, available, true, &fault);
@@ -469,6 +485,7 @@ static long receive_stream(struct linux64_socket *socket, const struct iovec *io
         }
         if (fault) break;
     }
+    linux64_pid_release(first_sender);
     if (fault && !done) return -EFAULT;
     if (message) {
         if (socket->passcred && done) receive_credentials(sender, message);

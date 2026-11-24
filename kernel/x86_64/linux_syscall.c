@@ -108,8 +108,11 @@ long linux64_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2,
     if (number == 28) return linux64_madvise(arg0, arg1, (i32)arg2);
     if (number == 13) return linux64_rt_sigaction((i32)arg0, arg1, arg2, arg3);
     if (number == 14) return linux64_rt_sigprocmask((i32)arg0, arg1, arg2, arg3);
-    if (number == 39) return linux64_current->process->pid; /* getpid */
-    if (number == 186) return linux64_current->tid; /* gettid */
+    if (number == 39) { /* getpid */
+        const struct linux64_process *process = linux64_current->process;
+        return linux64_pid_number(process->pid_identity, process->pid_ns);
+    }
+    if (number == 186) return linux64_current->visible_tid; /* gettid */
     if (number == 54 || number == 55)
         return linux64_sockopt(number == 55, (i32)arg0, (i32)arg1, (i32)arg2, arg3, arg4);
     if (number == 63) return linux_uname(arg0);
