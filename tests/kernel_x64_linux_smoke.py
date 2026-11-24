@@ -101,7 +101,7 @@ def check_files(build):
     assert 'Linux uname: MyOS' in serial and 'Linux ELF64 files probe' in serial, serial
     timestamp = int(serial.split('Linux UTC seconds: ', 1)[1].splitlines()[0])
     assert rtc_date.timestamp() <= timestamp <= rtc_date.timestamp() + 30, serial
-    print('OVMF: Linux ELF64 files, directories, descriptors, signals, uname, process IDs and UTC clocks: PASS', flush=True)
+    print('OVMF: Linux ELF64 files, directories, symlinks, descriptors, signals, IDs and UTC clocks: PASS', flush=True)
 
 
 def check_mmap(build):

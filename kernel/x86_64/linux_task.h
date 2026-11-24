@@ -149,7 +149,11 @@ bool linux64_poll_ready(struct linux64_task *task);
 long linux64_poll_resume(const struct linux64_task *task);
 const struct linux64_file_source *linux64_file_source(void);
 long linux64_vfs_walk(const struct linux64_file_source *source, const char *absolute,
-                      struct linux64_file *file, char *resolved, u32 create_mode);
+                      struct linux64_file *file, char *resolved, bool follow_final);
+long linux64_vfs_mkdir(const struct linux64_file_source *source, const char *absolute, u32 mode);
+long linux64_vfs_symlink(const struct linux64_file_source *source, const char *absolute,
+                         const char *target, uptr length);
+long linux64_vfs_unlink(const struct linux64_file_source *source, const char *absolute);
 u32 linux64_directory_permissions(const struct linux64_file *file);
 bool linux64_special_node(const char *path, struct linux64_file *file);
 long linux64_user_string(uptr address, char *string, uptr limit);

@@ -241,6 +241,77 @@ static long check_dup(void) {
     return 0;
 }
 
+static long check_links(long dir, const char *directory) {
+    static const char lock[] = "lock";
+    static const char target[] = "myos-123";
+    char path[64];
+    unsigned length = 0;
+    while (directory[length]) { path[length] = directory[length]; ++length; }
+    path[length++] = '/';
+    for (unsigned i = 0; i < sizeof(lock); ++i) path[length + i] = lock[i];
+
+    if (call(266, 0, dir, (word)lock, 0) != -14 ||
+        call(266, (word)"", dir, (word)lock, 0) != -2 ||
+        call(266, (word)target, -1, (word)lock, 0) != -9 ||
+        call(266, (word)target, dir, (word)"lock/", 0) != -2 ||
+        call(88, (word)target, (word)path, 0, 0)) return 68;
+    word first[18], other[18];
+    if (call(266, (word)"different", dir, (word)lock, 0) != -17 ||
+        call(266, (word)target, dir, (word)"lock/", 0) != -17 ||
+        call(262, dir, (word)lock, (word)first, 0x100) ||
+        (first[3] & 0177777) != 0120777 || first[6] != sizeof(target) - 1 ||
+        call(262, dir, (word)lock, (word)other, 0) != -2 ||
+        call(257, dir, (word)lock, 0x20000, 0) != -40 ||
+        call(257, dir, (word)lock, 0xc0, 0600) != -17 ||
+        call(258, dir, (word)lock, 0700, 0) != -17) return 69;
+    char bytes[16] = {0};
+    bytes[3] = 'z';
+    if (call(89, (word)path, (word)bytes, 3, 0) != 3 ||
+        bytes[0] != 'm' || bytes[1] != 'y' || bytes[2] != 'o' || bytes[3] != 'z' ||
+        call(267, dir, (word)lock, 0xffff800000000000ul, 8) != -14 ||
+        call(267, dir, (word)lock, (word)bytes, 0) != -22 ||
+        call(267, dir, (word)lock, (word)bytes, sizeof(bytes)) != sizeof(target) - 1 ||
+        bytes[7] != '3' || call(263, dir, (word)"lock/", 0, 0) != -20 ||
+        call(87, (word)path, 0, 0, 0) || call(87, (word)path, 0, 0, 0) != -2) return 70;
+
+    long nested = call(257, dir, (word)"child", 0x10000, 0);
+    if (nested < 3 || call(266, (word)"../shared", nested, (word)"parent", 0) ||
+        call(266, (word)"child", dir, (word)"alias", 0) ||
+        call(266, (word)FILE_PATH, dir, (word)"absolute", 0) ||
+        call(262, dir, (word)"alias/parent", (word)other, 0) ||
+        call(262, dir, (word)"shared", (word)first, 0) || first[1] != other[1] ||
+        call(262, dir, (word)"alias/", (word)other, 0x100) || (other[3] & 0170000) != 0040000 ||
+        call(262, dir, (word)"absolute/", (word)other, 0) != -20) return 71;
+    long opened = call(257, dir, (word)"absolute", 0, 0);
+    if (opened < 3 || call(0, opened, (word)bytes, 4, 0) != 4 ||
+        bytes[0] != '\x7f' || bytes[1] != 'E' || call(3, opened, 0, 0, 0) ||
+        call(263, dir, (word)"absolute", 0, 0) || call(263, dir, (word)"alias", 0, 0) ||
+        call(263, nested, (word)"parent", 0, 0) || call(3, nested, 0, 0, 0)) return 72;
+
+    if (call(266, (word)"longer/self", dir, (word)"loop", 0) ||
+        call(266, (word)"loop/..", dir, (word)"longer", 0) ||
+        call(262, dir, (word)"loop", (word)other, 0) != -40 ||
+        call(267, dir, (word)"loop", (word)bytes, sizeof(bytes)) != 11 ||
+        call(263, dir, (word)"loop", 0, 0) || call(263, dir, (word)"longer", 0, 0)) return 73;
+
+    unsigned char *query = buffer + 4096;
+    for (unsigned i = 0; i < 3000; i += 2) { buffer[i] = '.'; buffer[i + 1] = '/'; }
+    for (unsigned i = 0; i < sizeof("child"); ++i) buffer[3000 + i] = (unsigned char)"child"[i];
+    for (unsigned i = 0; i < 5; ++i) query[i] = (unsigned char)"wide/"[i];
+    for (unsigned i = 5; i < 1605; i += 2) { query[i] = '.'; query[i + 1] = '/'; }
+    query[1605] = 0;
+    if (call(266, (word)buffer, dir, (word)"wide", 0) ||
+        call(262, dir, (word)query, (word)other, 0) || (other[3] & 0170000) != 0040000 ||
+        call(263, dir, (word)"wide", 0, 0)) return 75;
+
+    if (call(102, 0, 0, 0, 0) != 0 &&
+        (call(258, dir, (word)"sealed", 0500, 0) ||
+         call(266, (word)target, dir, (word)"sealed/link", 0) != -13)) return 76;
+    for (unsigned i = 0; i < 260; ++i)
+        if (call(266, (word)target, dir, (word)lock, 0) || call(263, dir, (word)lock, 0, 0)) return 74;
+    return 0;
+}
+
 static long check_directories(void) {
     static char path[] = "/tmp/myos-dir-0000000000";
     unsigned pid = (unsigned)call(39, 0, 0, 0, 0);
@@ -285,17 +356,23 @@ static long check_directories(void) {
     int status;
     if (child < 0 || call(61, child, (word)&status, 0, 0) != child || status ||
         call(262, dir, (word)"shared", (word)opened, 0) ||
-        (opened[3] & 0170777) != 0040700 || call(3, dir, 0, 0, 0)) return 51;
+        (opened[3] & 0170777) != 0040700) return 51;
+    long links = check_links(dir, path);
+    if (links) return links;
+    if (call(3, dir, 0, 0, 0)) return 51;
     if (call(63, (word)buffer, 0, 0, 0)) return 52;
     if (buffer[0] == 'M') {
         long ro = call(2, (word)"/", 0x10000, 0, 0);
-        if (ro < 0 || call(258, ro, (word)(path + 5), 0700, 0) != -30) return 53;
+        if (ro < 0 || call(258, ro, (word)(path + 5), 0700, 0) != -30 ||
+            call(266, (word)"nowhere", ro, (word)(path + 5), 0) != -30 ||
+            call(263, ro, (word)(path + 5), 0, 0) != -30) return 53;
         call(3, ro, 0, 0, 0);
     } else {
         char nested[sizeof(path) + 8];
         for (unsigned i = 0; i < sizeof(path) - 1; ++i) nested[i] = path[i];
-        const char *names[] = {"/child", "/shared"};
-        for (unsigned n = 0; n < 2; ++n) {
+        const char *names[] = {"/child", "/shared", "/sealed"};
+        unsigned count = call(102, 0, 0, 0, 0) == 0 ? 2 : 3;
+        for (unsigned n = 0; n < count; ++n) {
             for (unsigned i = 0; (nested[sizeof(path) - 1 + i] = names[n][i]); ++i) {}
             if (call(84, (word)nested, 0, 0, 0)) return 54;
         }
