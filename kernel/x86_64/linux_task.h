@@ -115,8 +115,9 @@ struct linux64_process {
 struct linux64_futex_wait {
     const struct linux64_address_space *memory;
     uptr address;
+    long deadline;
     u32 bits;
-    bool private;
+    bool private, timed, realtime;
 };
 
 struct linux64_pollfd {

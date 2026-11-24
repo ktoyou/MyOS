@@ -84,6 +84,7 @@ uptr linux64_random_bytes(void *buffer, uptr length);
 long linux64_getrandom(uptr address, uptr length, u32 flags);
 void linux64_clock_init(void);
 bool linux64_monotonic_ns(u64 *nanos);
+bool linux64_clock_sample(bool realtime, long *seconds, u64 *nanoseconds);
 long linux64_clock_gettime(i32 clock, uptr address);
 long linux64_gettimeofday(uptr timeval, uptr timezone);
 void linux64_reset_signals(void);

@@ -1,9 +1,11 @@
 #include "linux_task.h"
 #include "paging.h"
 
+#define NS_PER_SECOND 1000000000l
+
 enum {
-    EPERM = 1, ESRCH = 3, ECHILD = 10, EAGAIN = 11, ENOMEM = 12, EFAULT = 14,
-    EINVAL = 22, ENOSYS = 38,
+    EPERM = 1, ESRCH = 3, EIO = 5, ECHILD = 10, EAGAIN = 11, ENOMEM = 12, EFAULT = 14,
+    EINVAL = 22, ENOSYS = 38, ETIMEDOUT = 110,
     SIGCHLD = 17, CLONE_VM = 0x100, CLONE_FS = 0x200, CLONE_FILES = 0x400,
     CLONE_SIGHAND = 0x800, CLONE_VFORK = 0x4000, CLONE_PARENT = 0x8000, CLONE_THREAD = 0x10000,
     CLONE_SYSVSEM = 0x40000, CLONE_SETTLS = 0x80000, CLONE_PARENT_SETTID = 0x100000,
@@ -454,11 +456,39 @@ static void halt_init(u32 status) {
     for (;;) __asm__ volatile("cli; hlt");
 }
 
+static long futex_ns(long seconds, long nanos) {
+    /* Отрицательное время UTC предшествует любому допустимому абсолютному сроку. */
+    if (seconds < 0) return -1;
+    if (seconds > (__LONG_MAX__ - nanos) / NS_PER_SECOND) return __LONG_MAX__;
+    return seconds * NS_PER_SECOND + nanos;
+}
+
+static bool futex_clock(bool realtime, long *now) {
+    long seconds;
+    u64 nanos;
+    if (!linux64_clock_sample(realtime, &seconds, &nanos)) return false;
+    *now = futex_ns(seconds, (long)nanos);
+    return true;
+}
+
+static bool futex_expired(const struct linux64_futex_wait *wait) {
+    long now;
+    return wait->timed && futex_clock(wait->realtime, &now) && now >= wait->deadline;
+}
+
 long linux64_futex(uptr address, u32 operation, u32 value, uptr timeout, u32 bits) {
     bool private = (operation & FUTEX_PRIVATE_FLAG) != 0;
+    bool realtime = (operation & FUTEX_CLOCK_REALTIME) != 0;
     u32 command = operation & ~(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
-    if ((operation & FUTEX_CLOCK_REALTIME) && command != FUTEX_WAIT_BITSET) return -ENOSYS;
     bool wait = command == FUTEX_WAIT || command == FUTEX_WAIT_BITSET;
+    long deadline = 0;
+    if (wait && timeout) {
+        long time[2];
+        if (paging64_copy_from_user(time, timeout, sizeof(time)) != sizeof(time)) return -EFAULT;
+        if (time[0] < 0 || time[1] < 0 || time[1] >= NS_PER_SECOND) return -EINVAL;
+        deadline = futex_ns(time[0], time[1]);
+    }
+    if (realtime && command != FUTEX_WAIT_BITSET) return -ENOSYS;
     if (!wait && command != FUTEX_WAKE && command != FUTEX_WAKE_BITSET) return -ENOSYS;
     if (command == FUTEX_WAIT || command == FUTEX_WAKE) bits = (u32)-1;
     if (!bits) return -EINVAL;
@@ -467,12 +497,19 @@ long linux64_futex(uptr address, u32 operation, u32 value, uptr timeout, u32 bit
         (!private && !paging64_shared_futex_address(address))) return -EFAULT;
     const struct linux64_address_space *memory = linux64_current->memory;
     if (wait) {
-        if (timeout) return -ENOSYS;
+        long now;
+        if (timeout && !futex_clock(realtime, &now)) return -EIO;
+        if (timeout && command == FUTEX_WAIT)
+            deadline = deadline > __LONG_MAX__ - now ? __LONG_MAX__ : now + deadline;
         u32 actual;
         if (paging64_copy_from_user(&actual, address, sizeof(actual)) != sizeof(actual)) return -EFAULT;
         if (actual != value) return -EAGAIN;
+        if (timeout && deadline <= now) return -ETIMEDOUT;
         /* На одном CPU между проверкой слова и постановкой в очередь никто его не изменит. */
-        linux64_current->futex = (struct linux64_futex_wait){memory, address, bits, private};
+        linux64_current->futex = (struct linux64_futex_wait){
+            .memory = memory, .address = address, .deadline = deadline, .bits = bits,
+            .private = private, .timed = timeout != 0, .realtime = realtime,
+        };
         linux64_current->state = TASK_FUTEX_WAIT;
         return 0;
     }
@@ -481,7 +518,7 @@ long linux64_futex(uptr address, u32 operation, u32 value, uptr timeout, u32 bit
         struct linux64_task *task = &tasks[i];
         const struct linux64_futex_wait *entry = &task->futex;
         if (task->state != TASK_FUTEX_WAIT || entry->memory != memory || entry->address != address ||
-            entry->private != private || !(entry->bits & bits)) continue;
+            entry->private != private || !(entry->bits & bits) || futex_expired(entry)) continue;
         task->frame.rax = 0;
         task->state = TASK_RUNNABLE;
         if (++woken >= (i32)value) break;
@@ -610,9 +647,14 @@ static struct linux64_task *pick_task(const struct linux64_task *current) {
                 (candidate->state == TASK_PIPE_WAIT && linux64_pipe_ready(&candidate->pipe_io)) ||
                 (candidate->state == TASK_SOCKET_WAIT && linux64_socket_wait_ready(candidate)))
                 return candidate;
-            if (candidate->state != TASK_POLL_WAIT) continue;
-            if (linux64_poll_ready(candidate)) return candidate;
-            if (candidate->poll.deadline) timed = true;
+            if (candidate->state == TASK_POLL_WAIT) {
+                if (linux64_poll_ready(candidate)) return candidate;
+                if (candidate->poll.deadline) timed = true;
+            }
+            if (candidate->state == TASK_FUTEX_WAIT && candidate->futex.timed) {
+                if (futex_expired(&candidate->futex)) return candidate;
+                timed = true;
+            }
         }
         /* Таймерных прерываний в этом режиме пока нет. */
         if (timed) __asm__ volatile("pause");
@@ -622,7 +664,13 @@ static struct linux64_task *pick_task(const struct linux64_task *current) {
     for (;;) __asm__ volatile("cli; hlt");
 }
 
+static void resume_futex_timeout(struct linux64_task *task, struct linux64_frame *frame) {
+    frame->rax = (u64)-ETIMEDOUT;
+    task->state = TASK_RUNNABLE;
+}
+
 static void resume_wait(struct linux64_task *task) {
+    if (task->state == TASK_FUTEX_WAIT) resume_futex_timeout(task, &task->frame);
     if (task->state == TASK_POLL_WAIT) {
         task->frame.rax = (u64)linux64_poll_resume(task);
         task->state = TASK_RUNNABLE;
@@ -647,6 +695,7 @@ static void schedule(struct linux64_frame *frame) {
     struct linux64_task *old = linux64_current;
     struct linux64_task *next = pick_task(old);
     if (next == old && old->state != TASK_SOCKET_WAIT) {
+        if (old->state == TASK_FUTEX_WAIT) resume_futex_timeout(old, frame);
         if (old->state == TASK_POLL_WAIT) {
             frame->rax = (u64)linux64_poll_resume(old);
             old->state = TASK_RUNNABLE;

@@ -154,7 +154,7 @@ bool linux64_monotonic_ns(u64 *nanos) {
     return true;
 }
 
-static bool clock_sample(bool realtime, long *seconds, u64 *nanoseconds) {
+bool linux64_clock_sample(bool realtime, long *seconds, u64 *nanoseconds) {
     if (realtime && !rtc_valid) return false;
     u64 nanos;
     if (!linux64_monotonic_ns(&nanos)) return false;
@@ -168,7 +168,7 @@ long linux64_clock_gettime(i32 clock, uptr address) {
     if (clock != 0 && clock != 1) return -22; /* CLOCK_REALTIME, CLOCK_MONOTONIC */
     long seconds;
     u64 nanos;
-    if (!clock_sample(clock == 0, &seconds, &nanos)) return -5;
+    if (!linux64_clock_sample(clock == 0, &seconds, &nanos)) return -5;
     const u64 timespec[2] = {(u64)seconds, nanos};
     return paging64_copy_to_user(address, timespec, sizeof(timespec)) == sizeof(timespec) ? 0 : -14;
 }
@@ -177,7 +177,7 @@ long linux64_gettimeofday(uptr timeval, uptr timezone) {
     if (timeval) {
         long seconds;
         u64 nanos;
-        if (!clock_sample(true, &seconds, &nanos)) return -5;
+        if (!linux64_clock_sample(true, &seconds, &nanos)) return -5;
         if (!paging64_put_user_u64(timeval, (u64)seconds) ||
             !paging64_put_user_u64(timeval + sizeof(u64), nanos / 1000)) return -14;
     }
