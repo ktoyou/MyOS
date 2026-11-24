@@ -8,8 +8,11 @@ PHDRS {
 SECTIONS {
     . = 0x100000;
     .text : { KEEP(*(.text.entry)) *(.text .text.*) } :code
+    . = ALIGN(0x1000);
+    __text_end = .;
     .rodata : { *(.rodata .rodata.*) } :code
     . = ALIGN(0x1000);
+    __rodata_end = .;
     .data : { *(.data .data.*) } :data
     .bss (NOLOAD) : { *(.bss .bss.*) *(COMMON) } :data
     __kernel_end = .;

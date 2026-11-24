@@ -1,4 +1,4 @@
-#include "pmm.h"
+#include "paging.h"
 
 #define COM1              0x3f8
 #define UEFI_ENTRY_MAGIC  0x55454649u
@@ -72,6 +72,53 @@ static __attribute__((noreturn)) void halt(void) {
     for (;;) __asm__ volatile("cli; hlt");
 }
 
+#ifdef X64_TEST_PAGING
+static void check_paging(unsigned mode, const struct boot_info *boot) {
+    static const u8 readonly = 0x5a;
+    uptr physical = pmm64_alloc();
+    if (!physical) {
+        serial_puts("x86-64 paging check FAIL\n");
+        halt();
+    }
+    volatile u8 *page = pmm64_pointer(physical);
+    page[PMM_PAGE_SIZE - 1] = 0x5a;
+    if ((uptr)page != X64_DIRECT_BASE + physical ||
+        page[PMM_PAGE_SIZE - 1] != 0x5a || !pmm64_free(physical) ||
+        pmm64_alloc() != physical || page[PMM_PAGE_SIZE - 1]) {
+        serial_puts("x86-64 paging check FAIL\n");
+        halt();
+    }
+    if (boot->root_bytes) {
+        const volatile u8 *root = pmm64_pointer(boot->root_phys);
+        const char expected[] = "MYOSPG!";
+        for (u32 i = 0; i < sizeof(expected) - 1; ++i) {
+            if (root[i] != (u8)expected[i]) {
+                serial_puts("x86-64 paging check FAIL\n");
+                halt();
+            }
+        }
+        serial_puts("x86-64 paging live root PASS\n");
+    }
+    serial_puts("x86-64 paging access PASS\n");
+    if (!mode) return;
+
+    uptr address = mode == 1 ? X64_DIRECT_BASE + (uptr)&readonly :
+                   mode == 2 ? (uptr)page : physical;
+    serial_puts("x86-64 expected fault address=");
+    serial_hex(address);
+    serial_puts("\n");
+    if (mode == 1) {
+        __asm__ volatile("movb $0,(%0)" : : "r"(address) : "memory");
+    } else if (mode == 2) {
+        page[0] = 0xc3;   /* ret, если право исполнения задано ошибочно */
+        __asm__ volatile("call *%0" : : "r"(address) : "memory");
+    } else {
+        __asm__ volatile("movb (%0),%%al" : : "r"(address) : "al", "memory");
+    }
+    serial_puts("x86-64 paging check FAIL\n");
+}
+#endif
+
 static void install_idt(void) {
     u16 cs;
     __asm__ volatile("mov %%cs,%0" : "=r"(cs));
@@ -116,12 +163,18 @@ static bool valid_boot_map(const struct boot_info *boot, u32 entry_magic) {
 }
 
 __attribute__((noreturn)) void kernel64_exception(u64 vector, u64 error, u64 rip) {
+    uptr cr2 = 0;
+    if (vector == 14) __asm__ volatile("mov %%cr2,%0" : "=r"(cr2));
     serial_puts("x86-64 exception vector=");
     serial_hex(vector);
     serial_puts(" error=");
     serial_hex(error);
     serial_puts(" rip=");
     serial_hex(rip);
+    if (vector == 14) {
+        serial_puts(" cr2=");
+        serial_hex(cr2);
+    }
     serial_puts("\nx86-64 exception halted\n");
     halt();
 }
@@ -134,12 +187,6 @@ __attribute__((noreturn)) void kernel64_main(const struct boot_info *boot, u32 e
         halt();
     }
     serial_puts("MyOS x86-64: UEFI memory map verified, IDT active\n");
-#if X64_TEST_EXCEPTION == 6
-    __asm__ volatile("ud2");
-#elif X64_TEST_EXCEPTION == 13
-    /* Селектор за пределами временной GDT вызывает #GP с кодом ошибки. */
-    __asm__ volatile("mov $0x28, %%ax; mov %%ax, %%ds" : : : "ax", "memory");
-#endif
     if (!pmm64_init(boot)) {
         serial_puts("MyOS x86-64: no free physical pages\n");
         halt();
@@ -149,6 +196,21 @@ __attribute__((noreturn)) void kernel64_main(const struct boot_info *boot, u32 e
     if (!pmm64_check(boot)) serial_puts("x86-64 PMM FAIL\n");
     else if (boot->root_bytes) serial_puts("x86-64 PMM live PASS\n");
     else serial_puts("x86-64 PMM disk PASS\n");
+#else
+    if (!paging64_init(boot)) {
+        serial_puts("MyOS x86-64: cannot activate kernel page tables\n");
+        halt();
+    }
+    serial_puts("MyOS x86-64: kernel CR3 active\n");
+#if X64_TEST_EXCEPTION == 6
+    __asm__ volatile("ud2");
+#elif X64_TEST_EXCEPTION == 13
+    /* Селектор за пределами временной GDT вызывает #GP с кодом ошибки. */
+    __asm__ volatile("mov $0x28, %%ax; mov %%ax, %%ds" : : : "ax", "memory");
+#endif
+#ifdef X64_TEST_PAGING
+    check_paging(X64_TEST_PAGING, boot);
+#endif
 #endif
     halt();
 }
