@@ -57,15 +57,30 @@ compare_pagesize:
     or r12d,2
 entry:
     cmp eax,9
-    jne aux
+    jne random
     lea rcx,[rip+_start]
     cmp rdx,rcx
     jne fail
     or r12d,4
     jmp aux
+random:
+    cmp eax,25
+    jne aux
+    test r12d,32
+    jnz fail
+    mov r13,rdx
+    or r12d,32
+    jmp aux
 aux_done:
-    cmp r12d,31
+    cmp r12d,63
     jne fail
+    cmp r13,rbx
+    jb fail
+    lea rdx,[r13+16]
+    cmp rdx,[rsp+8]
+    ja fail
+    mov r8,[r13]
+    mov r9,[r13+8]
     cmp byte ptr [rip+data_byte],0x5a
     jne fail
     cmp byte ptr [rip+buffer+4095],0

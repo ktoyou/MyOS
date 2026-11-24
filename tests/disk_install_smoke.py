@@ -74,7 +74,7 @@ def run(*args):
 
 
 class VM(hardware.VM):
-    def __init__(self, name, args, memory='256M',binary='qemu-system-i386'):
+    def __init__(self, name, args, memory='256M', binary='qemu-system-i386', *, cpu='max'):
         self.temp = tempfile.TemporaryDirectory(prefix='myos-setup-qmp-')
         self.log = pathlib.Path(self.temp.name)/'serial.log'
         self.log.write_text('')
@@ -82,7 +82,7 @@ class VM(hardware.VM):
         self.sockpath = self.temp.name+'/qmp'
         self.boot_timeout = 300
         self.err = (B/(name+'.stderr')).open('w')
-        self.p = subprocess.Popen([binary, '-cpu', 'max', '-m', memory,
+        self.p = subprocess.Popen([binary, '-cpu', cpu, '-m', memory,
             '-display', 'none', '-no-reboot', '-nic', 'none',
             '-serial', 'file:'+str(self.log), '-qmp', 'unix:'+self.sockpath+',server=on,wait=off',
             *args], stdout=subprocess.DEVNULL, stderr=self.err)
