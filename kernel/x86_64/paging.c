@@ -7,7 +7,7 @@
 #define MMAP_PENDING  (1ull << 10)
 #define FILE_BACKED   (1ull << 11)
 /* Эти биты доступны ПО в листе x86-64 и не входят в физический адрес. */
-#define STACK_LAZY    (1ull << 56)
+#define ZERO_LAZY     (1ull << 56)
 #define MMAP_NO_WRITE (1ull << 57)
 #define MMAP_SHARED_FRAME (1ull << 58)
 #define NO_EXECUTE    (1ull << 63)
@@ -193,26 +193,26 @@ static void set_alias_write(uptr root, uptr physical, bool writable) {
     invalidate(direct);
 }
 
-static bool materialize_stack(uptr root, uptr address, u64 *leaf, bool write, bool execute) {
+static bool materialize_zero(uptr root, uptr address, u64 *leaf, bool write, bool execute) {
     const u64 value = *leaf;
-    if (!(value & STACK_LAZY) || !(value & USER) || (write && !(value & WRITE)) ||
+    if (!(value & ZERO_LAZY) || !(value & USER) || (write && !(value & WRITE)) ||
         (execute && (value & NO_EXECUTE))) return false;
     uptr physical = pmm64_alloc();
     if (!physical) return false;
     if (!(value & WRITE)) set_alias_write(root, physical, false);
-    *leaf = physical | (value & ~STACK_LAZY) | PRESENT;
+    *leaf = physical | (value & ~ZERO_LAZY) | PRESENT;
     invalidate(address);
     return true;
 }
 
-bool paging64_stack_fault(uptr address, u64 error) {
+bool paging64_zero_fault(uptr address, u64 error) {
     const u64 write = 1u << 1, user = 1u << 2, instruction = 1u << 4;
     if (!(error & user) || (error & ~(write | user | instruction)) || address >= X64_USER_TOP)
         return false;
     uptr root = paging64_active_root();
     u64 *leaf = find_leaf(root, address);
-    return leaf && materialize_stack(root, address, leaf, (error & write) != 0,
-                                     (error & instruction) != 0);
+    return leaf && materialize_zero(root, address, leaf, (error & write) != 0,
+                                    (error & instruction) != 0);
 }
 
 static void release_mapping(uptr root, u64 value) {
@@ -344,8 +344,8 @@ bool paging64_reserve_stack(uptr start, uptr end) {
         ((start | end) & (PMM_PAGE_SIZE - 1))) return false;
     uptr root = paging64_active_root();
     for (uptr address = start; address < end; address += PMM_PAGE_SIZE) {
-        if (map_entry(root, address, STACK_LAZY | USER | WRITE | NO_EXECUTE)) continue;
-        clear_mappings(root, start, address, STACK_LAZY);
+        if (map_entry(root, address, ZERO_LAZY | USER | WRITE | NO_EXECUTE)) continue;
+        clear_mappings(root, start, address, ZERO_LAZY);
         return false;
     }
     return true;
@@ -359,6 +359,35 @@ bool paging64_remove_mmap(uptr start, uptr end) {
     }
     clear_mappings(root, start, end, MMAP_OWNED);
     return true;
+}
+
+enum paging64_discard_result paging64_discard_anon(uptr start, uptr end, uptr (*reserved_end)(uptr)) {
+    uptr root = paging64_active_root(), next;
+    enum paging64_discard_result result = PAGING64_DISCARD_OK;
+    for (uptr address = start; address < end; address = next) {
+        const u64 *leaf = find_leaf_span(root, address, &next);
+        u64 value = leaf ? *leaf : 0;
+        if (!value || !(value & (USER | MMAP_OWNED | ZERO_LAZY))) {
+            uptr reserved = reserved_end(address);
+            if (reserved) next = reserved;
+            else result = PAGING64_DISCARD_HOLE;
+            continue;
+        }
+        /* Без источника файловых страниц нельзя восстановить их содержимое. */
+        if (!(value & MMAP_OWNED) || (value & (FILE_BACKED | MMAP_SHARED_FRAME | MMAP_NO_WRITE)) ||
+            !(value & (ADDRESS_MASK | ZERO_LAZY))) return PAGING64_DISCARD_UNSUPPORTED;
+    }
+    for (uptr address = start; address < end; address = next) {
+        u64 *leaf = find_leaf_span(root, address, &next);
+        if (!leaf || !(*leaf & MMAP_OWNED) || !(*leaf & ADDRESS_MASK)) continue;
+        u64 old = *leaf;
+        /* Отбрасываем ссылку, не меняя данные чужого отображения после fork. */
+        *leaf = MMAP_OWNED | ZERO_LAZY | (old & (WRITE | NO_EXECUTE)) |
+                (old & PRESENT ? USER : 0);
+        invalidate(address);
+        release_mapping(root, old);
+    }
+    return result;
 }
 
 enum paging64_protect_result paging64_protect(uptr start, uptr end, bool accessible,
@@ -378,7 +407,7 @@ enum paging64_protect_result paging64_protect(uptr start, uptr end, bool accessi
             needs_backing = accessible;
             continue;
         }
-        if (!(*leaf & STACK_LAZY) &&
+        if (!(*leaf & ZERO_LAZY) &&
             (*leaf & ~(MMAP_NO_WRITE | MMAP_SHARED_FRAME)) != MMAP_OWNED &&
             !((*leaf & USER) && (*leaf & ADDRESS_MASK)))
             return PAGING64_PROTECT_UNMAPPED;
@@ -410,9 +439,10 @@ enum paging64_protect_result paging64_protect(uptr start, uptr end, bool accessi
     for (uptr address = start; address < end; address = next) {
         u64 *leaf = find_leaf_span(root, address, &next);
         if (!leaf) continue;
-        if (*leaf & STACK_LAZY) {
+        if (*leaf & ZERO_LAZY) {
             /* Для отсутствующей страницы USER хранит разрешение доступа до выделения. */
-            *leaf = STACK_LAZY | (accessible ? USER : 0) | (writable ? WRITE : 0) |
+            *leaf = (*leaf & ~(USER | WRITE | NO_EXECUTE)) |
+                    (accessible ? USER : 0) | (writable ? WRITE : 0) |
                     (executable ? 0 : NO_EXECUTE);
             continue;
         }
@@ -589,8 +619,8 @@ static u8 *user_pointer(uptr address, u64 required) {
     u64 *table = pmm64_pointer(root);
     for (int shift = 39; shift >= 12; shift -= 9) {
         u64 *slot = &table[(address >> shift) & 511u];
-        if (shift == 12 && (*slot & STACK_LAZY))
-            materialize_stack(root, address, slot, (required & WRITE) != 0, false);
+        if (shift == 12 && (*slot & ZERO_LAZY))
+            materialize_zero(root, address, slot, (required & WRITE) != 0, false);
         u64 entry = *slot;
         if ((entry & required) != required) return NULL;
         if (shift == 12)

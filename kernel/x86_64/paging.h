@@ -13,7 +13,7 @@ uptr paging64_exec_root(void);
 void paging64_drop_root(uptr root);
 void *paging64_user_page(uptr address);
 bool paging64_reserve_stack(uptr start, uptr end);
-bool paging64_stack_fault(uptr address, u64 error);
+bool paging64_zero_fault(uptr address, u64 error);
 bool paging64_user_code(uptr address, const u8 *code, uptr length);
 bool paging64_user_load(uptr address, const u8 *source, uptr offset, uptr length,
                         bool writable, bool executable);
@@ -35,6 +35,12 @@ enum paging64_protect_result paging64_protect(uptr start, uptr end, bool accessi
                                              uptr (*reserved_end)(uptr));
 uptr paging64_first_mapped(uptr start, uptr end);
 bool paging64_remove_mmap(uptr start, uptr end);
+enum paging64_discard_result {
+    PAGING64_DISCARD_OK,
+    PAGING64_DISCARD_HOLE,
+    PAGING64_DISCARD_UNSUPPORTED,
+};
+enum paging64_discard_result paging64_discard_anon(uptr start, uptr end, uptr (*reserved_end)(uptr));
 struct paging64_mmap_file {
     const u8 *bytes;
     uptr length, offset;

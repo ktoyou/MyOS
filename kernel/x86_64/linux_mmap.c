@@ -12,7 +12,8 @@ enum {
     MAP_SHARED = 1, MAP_PRIVATE = 2, MAP_FIXED = 0x10, MAP_ANONYMOUS = 0x20, MAP_DENYWRITE = 0x800,
     MAP_EXECUTABLE = 0x1000, MAP_NORESERVE = 0x4000, MAP_STACK = 0x20000,
     MAP_FIXED_NOREPLACE = 0x100000,
-    EBADF = 9, ENOMEM = 12, EACCES = 13, EEXIST = 17, EINVAL = 22, EOVERFLOW = 75,
+    MADV_DONTNEED = 4,
+    EBADF = 9, ENOMEM = 12, EACCES = 13, EEXIST = 17, EINVAL = 22, ENOSYS = 38, EOVERFLOW = 75,
 };
 
 /* BSP держит подготовленный список отдельно, пока изменение PTE может завершиться ошибкой. */
@@ -118,6 +119,21 @@ long linux64_munmap(uptr address, uptr length) {
     if (!paging64_remove_mmap(address, end)) return -EINVAL;
     commit_ranges();
     return 0;
+}
+
+long linux64_madvise(uptr address, uptr length, i32 advice) {
+    if (advice != MADV_DONTNEED) return -ENOSYS;
+    if ((address & PAGE_MASK) || length > (uptr)-1 - PAGE_MASK) return -EINVAL;
+    length = (length + PAGE_MASK) & ~PAGE_MASK;
+    if (!length) return 0;
+    if (length > (uptr)-1 - address) return -EINVAL;
+    if (address >= X64_USER_TOP || length > X64_USER_TOP - address) return -ENOMEM;
+    switch (paging64_discard_anon(address, address + length, reserved_end)) {
+    case PAGING64_DISCARD_OK: return 0;
+    case PAGING64_DISCARD_HOLE: return -ENOMEM;
+    case PAGING64_DISCARD_UNSUPPORTED: return -ENOSYS;
+    }
+    return -EINVAL;
 }
 
 long linux64_mmap(uptr address, uptr length, u32 protection, u32 flags, i32 fd, uptr offset) {

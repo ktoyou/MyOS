@@ -28,6 +28,10 @@ static long munmap(word address, word length) {
     return call(11, address, length, 0, 0, 0, 0);
 }
 
+static long discard(word address, word length) {
+    return call(28, address, length, 4, 0, 0, 0);
+}
+
 static long wake(word address, word op, word count) {
     return call(202, address, op, count, (word)-1, (word)-1, (word)-1);
 }
@@ -84,6 +88,8 @@ static long check_sparse(void) {
         items[0] != 0x31 || items[0x1000] || items[0x2000] != 0x53) return 25;
     if (mmap(middle, 0x1000, 0, 0x32, -1, 0) != (long)middle ||
         mprotect(middle, 0x1000, 3) || items[0] || items[0x2000] != 0x53) return 26;
+    if (discard(base + 0x1000, size - 0x2000) || items[0x2000] ||
+        discard(base + size - 0x2000, 0x2000) != -12) return 67;
     if (munmap(base, size) ||
         mmap(base, size, 0, 0x100022, -1, 0) != base || munmap(base, size)) return 27;
     return 0;
@@ -240,6 +246,43 @@ static __attribute__((noreturn)) void finish(long status) {
     __builtin_trap();
 }
 
+static long check_discard(void) {
+    const word page = 4096;
+    long base = mmap(0, 5 * page, 3, 0x22, -1, 0);
+    if (base < 0 || discard(base + 1, 0) != -22 || discard(base, (word)-1) != -22) return 68;
+    volatile unsigned char *bytes = (void *)base;
+    for (word i = 0; i < 5; ++i) bytes[i * page] = (unsigned char)(i + 1);
+    bytes[2 * page - 1] = 0xff;
+    if (mprotect(base + page, page, 1) || mprotect(base + 2 * page, page, 0) ||
+        discard(base + page, 1) || discard(base + 2 * page, page) ||
+        mmap(base + page, page, 3, 0x100022, -1, 0) != -17 || bytes[0] != 1 ||
+        bytes[page] || bytes[2 * page - 1] || bytes[3 * page] != 4) return 69;
+    long fd = open_data();
+    if (fd < 0 || call(17, fd, base + page, 1, 0, 0, 0) != -14 ||
+        call(17, fd, base + 2 * page, 1, 0, 0, 0) != -14 || mprotect(base + 2 * page, page, 3) ||
+        call(17, fd, base + 2 * page, 1, 0, 0, 0) != 1 || bytes[2 * page] != 0xb8 ||
+        bytes[2 * page + 1]) return 70;
+
+    if (mprotect(base, page, 1)) return 71;
+    long pid = call(57, 0, 0, 0, 0, 0, 0);
+    if (!pid) finish(discard(base, page) || bytes[0]);
+    int status;
+    if (pid < 0 || call(61, pid, (word)&status, 0, 0, 0, 0) != pid || status || bytes[0] != 1) return 72;
+    if (munmap(base + 3 * page, page) || discard(base + 3 * page, 0) ||
+        discard(base + 2 * page, 3 * page) != -12 || bytes[2 * page] || bytes[4 * page] ||
+        munmap(base, 5 * page)) return 73;
+
+    long file = mmap(0, page, 3, 2, fd, 0);
+    if (file < 0 || call(3, fd, 0, 0, 0, 0, 0)) return 74;
+    volatile unsigned char *file_bytes = (void *)file;
+    *file_bytes = 0x71;
+    char uname[390];
+    if (call(63, (word)uname, 0, 0, 0, 0, 0)) return 75;
+    long result = discard(file, page);
+    if (uname[0] == 'M' ? result != -38 || *file_bytes != 0x71 : result || *file_bytes != 0xb8) return 75;
+    return munmap(file, page) ? 76 : 0;
+}
+
 __attribute__((noreturn)) void _start(void) {
     long status = check_mmap();
     if (!status) status = check_shared();
@@ -247,6 +290,7 @@ __attribute__((noreturn)) void _start(void) {
     if (!status) status = check_memfd_resize();
     if (!status) status = check_stack();
     if (!status) status = check_sparse();
+    if (!status) status = check_discard();
     if (!status) {
         static const char message[] = "Linux ELF64 mmap and mprotect probe\n";
         if (call(1, 1, (word)message, sizeof(message) - 1, 0, 0, 0) != sizeof(message) - 1)

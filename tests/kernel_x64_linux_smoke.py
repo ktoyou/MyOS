@@ -149,7 +149,7 @@ def check_mmap(build):
     serial = check_guest('mmap-memfd-nx', memfd_nx, 'x86-64 exception halted', fault=True)
     assert ('vector=0x000000000000000e error=0x0000000000000015' in serial and
             'cr2=0x0000001000000000 cpl=3' in serial), serial
-    print('OVMF: mmap, memfd, mprotect, RELRO and Linux futex wake: PASS', flush=True)
+    print('OVMF: mmap, memfd, mprotect, MADV_DONTNEED, RELRO and Linux futex wake: PASS', flush=True)
 
 
 def check_socket(build):
