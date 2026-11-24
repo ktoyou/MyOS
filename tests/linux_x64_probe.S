@@ -65,14 +65,20 @@ entry:
     jmp aux
 random:
     cmp eax,25
-    jne aux
+    jne execfn
     test r12d,32
     jnz fail
     mov r13,rdx
     or r12d,32
     jmp aux
+execfn:
+    cmp eax,31
+    jne aux
+    mov r14,rdx
+    or r12d,64
+    jmp aux
 aux_done:
-    cmp r12d,63
+    cmp r12d,127
     jne fail
     cmp r13,rbx
     jb fail
@@ -88,6 +94,8 @@ aux_done:
     cmp byte ptr [rip+buffer+8191],0
     jne fail
 
+    mov r15,[rsp+8]
+    call check_executable
     call check_fs
     call check_getrandom
     call check_clock
@@ -343,6 +351,89 @@ clock_fail:
 clock_done:
     ret
 
+check_executable:
+    cmp byte ptr [r14],'/'
+    jne exe_fail
+    cmp byte ptr [r15],'/'
+    jne exe_fail
+    mov byte ptr [r15],'x'
+    cmp byte ptr [r14],'/'
+    jne exe_fail
+    mov byte ptr [r15],'/'
+    xor r12d,r12d
+path_length:
+    cmp byte ptr [r14+r12],0
+    je path_length_done
+    inc r12d
+    cmp r12d,4096
+    jb path_length
+    jmp exe_fail
+path_length_done:
+    cmp r12d,3
+    jb exe_fail
+    mov eax,89
+    lea rdi,[rip+proc_exe]
+    lea rsi,[rip+buffer+1]
+    mov byte ptr [rsi+r12],0x5a
+    mov edx,4096
+    syscall
+    cmp rax,r12
+    jne exe_fail
+    cmp byte ptr [rsi+r12],0x5a
+    jne exe_fail
+    mov rcx,rax
+    mov rdi,rsi
+    mov rsi,r14
+    repe cmpsb
+    jne exe_fail
+
+    mov eax,89
+    lea rdi,[rip+proc_exe]
+    lea rsi,[rip+buffer+4095]
+    mov rdx,0xffffffff00000003
+    mov byte ptr [rsi+3],0xa5
+    syscall
+    cmp rax,3
+    jne exe_fail
+    cmp byte ptr [rsi+3],0xa5
+    jne exe_fail
+    mov ecx,3
+    mov rdi,rsi
+    mov rsi,r14
+    repe cmpsb
+    jne exe_fail
+
+    mov eax,89
+    xor edi,edi
+    mov rdx,0x80000000
+    syscall
+    cmp rax,-22
+    jne exe_fail
+    mov eax,89
+    mov rdi,r14
+    mov edx,1
+    syscall
+    cmp rax,-22
+    jne exe_fail
+    mov eax,89
+    lea rdi,[rip+missing_proc]
+    syscall
+    cmp rax,-2
+    jne exe_fail
+    mov eax,89
+    lea rdi,[rip+proc_exe]
+    lea rsi,[rip+buffer+8191]
+    mov edx,2
+    syscall
+    cmp rax,-14
+    jne exe_fail
+    ret
+exe_fail:
+    mov eax,60
+    mov edi,16
+    syscall
+    ud2
+
 monotonic_ns:
     mov eax,228
     mov edi,1
@@ -367,6 +458,8 @@ guard_probe:
 .section .rodata
 message: .ascii " Linux ELF64 syscall probe\n"
 message_end:
+proc_exe: .asciz "/proc/self/exe"
+missing_proc: .asciz "/proc/self/myos-missing"
 .section .data
 data_byte: .byte 0x5a
 .balign 8

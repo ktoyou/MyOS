@@ -65,7 +65,8 @@ static bool valid_header(const struct elf_header *e, uptr size) {
 
 static const char *interp_path(const struct elf_header *e, const struct elf_segment *p,
                                uptr size) {
-    if (p->filesz < 2 || p->filesz > 4096 || p->offset > size || p->filesz > size - p->offset)
+    if (p->filesz < 2 || p->filesz > LINUX64_PATH_LIMIT ||
+        p->offset > size || p->filesz > size - p->offset)
         return NULL;
     const char *path = (const char *)e + p->offset;
     if (path[0] != '/' || path[p->filesz - 1]) return NULL;
@@ -164,34 +165,36 @@ static bool map_image(const struct elf_image *elf) {
     return true;
 }
 
-static uptr make_stack(const struct elf_image *main, u64 interp_bias, const u64 entropy[2]) {
-    u8 *top_page = NULL;
+static uptr make_stack(const struct elf_image *main, u64 interp_bias, const u64 entropy[2],
+                       const char *path, uptr path_length) {
     for (uptr page = STACK_BOTTOM; page < STACK_TOP; page += PMM_PAGE_SIZE) {
-        top_page = paging64_user_page(page);
-        if (!top_page) return 0;
+        if (!paging64_user_page(page)) return 0;
     }
-    static const char command[] = "linux-elf";
-    const uptr command_address = STACK_TOP - sizeof(command);
-    const uptr random_address = (command_address - 2 * sizeof(u64)) & ~7ul;
+    const uptr path_size = path_length + 1;
+    const uptr execfn_address = STACK_TOP - path_size;
+    const uptr argv_address = execfn_address - path_size;
+    const uptr random_address = (argv_address - 2 * sizeof(u64)) & ~7ul;
     const u64 initial[] = {
-        1, command_address, 0, 0,
+        1, argv_address, 0, 0,
         3, main->phdr, 4, main->header->phentsize, 5, main->header->phnum, 6, PMM_PAGE_SIZE,
-        7, interp_bias, 9, main->entry, AT_RANDOM, random_address, 31, command_address, 0, 0,
+        7, interp_bias, 9, main->entry, AT_RANDOM, random_address, 31, execfn_address, 0, 0,
     };
     uptr stack = (random_address - sizeof(initial)) & ~15ul;
-    for (unsigned i = 0; i < sizeof(command); ++i)
-        top_page[PMM_PAGE_SIZE - sizeof(command) + i] = (u8)command[i];
-    u64 *random_bytes = (void *)(top_page + (random_address & (PMM_PAGE_SIZE - 1)));
-    for (unsigned i = 0; i < 2; ++i) random_bytes[i] = entropy[i];
-    u64 *words = (void *)(top_page + (stack & (PMM_PAGE_SIZE - 1)));
-    for (unsigned i = 0; i < sizeof(initial) / sizeof(*initial); ++i) words[i] = initial[i];
+    /* argv[0] изменяется программой независимо от AT_EXECFN. */
+    if (stack < STACK_BOTTOM ||
+        paging64_copy_to_user(execfn_address, path, path_size) != path_size ||
+        paging64_copy_to_user(argv_address, path, path_size) != path_size ||
+        paging64_copy_to_user(random_address, entropy, 2 * sizeof(u64)) != 2 * sizeof(u64) ||
+        paging64_copy_to_user(stack, initial, sizeof(initial)) != sizeof(initial)) return 0;
     return stack;
 }
 
-bool linux64_run(const void *image, uptr size, const struct linux64_file_source *source) {
+bool linux64_run(const void *image, uptr size, const char *path, uptr path_length,
+                 const struct linux64_file_source *source) {
     struct elf_image main, interpreter = {0};
     u64 mapped = 0;
-    if (!load_layout(&main, image, size, false, &mapped) ||
+    if (!path || !path_length || path_length >= LINUX64_PATH_LIMIT || path[0] != '/' ||
+        path[path_length] || !load_layout(&main, image, size, false, &mapped) ||
         !paging64_range_free(STACK_GUARD, STACK_TOP)) return false;
     if (main.interp) {
         struct linux64_file interp;
@@ -206,9 +209,9 @@ bool linux64_run(const void *image, uptr size, const struct linux64_file_source 
         return false;
     }
     if (!map_image(&main) || (main.interp && !map_image(&interpreter))) return false;
-    uptr stack = make_stack(&main, interpreter.bias, entropy);
+    uptr stack = make_stack(&main, interpreter.bias, entropy, path, path_length);
     if (!stack || !linux64_enable_syscall()) return false;
-    linux64_use_files(source);
+    linux64_use_files(source, path, path_length);
     linux64_reset_signals();
     linux64_clock_init();
     segments64_enter_user(main.interp ? interpreter.entry : main.entry, stack);

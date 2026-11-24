@@ -83,6 +83,8 @@ static __attribute__((noreturn)) void halt(void) {
 struct linux_test_files {
     const u8 *cursor, *end;
     uptr count;
+    const char *exec_path;
+    struct linux64_file executable;
 };
 
 struct linux_test_entry {
@@ -90,6 +92,21 @@ struct linux_test_entry {
 } __attribute__((packed));
 
 static struct linux_test_files test_files;
+
+static bool valid_test_path(const char *path, uptr size) {
+    if (size < 2 || size > LINUX64_PATH_LIMIT || path[0] != '/' || path[size - 1]) return false;
+    for (uptr i = 1; i < size - 1; ++i)
+        if (!path[i]) return false;
+    return true;
+}
+
+static bool test_path_equal(const char *path, const char *expected) {
+    while (*path && *path == *expected) {
+        ++path;
+        ++expected;
+    }
+    return *path == *expected;
+}
 
 static bool linux_test_next(struct linux_test_files *files, const char **path,
                             struct linux64_file *file) {
@@ -100,9 +117,7 @@ static bool linux_test_next(struct linux_test_files *files, const char **path,
     if (entry->path_size < 2 || entry->path_size > remaining ||
         entry->file_size > remaining - entry->path_size) return false;
     *path = (const char *)(entry + 1);
-    if (**path != '/' || (*path)[entry->path_size - 1]) return false;
-    for (uptr i = 1; i < entry->path_size - 1; ++i)
-        if (!(*path)[i]) return false;
+    if (!valid_test_path(*path, entry->path_size)) return false;
     file->bytes = (const u8 *)*path + entry->path_size;
     file->size = entry->file_size;
     files->cursor = file->bytes + file->size;
@@ -111,16 +126,15 @@ static bool linux_test_next(struct linux_test_files *files, const char **path,
 
 static bool linux_test_lookup(const void *context, const char *path, struct linux64_file *file) {
     struct linux_test_files files = *(const struct linux_test_files *)context;
+    if (test_path_equal(path, files.exec_path)) {
+        *file = files.executable;
+        return true;
+    }
     for (uptr i = 0; i < files.count; ++i) {
         const char *expected;
         if (!linux_test_next(&files, &expected, file)) return false;
-        const char *actual = path;
-        while (*actual && *actual == *expected) {
-            ++actual;
-            ++expected;
-        }
-        if (*actual == *expected) {
-            file->inode = i + 1;
+        if (test_path_equal(path, expected)) {
+            file->inode = i + 2;
             return true;
         }
     }
@@ -128,21 +142,27 @@ static bool linux_test_lookup(const void *context, const char *path, struct linu
 }
 
 static void linux_test_boot(uptr root_phys, uptr root_bytes) {
-    /* За основным ELF идут записи с путём и содержимым файла. */
-    if (!root_phys || root_bytes < 24) return;
+    /* Заголовок, путь запуска, основной ELF и записи дополнительных файлов. */
+    if (!root_phys || root_bytes < 32) return;
     const u64 *header = pmm64_pointer(root_phys);
-    if (header[0] != 0x3336584c534f594dull || header[1] > root_bytes - 24 || header[2] > 1024)
+    if (header[0] != 0x3536584c534f594dull || header[3] > root_bytes - 32 ||
+        header[1] > root_bytes - 32 - header[3] || header[2] > 1024)
         return;
-    const u8 *image = (const void *)(header + 3);
-    test_files = (struct linux_test_files){image + header[1], image + root_bytes - 24, header[2]};
+    const char *path = (const void *)(header + 4);
+    if (!valid_test_path(path, header[3])) return;
+    const u8 *image = (const u8 *)path + header[3];
+    test_files = (struct linux_test_files){
+        .cursor = image + header[1], .end = (const u8 *)header + root_bytes,
+        .count = header[2], .exec_path = path, .executable = {image, header[1], 1},
+    };
     struct linux_test_files scan = test_files;
     for (uptr i = 0; i < scan.count; ++i) {
-        const char *path;
+        const char *entry_path;
         struct linux64_file file;
-        if (!linux_test_next(&scan, &path, &file)) return;
+        if (!linux_test_next(&scan, &entry_path, &file)) return;
     }
     const struct linux64_file_source source = {linux_test_lookup, &test_files};
-    linux64_run(image, header[1], &source);
+    linux64_run(image, header[1], path, header[3] - 1, &source);
 }
 #endif
 

@@ -3,6 +3,8 @@
 
 #include "../types.h"
 
+#define LINUX64_PATH_LIMIT 4096u
+
 struct linux64_file {
     const u8 *bytes;
     uptr size;
@@ -14,8 +16,9 @@ struct linux64_file_source {
     const void *context;
 };
 
-bool linux64_run(const void *image, uptr size, const struct linux64_file_source *source);
-void linux64_use_files(const struct linux64_file_source *source);
+bool linux64_run(const void *image, uptr size, const char *path, uptr path_length,
+                 const struct linux64_file_source *source);
+void linux64_use_files(const struct linux64_file_source *source, const char *path, uptr path_length);
 const struct linux64_file *linux64_get_file(i32 fd);
 long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg3);
 long linux64_mmap(uptr address, uptr length, u32 protection, u32 flags, i32 fd, uptr offset);

@@ -11,8 +11,10 @@ from kernel_x64_smoke import image
 from uefi_x64_smoke import boot_x64
 
 
-def linux_root(elf, files):
-    root = bytearray(b'MYOSLX63' + struct.pack('<QQ', len(elf), len(files)))
+def linux_root(elf, files, exec_path='/myos/test.elf'):
+    executable = os.fsencode(exec_path) + b'\0'
+    root = bytearray(b'MYOSLX65' + struct.pack('<QQQ', len(elf), len(files), len(executable)))
+    root.extend(executable)
     root.extend(elf)
     for path, contents in files.items():
         encoded = os.fsencode(path) + b'\0'
@@ -22,9 +24,9 @@ def linux_root(elf, files):
     return root
 
 
-def check_guest(name, elf, marker, *, fault=False, files=None, cpu='max'):
+def check_guest(name, elf, marker, *, fault=False, files=None, cpu='max', exec_path='/myos/test.elf'):
     payload, kernel_end = image('kernel-linux')
-    root_header = linux_root(elf, files or {})
+    root_header = linux_root(elf, files or {}, exec_path)
     with tempfile.TemporaryDirectory(prefix='myos-linux-x64-') as temp:
         serial = boot_x64(pathlib.Path(temp), 'x64-linux-' + name, payload,
                           kernel_end, [marker], live_root_header=root_header, cpu=cpu)
@@ -57,7 +59,7 @@ def check_interpreter(build):
     assert (host.returncode, host.stdout, host.stderr) == (
         42, marker + b'OK', b' Linux ELF64 syscall probe\n'), host
     serial = check_guest('interp', elf, 'Linux x86-64 exit status=0x2a',
-                         files={path: interp})
+                         files={path: interp}, exec_path=pie)
     assert 'Linux ELF64 interpreter\nOK Linux ELF64 syscall probe' in serial, serial
     print('OVMF: same PIE and interpreter as Linux: PASS', flush=True)
 
@@ -142,9 +144,13 @@ def main():
     host = subprocess.run([str(probe.resolve())], env={}, capture_output=True, timeout=5)
     assert (host.returncode, host.stdout, host.stderr) == (42, b'OK', b' Linux ELF64 syscall probe\n'), host
     elf = probe.read_bytes()
-    serial = check_guest('probe', elf, 'Linux x86-64 exit status=0x2a')
+    serial = check_guest('probe', elf, 'Linux x86-64 exit status=0x2a', exec_path=probe.resolve())
     assert 'OK Linux ELF64 syscall probe' in serial and 'Linux x86-64 ELF rejected' not in serial, serial
     print('OVMF: same Linux ELF64, same output and exit status: PASS', flush=True)
+    longest_path = '/' + 'bin/' * 1023 + 'el'
+    check_guest('long-exe', elf, 'Linux x86-64 exit status=0x2a', exec_path=longest_path)
+    check_guest('bad-exe', elf, 'Linux x86-64 ELF rejected', exec_path='relative.elf')
+    print('OVMF: executable path, AT_EXECFN and readlink: PASS', flush=True)
     serial = check_guest('no-rdrand', elf, 'Linux x86-64 ELF rejected', cpu='max,-rdrand')
     assert 'AT_RANDOM entropy unavailable' in serial and 'Linux x86-64 exit status' not in serial, serial
     print('OVMF: Linux ELF64 rejects CPU without RDRAND: PASS', flush=True)
