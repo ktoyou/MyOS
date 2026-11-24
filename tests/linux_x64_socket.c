@@ -24,7 +24,7 @@ struct credentials {
 enum {
     FD_LIMIT = 256,
     AF_UNIX = 1, SOCK_STREAM = 1, SOCK_SEQPACKET = 5, SOCK_NONBLOCK = 0x800, SOCK_CLOEXEC = 0x80000,
-    SOL_SOCKET = 1, SCM_RIGHTS = 1, SO_TYPE = 3, SO_PASSCRED = 16,
+    SOL_SOCKET = 1, SCM_RIGHTS = 1, SO_TYPE = 3, SO_PASSCRED = 16, SO_PEERCRED = 17,
     MSG_PEEK = 2, MSG_CTRUNC = 8, MSG_TRUNC = 0x20, MSG_DONTWAIT = 0x40, MSG_NOSIGNAL = 0x4000,
     MSG_CMSG_CLOEXEC = 0x40000000, SHUT_RD = 0, SHUT_WR = 1, SHUT_RDWR = 2,
 };
@@ -59,7 +59,7 @@ static long passcred(int fd, const int *enabled, word length) {
     return call(54, fd, SOL_SOCKET, SO_PASSCRED, (word)enabled, length);
 }
 
-static long option(int fd, int key, int *value, unsigned *length) {
+static long option(int fd, int key, void *value, unsigned *length) {
     return call(55, fd, SOL_SOCKET, key, (word)value, (word)length);
 }
 
@@ -153,6 +153,66 @@ struct unix_address {
 
 static long named_call(word number, long fd, const struct unix_address *address) {
     return call(number, fd, (word)address, sizeof(*address), 0, 0);
+}
+
+static int has_peer(int fd, int pid, unsigned uid, unsigned gid) {
+    struct { int pid; unsigned uid, gid; } peer;
+    unsigned count = sizeof(peer);
+    return !option(fd, SO_PEERCRED, &peer, &count) && count == sizeof(peer) &&
+           peer.pid == pid && peer.uid == uid && peer.gid == gid;
+}
+
+static int child_ok(long pid) {
+    int status;
+    return pid > 0 && call(61, pid, (word)&status, 0, 0, 0) == pid && status == 0;
+}
+
+static long check_peer_pair(word type) {
+    int ends[2], parent = (int)call(39, 0, 0, 0, 0, 0);
+    unsigned uid = (unsigned)call(107, 0, 0, 0, 0, 0), gid = (unsigned)call(108, 0, 0, 0, 0, 0);
+    if (pair_type(ends, type) || !has_peer(ends[0], parent, uid, gid)) return 150;
+    long child = call(57, 0, 0, 0, 0, 0);
+    if (!child) {
+        call(60, !has_peer(ends[1], parent, uid, gid), 0, 0, 0, 0);
+        __builtin_trap();
+    }
+    if (!child_ok(child) || close_fd(ends[1]) || !has_peer(ends[0], parent, uid, gid)) return 151;
+    unsigned count = 0;
+    if (option(ends[0], SO_PEERCRED, 0, &count) || count) return 152;
+    count = 12;
+    if (option(ends[0], SO_PEERCRED, 0, &count) != -14 || count != 12) return 152;
+    unsigned char bytes[16] = {[1] = 0xa5, [12] = 0x5a};
+    count = 1;
+    if (option(ends[0], SO_PEERCRED, bytes, &count) || count != 1 ||
+        bytes[0] != (unsigned char)parent || bytes[1] != 0xa5) return 152;
+    count = sizeof(bytes);
+    if (option(ends[0], SO_PEERCRED, bytes, &count) || count != 12 || bytes[12] != 0x5a ||
+        close_fd(ends[0])) return 152;
+    return 0;
+}
+
+static long check_peer_named(const struct unix_address *address) {
+    long listener = stream(0), client = stream(0);
+    unsigned uid = (unsigned)call(107, 0, 0, 0, 0, 0), gid = (unsigned)call(108, 0, 0, 0, 0, 0);
+    if (listener < 3 || client < 3 || !has_peer(client, 0, (unsigned)-1, (unsigned)-1) ||
+        named_call(49, listener, address)) return 153;
+    long owner = call(57, 0, 0, 0, 0, 0);
+    if (!owner) {
+        call(60, call(50, listener, 4, 0, 0, 0) != 0, 0, 0, 0, 0);
+        __builtin_trap();
+    }
+    if (!child_ok(owner)) return 153;
+    long connector = call(57, 0, 0, 0, 0, 0);
+    if (!connector) {
+        call(60, named_call(42, client, address) != 0, 0, 0, 0, 0);
+        __builtin_trap();
+    }
+    if (!child_ok(connector) || call(50, listener, 4, 0, 0, 0)) return 154;
+    long accepted = call(43, listener, 0, 0, 0, 0);
+    if (accepted < 3 || close_fd(listener) || !has_peer(client, (int)owner, uid, gid) ||
+        close_fd(client) || !has_peer(accepted, (int)connector, uid, gid) ||
+        close_fd(accepted) || call(87, (word)address->path, 0, 0, 0, 0)) return 154;
+    return 0;
 }
 
 static long check_named(const struct unix_address *address) {
@@ -829,6 +889,8 @@ static long check(void) {
     long status = check_stream();
     if (!status) status = check_stream_fd_limit();
     if (!status) status = check_stream_pair();
+    if (!status) status = check_peer_pair(SOCK_STREAM);
+    if (!status) status = check_peer_pair(SOCK_SEQPACKET);
     if (!status) status = check_sendto();
     if (!status) status = check_rights_fork(SOCK_STREAM);
     if (!status) status = check_rights_fork(SOCK_SEQPACKET);
@@ -845,6 +907,7 @@ static long check(void) {
     for (unsigned i = sizeof("/tmp/myos-socket-0000000000") - 2; pid; --i, pid /= 10)
         address.path[i] = (char)('0' + pid % 10);
     if (!status) status = check_named(&address);
+    if (!status) status = check_peer_named(&address);
     if (!status) status = check_blocking_stream(&address, 0);
     if (!status) status = check_blocking_stream(&address, 1);
     if (!status) status = check_listener_shutdown(&address);
