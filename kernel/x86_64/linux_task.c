@@ -45,9 +45,9 @@ u16 linux64_task_count(void) {
 
 void linux64_task_init(void) {
     processes[0] = (struct linux64_process){
-        .pid = LINUX64_PID, .sid = LINUX64_PID, .pgid = LINUX64_PID, .threads = 1, .umask = 022,
+        .pid = LINUX64_PID, .sid = LINUX64_PID, .pgid = LINUX64_PID, .threads = 1,
         .pid_ns = linux64_pidns_init(), .pid_identity = linux64_pid_init(),
-        .group_identity = linux64_pid_init(),
+        .group_identity = linux64_pid_init(), .fs = linux64_initial_fs(),
     };
     linux64_current->tid = LINUX64_PID;
     linux64_current->visible_tid = LINUX64_PID;
@@ -150,21 +150,25 @@ static void reap_process(struct linux64_process *process) {
 static long clone_task(struct linux64_frame *frame, uptr flags, uptr stack, uptr parent_tid,
                        uptr child_tid, uptr tls) {
     bool thread = flags == PTHREAD_FLAGS;
-    bool vfork = flags == (CLONE_VM | CLONE_VFORK | SIGCHLD);
+    bool fs_vfork = flags == (CLONE_FS | CLONE_VM | CLONE_VFORK | CLONE_SETTLS | SIGCHLD);
+    bool vfork = fs_vfork || flags == (CLONE_VM | CLONE_VFORK | SIGCHLD);
+    bool shared_fs = fs_vfork || flags == (CLONE_FS | SIGCHLD);
     bool new_user = (flags & CLONE_NEWUSER) != 0;
     bool new_pid = (flags & CLONE_NEWPID) != 0;
     bool shared = thread || vfork;
     if (new_pid && (flags & (CLONE_THREAD | CLONE_PARENT))) return -EINVAL;
-    if ((!shared && ((stack && !new_user && !new_pid) ||
+    if (new_user && (flags & CLONE_FS)) return -EINVAL;
+    if ((!shared && !shared_fs && ((stack && !new_user && !new_pid) ||
                      (flags & ~(CHILD_CLEARTID | CHILD_SETTID | CLONE_NEWUSER | CLONE_NEWPID)) != SIGCHLD)) ||
         !xstate_supported) return -ENOSYS;
-    if (stack >= X64_USER_TOP || (thread && (!stack || tls >= X64_USER_TOP - PMM_PAGE_SIZE)))
+    if (stack >= X64_USER_TOP || ((thread || fs_vfork) && (!stack || tls >= X64_USER_TOP - PMM_PAGE_SIZE)))
         return -EINVAL;
     unsigned slot = 1;
     while (slot < LINUX64_TASK_COUNT && tasks[slot].state != TASK_FREE) ++slot;
     if (slot == LINUX64_TASK_COUNT || next_pid == 0x7fffffff) return -EAGAIN;
     struct linux64_task *child = &tasks[slot];
     struct linux64_task *parent = linux64_current;
+    if (new_user && parent->process->fs->root.path[1]) return -EPERM;
     if (new_pid && !new_user && !(parent->caps.effective & LINUX64_CAP_SYS_ADMIN)) return -EPERM;
     struct linux64_process *process = thread ? parent->process : unused_process();
     if (!process) return -EAGAIN;
@@ -197,11 +201,25 @@ static long clone_task(struct linux64_frame *frame, uptr flags, uptr stack, uptr
     }
     if (shared) ++memory->references;
     child->memory = memory;
+    struct linux64_fs *fs = parent->process->fs;
+    if (!thread) {
+        if (shared_fs) linux64_fs_retain(fs);
+        else fs = linux64_fs_copy(fs);
+        if (!fs) {
+            release_memory(child);
+            linux64_pid_release(identity);
+            linux64_userns_release(ns);
+            return -ENOMEM;
+        }
+    }
     long local = linux64_pid_allocate(pid_ns, next_pid, identity);
     if (local < 0) {
         release_memory(child);
         linux64_pid_release(identity);
-        if (!thread) linux64_userns_release(ns);
+        if (!thread) {
+            linux64_userns_release(ns);
+            linux64_fs_release(fs);
+        }
         return local;
     }
     child->frame = *frame;
@@ -225,7 +243,9 @@ static long clone_task(struct linux64_frame *frame, uptr flags, uptr stack, uptr
         process->threads = 0;
         process->exit_status = 0;
         process->pid_ns_link_inode = 0;
+        process->fdinfo_inode = 0;
         process->userns = ns;
+        process->fs = fs;
         process->pid_ns = pid_ns;
         process->pid_identity = identity;
         linux64_pid_retain(process->group_identity);
@@ -234,11 +254,12 @@ static long clone_task(struct linux64_frame *frame, uptr flags, uptr stack, uptr
     }
     ++process->threads;
     save_state(child);
-    if (thread) {
+    if (thread || fs_vfork) {
         child->fs = tls;
         child->fs_selector = 0;
-        paging64_copy_to_user(parent_tid, &child->visible_tid, sizeof(child->visible_tid));
     }
+    if (thread)
+        paging64_copy_to_user(parent_tid, &child->visible_tid, sizeof(child->visible_tid));
     child->state = TASK_RUNNABLE;
     if (vfork) {
         parent->vfork_child = process->pid;
@@ -500,6 +521,7 @@ static void shutdown_pid_namespace(struct linux64_task *reaper) {
             !linux64_pidns_contains(ns, victim->pid_ns)) continue;
         linux64_close_files(victim);
         linux64_userns_release(victim->userns);
+        linux64_fs_release(victim->fs);
         reap_process(victim);
     }
 }
@@ -523,6 +545,8 @@ static void finish_task(i32 wait_status, bool group) {
     linux64_close_files(process);
     linux64_userns_release(process->userns);
     process->userns = NULL;
+    linux64_fs_release(process->fs);
+    process->fs = NULL;
     if (process->pid == LINUX64_PID) halt_init((u32)process->exit_status >> 8);
     complete_vfork(process->pid);
     i32 namespace_init = linux64_pidns_reaper(process->pid_ns);
@@ -555,9 +579,19 @@ static long unshare(uptr flags) {
     if (flags != CLONE_NEWUSER) return -ENOSYS;
     struct linux64_process *process = linux64_current->process;
     if (process->threads != 1) return -EINVAL;
+    if (process->fs->root.path[1]) return -EPERM;
     struct linux64_userns *ns;
     long result = linux64_userns_create(process->userns, &ns);
     if (result) return result;
+    if (process->fs->references > 1) {
+        struct linux64_fs *fs = linux64_fs_copy(process->fs);
+        if (!fs) {
+            linux64_userns_release(ns);
+            return -ENOMEM;
+        }
+        linux64_fs_release(process->fs);
+        process->fs = fs;
+    }
     linux64_userns_release(process->userns);
     process->userns = ns;
     linux64_userns_caps(linux64_current);
@@ -707,8 +741,8 @@ void linux64_task_syscall(struct linux64_frame *frame) {
         frame->rax = (u64)wait4((i32)frame->rdi, frame->rsi, (u32)frame->rdx, frame->r10);
         break;
     case 95: /* umask */
-        frame->rax = linux64_current->process->umask;
-        linux64_current->process->umask = (u32)frame->rdi & 0777u;
+        frame->rax = linux64_current->process->fs->umask;
+        linux64_current->process->fs->umask = (u32)frame->rdi & 0777u;
         break;
     case 110: { /* getppid */
         const struct linux64_process *process = linux64_current->process;

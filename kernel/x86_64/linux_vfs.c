@@ -18,6 +18,38 @@ struct temporary_node {
 static struct temporary_node temporary[TEMP_NODES];
 static u64 next_inode = 1ull << 32;
 
+struct linux64_fs *linux64_initial_fs(void) {
+    static struct linux64_fs initial = {
+        .root = {.path = "/", .file = {.mode = LINUX64_S_IFDIR | 0555, .inode = 1}},
+        .cwd = {.path = "/", .file = {.mode = LINUX64_S_IFDIR | 0555, .inode = 1}},
+        .references = 1, .umask = 022,
+    };
+    return &initial;
+}
+
+struct linux64_fs *linux64_fs_copy(const struct linux64_fs *source) {
+    uptr page = pmm64_alloc();
+    if (!page) return NULL;
+    struct linux64_fs *fs = pmm64_pointer(page);
+    *fs = *source;
+    fs->page = page;
+    fs->references = 1;
+    if (fs->root.page) pmm64_retain(fs->root.page);
+    if (fs->cwd.page) pmm64_retain(fs->cwd.page);
+    return fs;
+}
+
+void linux64_fs_retain(struct linux64_fs *fs) {
+    ++fs->references;
+}
+
+void linux64_fs_release(struct linux64_fs *fs) {
+    if (!fs || --fs->references) return;
+    if (fs->root.page) pmm64_free(fs->root.page);
+    if (fs->cwd.page) pmm64_free(fs->cwd.page);
+    if (fs->page) pmm64_free(fs->page);
+}
+
 static bool same_path(const char *left, const char *right) {
     while (*left && *left == *right) { ++left; ++right; }
     return *left == *right;
@@ -103,16 +135,25 @@ static long unlink_node(const struct linux64_file *parent, const struct linux64_
     return 0;
 }
 
-static long walk(const struct linux64_file_source *source, const char *absolute,
+static uptr start_at(char *path, const struct linux64_directory *anchor, struct linux64_file *file) {
+    uptr length = 0;
+    while ((path[length] = anchor->path[length])) ++length;
+    *file = anchor->file;
+    return length;
+}
+
+static long walk(const struct linux64_directory *base, const char *input,
                  struct linux64_file *file, char *resolved, enum walk_action action,
                  const struct linux64_file *create) {
-    char path[LINUX64_PATH_LIMIT] = "/";
-    uptr length = 1;
+    const struct linux64_fs *fs = linux64_current->process->fs;
+    const struct linux64_directory *root = &fs->root;
+    const struct linux64_file_source *source = linux64_file_source();
+    const char *absolute = input;
+    char path[LINUX64_PATH_LIMIT];
+    uptr length = start_at(path, *input == '/' ? root : base ? base : &fs->cwd, file);
     /* Обход не уступает CPU, поэтому указатели на цели действуют до его конца. */
     const char *suffixes[LINK_LIMIT];
     unsigned depth = 0, links = 0;
-    find_node(source, path, file);
-    if (*absolute++ != '/') return -ENOENT;
     for (;;) {
         while (*absolute == '/') ++absolute;
         if (!*absolute) {
@@ -135,9 +176,11 @@ static long walk(const struct linux64_file_source *source, const char *absolute,
         if (count > NAME_LIMIT) return -ENAMETOOLONG;
         if (count == 1 && start[0] == '.') continue;
         if (count == 2 && start[0] == '.' && start[1] == '.') {
+            if (length == 1 || same_path(path, root->path)) continue;
             while (length > 1 && path[--length] != '/') {}
             path[length] = 0;
-            find_node(source, path, file);
+            if (same_path(path, root->path)) *file = root->file;
+            else if (!find_node(source, path, file)) return -ENOENT;
             continue;
         }
         uptr parent_length = length;
@@ -147,7 +190,7 @@ static long walk(const struct linux64_file_source *source, const char *absolute,
         path[length] = 0;
         if (final && action == WALK_UNLINK && !file->writable_directory) return -EROFS;
         struct linux64_file child;
-        if (!find_node(source, path, &child)) {
+        if (file->private_directory || !find_node(source, path, &child)) {
             if (!final || action != WALK_CREATE ||
                 (trailing && (create->mode & LINUX64_S_IFMT) != LINUX64_S_IFDIR)) return -ENOENT;
             if (!file->writable_directory) return -EROFS;
@@ -163,9 +206,7 @@ static long walk(const struct linux64_file_source *source, const char *absolute,
             if (trailing) suffixes[depth++] = absolute;
             absolute = (const char *)child.bytes;
             if (*absolute == '/') {
-                length = 1;
-                path[length] = 0;
-                find_node(source, path, file);
+                length = start_at(path, root, file);
             } else {
                 length = parent_length;
                 path[length] = 0;
@@ -182,36 +223,36 @@ static long walk(const struct linux64_file_source *source, const char *absolute,
     return 0;
 }
 
-long linux64_vfs_walk(const struct linux64_file_source *source, const char *absolute,
+long linux64_vfs_walk(const struct linux64_directory *base, const char *path,
                       struct linux64_file *file, char *resolved, bool follow_final) {
-    return walk(source, absolute, file, resolved, follow_final ? WALK_FOLLOW : WALK_NOFOLLOW, NULL);
+    return walk(base, path, file, resolved, follow_final ? WALK_FOLLOW : WALK_NOFOLLOW, NULL);
 }
 
-long linux64_vfs_mkdir(const struct linux64_file_source *source, const char *absolute, u32 mode) {
+long linux64_vfs_mkdir(const struct linux64_directory *base, const char *path, u32 mode) {
     const struct linux64_file node = {.mode = mode, .writable_directory = true};
     struct linux64_file file;
-    return walk(source, absolute, &file, NULL, WALK_CREATE, &node);
+    return walk(base, path, &file, NULL, WALK_CREATE, &node);
 }
 
-long linux64_vfs_symlink(const struct linux64_file_source *source, const char *absolute,
+long linux64_vfs_symlink(const struct linux64_directory *base, const char *path,
                         const char *target, uptr length) {
     const struct linux64_file node = {
         .bytes = (const u8 *)target, .size = length, .mode = LINUX64_S_IFLNK | 0777,
     };
     struct linux64_file file;
-    return walk(source, absolute, &file, NULL, WALK_CREATE, &node);
+    return walk(base, path, &file, NULL, WALK_CREATE, &node);
 }
 
-long linux64_vfs_socket(const struct linux64_file_source *source, const char *absolute, u32 mode,
+long linux64_vfs_socket(const struct linux64_directory *base, const char *path, u32 mode,
                         u64 *inode) {
     const struct linux64_file node = {.mode = LINUX64_S_IFSOCK | mode};
     struct linux64_file file;
-    long result = walk(source, absolute, &file, NULL, WALK_CREATE, &node);
+    long result = walk(base, path, &file, NULL, WALK_CREATE, &node);
     if (!result) *inode = file.inode;
     return result;
 }
 
-long linux64_vfs_unlink(const struct linux64_file_source *source, const char *absolute) {
+long linux64_vfs_unlink(const struct linux64_directory *base, const char *path) {
     struct linux64_file file;
-    return walk(source, absolute, &file, NULL, WALK_UNLINK, NULL);
+    return walk(base, path, &file, NULL, WALK_UNLINK, NULL);
 }
