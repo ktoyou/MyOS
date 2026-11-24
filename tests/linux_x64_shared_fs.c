@@ -81,6 +81,7 @@ static void check_jail_exec(int missing) {
             open_path("/../../dev/null", 0) != -2 ||
             call(272, NEWUSER, 0, 0, 0) != -1 ||
             call(56, NEWUSER | SIGCHLD, 0, 0, 0) != -1 ||
+            exec_path("/proc/self/exe") != -2 ||
             exec_path("/outside.elf") != -2) finish(3);
         finish(exec_path("probe") == -2 ? 40 : 4);
     }

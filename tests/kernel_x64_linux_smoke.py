@@ -347,9 +347,20 @@ def check_exec(build):
     serial = check_guest('execve', probe.read_bytes(), 'Linux x86-64 exit status=0x00', files=files)
     assert marker in serial, serial
     symbols = subprocess.check_output(['nm', str(probe)], text=True)
-    entry = next(int(line.split()[0], 16) for line in symbols.splitlines() if line.endswith(' exec_oom'))
+    entries = {line.split()[-1]: int(line.split()[0], 16) for line in symbols.splitlines()
+               if line.endswith((' exec_self_entry', ' exec_oom'))}
+    self_exec = bytearray(probe.read_bytes())
+    struct.pack_into('<Q', self_exec, 24, entries['exec_self_entry'])
+    with tempfile.TemporaryDirectory(prefix='myos-host-self-exec-') as temp:
+        host_self = pathlib.Path(temp) / 'self.elf'
+        host_self.write_bytes(self_exec)
+        host_self.chmod(0o755)
+        host = subprocess.run([str(host_self)], env={}, capture_output=True, timeout=5)
+        assert (host.returncode, host.stdout, host.stderr) == (0, b'', b''), host
+    check_guest('execve-self', self_exec, 'Linux x86-64 exit status=0x00',
+                exec_path='/myos/self.elf')
     oom = bytearray(probe.read_bytes())
-    struct.pack_into('<Q', oom, 24, entry)
+    struct.pack_into('<Q', oom, 24, entries['exec_oom'])
     large = bytearray(target.read_bytes())
     loads = [offset for offset in program_headers(large) if struct.unpack_from('<I', large, offset)[0] == 1]
     last = max(loads, key=lambda offset: struct.unpack_from('<Q', large, offset + 16)[0])

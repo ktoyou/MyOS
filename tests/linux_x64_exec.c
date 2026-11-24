@@ -3,6 +3,7 @@
 extern long clone_exec(word stack, unsigned empty_argv);
 __attribute__((noreturn)) void child_exec(unsigned empty_argv);
 __attribute__((noreturn)) void exec_shared(word argc);
+__attribute__((noreturn)) void exec_self(const word *stack);
 
 __asm__(
     ".text\n"
@@ -25,6 +26,11 @@ __asm__(
     "exec_shared_entry:\n"
     "mov (%rsp),%rdi\n"
     "call exec_shared\n"
+    "ud2\n"
+    ".global exec_self_entry\n"
+    "exec_self_entry:\n"
+    "mov %rsp,%rdi\n"
+    "call exec_self\n"
     "ud2\n"
 );
 
@@ -136,6 +142,30 @@ __attribute__((noreturn)) void _start(void) {
         if (sys(1, 1, (word)marker, sizeof(marker) - 1, 0, 0, 0) != sizeof(marker) - 1) status = 12;
     }
     finish(status);
+}
+
+__attribute__((noreturn)) void exec_self(const word *stack) {
+    static const char proc_exe[] = "/proc/self/exe";
+    static const char proc_alias[] = "/proc/./self//exe";
+    char actual[4096];
+    long length = sys(89, (word)proc_exe, (word)actual, sizeof(actual), 0, 0, 0);
+    if (length <= 0 || length >= (long)sizeof(actual)) finish(70);
+    actual[length] = 0;
+    const char *path = proc_exe, *stage = "first";
+    if (stack[0] != 1) {
+        const char *const *argv = (const void *)(stack + 1);
+        if (stack[0] != 3 || stack[4] || stack[5] || !equal(actual, argv[2])) finish(71);
+        const word *aux = stack + 6;
+        for (; aux[0] && aux[0] != 31; aux += 2) {}
+        if (!aux[0] || !equal((const char *)aux[1], argv[1])) finish(72);
+        if (equal(argv[0], "second") && equal(argv[1], proc_alias)) finish(0);
+        if (!equal(argv[0], "first") || !equal(argv[1], proc_exe)) finish(73);
+        path = proc_alias;
+        stage = "second";
+    }
+    const char *const argv[] = {stage, path, actual, 0};
+    sys(59, (word)path, (word)argv, 0, 0, 0, 0);
+    finish(74);
 }
 
 __attribute__((noreturn)) void exec_shared(word argc) {

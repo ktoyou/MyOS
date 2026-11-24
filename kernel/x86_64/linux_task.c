@@ -467,8 +467,10 @@ bool linux64_commit_exec(struct linux64_frame *frame, uptr root, uptr entry, upt
     task->caps = (struct linux64_caps){0};
     task->tid = process->pid;
     task->visible_tid = linux64_pid_number(process->pid_identity, process->pid_ns);
-    process->executable_path_length = path_length;
-    for (uptr i = 0; i <= path_length; ++i) process->executable_path[i] = path[i];
+    if (path) {
+        process->executable_path_length = path_length;
+        for (uptr i = 0; i <= path_length; ++i) process->executable_path[i] = path[i];
+    }
     task->fs = task->gs = 0;
     task->fs_selector = task->gs_selector = 0;
     task->ds_selector = task->es_selector = 0x1b;

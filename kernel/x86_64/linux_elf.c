@@ -313,7 +313,9 @@ long linux64_execve(struct linux64_frame *frame, uptr filename, uptr argv, uptr 
     uptr entry, stack, data_bytes;
     result = prepare_image(&file, source, &args, EXEC_STACK_SIZE, &entry, &stack, &data_bytes,
                            process->userns, true, process->data_limit.soft);
-    if (!result && linux64_commit_exec(frame, root, entry, stack, data_bytes, exec_args.absolute, absolute_length))
+    /* При запуске через /proc/self/exe сохраняем путь образа, а AT_EXECFN берём из filename. */
+    const char *new_path = file.proc_exe ? NULL : exec_args.absolute;
+    if (!result && linux64_commit_exec(frame, root, entry, stack, data_bytes, new_path, absolute_length))
         return 0;
     paging64_switch_root(previous);
     paging64_drop_root(root);
