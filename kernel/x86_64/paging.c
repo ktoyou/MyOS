@@ -388,6 +388,21 @@ const u8 *paging64_user_read(uptr address) {
     return user_pointer(address, PRESENT | USER);
 }
 
+uptr paging64_copy_from_user(void *destination, uptr address, uptr length) {
+    u8 *target = destination;
+    uptr copied = 0;
+    while (copied < length) {
+        uptr current = address + copied;
+        const u8 *source = paging64_user_read(current);
+        if (!source) break;
+        uptr chunk = PMM_PAGE_SIZE - (current & (PMM_PAGE_SIZE - 1));
+        if (chunk > length - copied) chunk = length - copied;
+        for (uptr i = 0; i < chunk; ++i) target[copied + i] = source[i];
+        copied += chunk;
+    }
+    return copied;
+}
+
 bool paging64_shared_futex_address(uptr address) {
     if (!paging64_user_read(address)) return false;
     return (*find_leaf(active_root(), address) & (WRITE | FILE_BACKED)) != 0;

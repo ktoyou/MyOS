@@ -43,8 +43,43 @@ static long check_files(void) {
     return call(3, fd, 0, 0, 0) ? 11 : 0;
 }
 
+struct action {
+    word handler, flags, restorer, mask;
+};
+
+static long sigaction(word signal, const struct action *action, struct action *old) {
+    return call(13, signal, (word)action, (word)old, sizeof(word));
+}
+
+static long check_signals(void) {
+    struct action *cross = (void *)(buffer + 4096 - 16);
+    struct action old = {1, 1, 1, 1};
+    if (sigaction(13, 0, &old) || old.handler || old.flags || old.restorer || old.mask)
+        return 14;
+    *cross = (struct action){1, 0x14001c04ul, 0x123450ul, ~0ul};
+    if (sigaction(13, cross, cross) || cross->handler || cross->flags ||
+        cross->restorer || cross->mask) return 15;
+    if (sigaction(13, 0, cross) || cross->handler != 1 || cross->flags != 0x14000804ul ||
+        cross->restorer != 0x123450ul || cross->mask != ~(0x40100ul)) return 16;
+
+    if (sigaction(9, 0, &old) || sigaction(19, 0, &old) ||
+        sigaction(9, cross, 0) != -22 || sigaction(19, cross, 0) != -22 ||
+        sigaction(65, 0, 0) != -22 ||
+        call(13, 0, 0xffff800000000000ul, 0, 16) != -22 ||
+        call(13, 0, 0xffff800000000000ul, 0, 8) != -14) return 17;
+
+    const struct action handler = {0x123456ul, 0, 0, 0};
+    if (sigaction(64, &handler, (void *)path) != -14 ||
+        sigaction(64, 0, &old) || old.handler != handler.handler) return 18;
+    const struct action initial = {0};
+    if (sigaction(13, &initial, &old) || old.handler != 1 ||
+        sigaction(13, 0, &old) || old.handler) return 19;
+    return 0;
+}
+
 __attribute__((noreturn)) void _start(void) {
     long status = check_files();
+    if (!status) status = check_signals();
     if (!status) {
         static const char message[] = "Linux ELF64 files probe\n";
         if (call(1, 1, (word)message, sizeof(message) - 1, 0) != sizeof(message) - 1)
