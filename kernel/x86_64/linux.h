@@ -63,6 +63,7 @@ long linux64_getrandom(uptr address, uptr length, u32 flags);
 void linux64_clock_init(void);
 bool linux64_monotonic_ns(u64 *nanos);
 long linux64_clock_gettime(i32 clock, uptr address);
+long linux64_gettimeofday(uptr timeval, uptr timezone);
 void linux64_reset_signals(void);
 long linux64_rt_sigaction(i32 signal, uptr action, uptr previous, uptr sigset_size);
 long linux64_rt_sigprocmask(i32 how, uptr set, uptr previous, uptr sigset_size);

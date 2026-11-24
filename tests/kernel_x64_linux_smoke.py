@@ -1,4 +1,5 @@
 """Run the same Linux ELF64 files on the host and in the MyOS guest."""
+import datetime
 import os
 import pathlib
 import resource
@@ -24,12 +25,12 @@ def linux_root(elf, files, exec_path='/myos/test.elf'):
     return root
 
 
-def check_guest(name, elf, marker, *, fault=False, files=None, cpu='max', exec_path='/myos/test.elf'):
+def check_guest(name, elf, marker, *, fault=False, files=None, cpu='max', exec_path='/myos/test.elf', rtc=None):
     payload, kernel_end = image('kernel-linux')
     root_header = linux_root(elf, files or {}, exec_path)
     with tempfile.TemporaryDirectory(prefix='myos-linux-x64-') as temp:
         serial = boot_x64(pathlib.Path(temp), 'x64-linux-' + name, payload,
-                          kernel_end, [marker], live_root_header=root_header, cpu=cpu)
+                          kernel_end, [marker], live_root_header=root_header, cpu=cpu, rtc=rtc)
     if not fault:
         assert 'x86-64 exception' not in serial, serial
     return serial
@@ -89,12 +90,18 @@ def check_files(build):
     probe = build / 'linux-files.elf'
     data = (build / 'linux-interp.elf').absolute()
     host = subprocess.run([str(probe.resolve())], env={}, capture_output=True, timeout=5)
-    assert (host.returncode, host.stdout, host.stderr) == (
-        0, b'Linux uname: Linux\nLinux ELF64 files probe\n', b''), host
+    assert (host.returncode, host.stderr) == (0, b''), host
+    host_uname, host_time, host_marker = host.stdout.decode().splitlines()
+    assert host_uname == 'Linux uname: Linux' and host_marker == 'Linux ELF64 files probe', host
+    assert int(host_time.removeprefix('Linux UTC seconds: ')) > 0, host
+    rtc_date = datetime.datetime(2040, 2, 29, 12, 34, 56, tzinfo=datetime.timezone.utc)
     serial = check_guest('files', probe.read_bytes(), 'Linux x86-64 exit status=0x00',
-                         files={data: data.read_bytes()})
+                         files={data: data.read_bytes()},
+                         rtc=f'base={rtc_date.replace(tzinfo=None).isoformat()},clock=vm')
     assert 'Linux uname: MyOS' in serial and 'Linux ELF64 files probe' in serial, serial
-    print('OVMF: Linux ELF64 files, directories, descriptors, signals, uname and process IDs: PASS', flush=True)
+    timestamp = int(serial.split('Linux UTC seconds: ', 1)[1].splitlines()[0])
+    assert rtc_date.timestamp() <= timestamp <= rtc_date.timestamp() + 30, serial
+    print('OVMF: Linux ELF64 files, directories, descriptors, signals, uname, process IDs and UTC clocks: PASS', flush=True)
 
 
 def check_mmap(build):

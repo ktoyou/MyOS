@@ -304,6 +304,42 @@ static long check_directories(void) {
     return 0;
 }
 
+static long check_realtime(void) {
+    const word invalid = 0xffff800000000000ul;
+    struct { long sec, nsec; } start, end;
+    struct { long sec, usec; } tv;
+    struct { int west, dst; unsigned guard; } tz = {-1, -1, 0xa5a5a5a5u};
+    if (call(96, 0, 0, 0, 0) || call(96, 0, (word)&tz, 0, 0) ||
+        tz.west == -1 || tz.dst == -1 || tz.guard != 0xa5a5a5a5u) return 59;
+    if (call(63, (word)buffer, 0, 0, 0) || (buffer[0] == 'M' && (tz.west || tz.dst))) return 59;
+    if (call(228, 0, (word)&start, 0, 0) || call(96, (word)&tv, (word)&tz, 0, 0) ||
+        call(228, 0, (word)&end, 0, 0) || tz.guard != 0xa5a5a5a5u) return 60;
+    if (start.nsec < 0 || start.nsec >= 1000000000 || end.nsec < 0 || end.nsec >= 1000000000 ||
+        tv.sec <= 0 || tv.usec < 0 || tv.usec >= 1000000) return 61;
+    long usec = tv.sec * 1000000 + tv.usec;
+    if (usec < start.sec * 1000000 + start.nsec / 1000 ||
+        usec > end.sec * 1000000 + end.nsec / 1000) return 62;
+    if (call(228, -1, invalid, 0, 0) != -22 || call(228, 0, 0, 0, 0) != -14 ||
+        call(96, invalid, 0, 0, 0) != -14 || call(96, 0, invalid, 0, 0) != -14) return 63;
+    long timestamp = tv.sec;
+    tv.sec = -1;
+    if (call(96, (word)&tv, invalid, 0, 0) != -14 || tv.sec < timestamp) return 64;
+    if (call(228, 1, (word)&start, 0, 0) || start.sec < 0 ||
+        start.nsec < 0 || start.nsec >= 1000000000) return 65;
+
+    long *page_end = (void *)(buffer + 4096 - sizeof(long));
+    *page_end = -1;
+    tz.west = tz.dst = -1;
+    if (call(10, (word)(buffer + 4096), 4096, 0, 0) ||
+        call(96, (word)page_end, (word)&tz, 0, 0) != -14 || *page_end < timestamp ||
+        tz.west != -1 || tz.dst != -1 || call(10, (word)(buffer + 4096), 4096, 3, 0)) return 66;
+
+    char message[] = "Linux UTC seconds: 000000000000\n";
+    for (unsigned i = sizeof(message) - 3; i >= sizeof("Linux UTC seconds: ") - 1; --i, timestamp /= 10)
+        message[i] = (char)('0' + timestamp % 10);
+    return call(1, 1, (word)message, sizeof(message) - 1, 0) == sizeof(message) - 1 ? 0 : 67;
+}
+
 __attribute__((noreturn)) void _start(void) {
     long status = check_files();
     if (!status) status = check_signals();
@@ -314,6 +350,7 @@ __attribute__((noreturn)) void _start(void) {
     if (!status) status = check_null();
     if (!status) status = check_dup();
     if (!status) status = check_directories();
+    if (!status) status = check_realtime();
     if (!status) {
         static const char message[] = "Linux ELF64 files probe\n";
         if (call(1, 1, (word)message, sizeof(message) - 1, 0) != sizeof(message) - 1)
