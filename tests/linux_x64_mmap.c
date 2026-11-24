@@ -115,6 +115,85 @@ static long check_shared(void) {
     return 0;
 }
 
+static long open_proc_fd(char path[], word flags) {
+    return call(257, (unsigned)-100, (word)path, flags, 0, 0, 0);
+}
+
+static long close_fd(long fd) {
+    return call(3, fd, 0, 0, 0, 0, 0);
+}
+
+static long resize_fd(long fd, word size) {
+    return call(77, fd, size, 0, 0, 0, 0);
+}
+
+static long fcntl(long fd, word command, word value) {
+    return call(72, fd, command, value, 0, 0, 0);
+}
+
+static long check_memfd(void) {
+    const word size = 0x10020;
+    static const char name[] = "shared-memory-region";
+    if (call(319, 0, 0xb, 0, 0, 0, 0) != -14 ||
+        call(319, (word)name, 0x8000, 0, 0, 0, 0) != -22) return 40;
+    long fd = call(319, (word)name, 0xb, 0, 0, 0, 0);
+    if (fd < 3 || fd > 99 || fcntl(fd, 1, 0) != 1 || fcntl(fd, 1034, 0) != 0x20 ||
+        resize_fd(fd, size) || fcntl(fd, 1033, 0x8000) != -22 ||
+        fcntl(fd, 1033, 7) || fcntl(fd, 1034, 0) != 0x27 || fcntl(fd, 1033, 0) != -1 ||
+        resize_fd(fd, size) || resize_fd(fd, size - 1) != -1 || resize_fd(fd, size + 1) != -1)
+        return 41;
+    char path[] = "/proc/self/fd/00";
+    char *digit = path + sizeof("/proc/self/fd/") - 1;
+    digit[1] += fd % 10;
+    if (fd < 10 && open_proc_fd(path, 0) != -2) return 42;
+    digit[0] = fd < 10 ? digit[1] : (char)('0' + fd / 10);
+    if (fd < 10) digit[1] = 0;
+    if (open_proc_fd(path, 0x20000) != -40) return 43;
+    long ro = open_proc_fd(path, 0x80000);
+    if (ro < 0 || ro == fd || fcntl(ro, 1, 0) != 1 || (fcntl(ro, 3, 0) & 3) != 0 ||
+        (fcntl(fd, 3, 0) & 3) != 2 || fcntl(ro, 1034, 0) != 0x27 ||
+        resize_fd(ro, size) != -22 || mmap(0, size, 3, 1, ro, 0) != -13) return 44;
+    word stat_rw[18], stat_ro[18];
+    if (call(5, fd, (word)stat_rw, 0, 0, 0, 0) || call(5, ro, (word)stat_ro, 0, 0, 0, 0) ||
+        stat_rw[0] != stat_ro[0] || stat_rw[1] != stat_ro[1] ||
+        stat_rw[6] != size || stat_ro[6] != size) return 45;
+    long rw_map = mmap(0, size, 3, 1, fd, 0), ro_map = mmap(0, size, 1, 1, ro, 0);
+    if (rw_map < 0 || ro_map < 0 || mprotect(ro_map, 0x1000, 3) != -13) return 46;
+    volatile unsigned char *rw_bytes = (void *)rw_map, *ro_bytes = (void *)ro_map;
+    if (rw_bytes[0] || ro_bytes[size - 1]) return 47;
+    rw_bytes[0] = 0x51;
+    rw_bytes[size - 1] = 0x72;
+    unsigned char byte;
+    if (mmap(rw_map, 0x1000, 3, 0x11, fd, 0) != rw_map || rw_bytes[0] != 0x51 ||
+        call(17, ro, (word)&byte, 1, size - 1, 0, 0) != 1 || byte != 0x72 ||
+        call(0, ro, (word)&byte, 1, 0, 0, 0) != 1 || byte != 0x51 ||
+        call(0, fd, (word)&byte, 1, 0, 0, 0) != 1 || byte != 0x51 ||
+        close_fd(fd) || open_proc_fd(path, 0) != -2 || close_fd(ro)) return 48;
+    if (mprotect(ro_map, size, 0) || mprotect(ro_map, size, 1) ||
+        mprotect(ro_map, size, 3) != -13 || ro_bytes[size - 1] != 0x72) return 49;
+    rw_bytes[0] = 0x33;
+    if (ro_bytes[0] != 0x33 || munmap(rw_map, size) || ro_bytes[0] != 0x33 ||
+        munmap(ro_map, size)) return 50;
+    return 0;
+}
+
+static long check_memfd_resize(void) {
+    const word size = 0x201010;
+    long fd = call(319, (word)"", 0, 0, 0, 0, 0);
+    if (fd < 0 || fcntl(fd, 1034, 0) != 1 || resize_fd(fd, size)) return 51;
+    long last = mmap(0, 0x2000, 3, 1, fd, 0x200000);
+    if (last < 0) return 52;
+    volatile unsigned char *bytes = (void *)last;
+    bytes[0] = 0x25;
+    bytes[0x1010 - 1] = 0x30;
+    if (munmap(last, 0x2000) || resize_fd(fd, 0x200001) || resize_fd(fd, size)) return 53;
+    last = mmap(0, 0x2000, 1, 1, fd, 0x200000);
+    if (last < 0) return 54;
+    bytes = (void *)last;
+    if (bytes[0] != 0x25 || bytes[0x1010 - 1] || munmap(last, 0x2000) || close_fd(fd)) return 55;
+    return 0;
+}
+
 static long check_mmap(void) {
     long fd = open_data();
     if (fd < 0) return 1;
@@ -148,6 +227,8 @@ static __attribute__((noreturn)) void finish(long status) {
 __attribute__((noreturn)) void _start(void) {
     long status = check_mmap();
     if (!status) status = check_shared();
+    if (!status) status = check_memfd();
+    if (!status) status = check_memfd_resize();
     if (!status) status = check_sparse();
     if (!status) {
         static const char message[] = "Linux ELF64 mmap and mprotect probe\n";
@@ -155,6 +236,23 @@ __attribute__((noreturn)) void _start(void) {
             status = 10;
     }
     finish(status);
+}
+
+__attribute__((noreturn)) void mmap_memfd_nx(void) {
+    long fd = call(319, (word)"", 0xb, 0, 0, 0, 0);
+    if (fd < 0 || resize_fd(fd, 0x1000)) finish(56);
+    long rw = mmap(0, 0x1000, 3, 1, fd, 0);
+    if (rw < 0) finish(57);
+    *(volatile unsigned char *)rw = 0xc3;
+    if (resize_fd(fd, 0x2000) != -16 || munmap(rw, 0x1000)) finish(59);
+    word stat[18];
+    if (resize_fd(fd, 0x10000000) != -12 || call(5, fd, (word)stat, 0, 0, 0, 0) ||
+        stat[6] != 0x1000 || resize_fd(fd, 0x201000)) finish(60);
+    rw = mmap(0, 0x1000, 3, 1, fd, 0);
+    if (rw < 0 || mmap(0, 0x1000, 5, 1, fd, 0) != -13 ||
+        mprotect(rw, 0x1000, 5) != -13 || *(volatile unsigned char *)rw != 0xc3) finish(61);
+    ((void (*)(void))rw)();
+    finish(58);
 }
 
 __attribute__((noreturn)) void mmap_past_eof(void) {

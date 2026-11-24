@@ -19,7 +19,13 @@ struct linux64_file_source {
 bool linux64_run(const void *image, uptr size, const char *path, uptr path_length,
                  const struct linux64_file_source *source);
 void linux64_use_files(const struct linux64_file_source *source, const char *path, uptr path_length);
-const struct linux64_file *linux64_get_file(i32 fd);
+struct linux64_fd_view {
+    struct linux64_file file;
+    const void *object;
+    uptr (*frame)(const void *object, uptr offset);
+    bool writable, may_grow;
+};
+bool linux64_get_file(i32 fd, struct linux64_fd_view *view);
 long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg3);
 long linux64_mmap(uptr address, uptr length, u32 protection, u32 flags, i32 fd, uptr offset);
 long linux64_mprotect(uptr address, uptr length, uptr protection);

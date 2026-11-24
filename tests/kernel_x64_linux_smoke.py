@@ -136,7 +136,12 @@ def check_mmap(build):
     sparse_oom = bytearray(elf)
     struct.pack_into('<Q', sparse_oom, 24, symbols['mprotect_sparse_oom'])
     check_guest('mprotect-sparse-oom', sparse_oom, 'Linux x86-64 exit status=0x00', files=files)
-    print('OVMF: private and shared mmap, mprotect, RELRO and Linux futex wake: PASS', flush=True)
+    memfd_nx = bytearray(elf)
+    struct.pack_into('<Q', memfd_nx, 24, symbols['mmap_memfd_nx'])
+    serial = check_guest('mmap-memfd-nx', memfd_nx, 'x86-64 exception halted', fault=True)
+    assert ('vector=0x000000000000000e error=0x0000000000000015' in serial and
+            'cr2=0x0000001000000000 cpl=3' in serial), serial
+    print('OVMF: mmap, memfd, mprotect, RELRO and Linux futex wake: PASS', flush=True)
 
 
 def main():

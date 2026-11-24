@@ -6,7 +6,7 @@
 
 extern const u8 _start[], __kernel_end[];
 static u64 available[BITMAP_WORDS];
-static u64 allocated[BITMAP_WORDS];
+static u16 references[PAGE_COUNT];
 static u32 next_page = PAGE_COUNT;
 static uptr physical_base;
 
@@ -38,10 +38,8 @@ static void reserve(u64 start, u64 end) {
 
 bool pmm64_init(const struct boot_info *boot) {
     const struct boot_region *map = (const void *)(uptr)boot->map_phys;
-    for (u32 i = 0; i < BITMAP_WORDS; ++i) {
-        available[i] = 0;
-        allocated[i] = 0;
-    }
+    for (u32 i = 0; i < BITMAP_WORDS; ++i) available[i] = 0;
+    for (u32 i = 0; i < PAGE_COUNT; ++i) references[i] = 0;
     for (u32 i = 0; i < boot->map_count; ++i) {
         if (map[i].type != 1 || !(map[i].attributes & 1u)) continue;
         u32 first = (u32)(map[i].base / PMM_PAGE_SIZE);
@@ -64,7 +62,7 @@ uptr pmm64_alloc(void) {
     if (page == PAGE_COUNT) return 0;
     u64 bit = page_bit(page);
     available[page / 64] &= ~bit;
-    allocated[page / 64] |= bit;
+    references[page] = 1;
     next_page = find_available(page + 1);
 
     uptr physical = (uptr)page * PMM_PAGE_SIZE;
@@ -73,13 +71,29 @@ uptr pmm64_alloc(void) {
     return physical;
 }
 
+static u16 *page_references(uptr physical) {
+    if (physical >= BOOT_MEMORY_LIMIT || (physical & (PMM_PAGE_SIZE - 1))) return NULL;
+    return &references[physical / PMM_PAGE_SIZE];
+}
+
+bool pmm64_retain(uptr physical) {
+    u16 *count = page_references(physical);
+    if (!count || !*count || *count == 0xffffu) return false;
+    ++*count;
+    return true;
+}
+
+bool pmm64_has_aliases(uptr physical) {
+    const u16 *count = page_references(physical);
+    return count && *count > 1;
+}
+
 bool pmm64_free(uptr physical) {
-    if (physical >= BOOT_MEMORY_LIMIT || (physical & (PMM_PAGE_SIZE - 1))) return false;
+    u16 *count = page_references(physical);
+    if (!count || !*count) return false;
+    if (--*count) return true;
     u32 page = (u32)(physical / PMM_PAGE_SIZE);
-    u64 bit = page_bit(page);
-    if (!(allocated[page / 64] & bit)) return false;
-    allocated[page / 64] &= ~bit;
-    available[page / 64] |= bit;
+    available[page / 64] |= page_bit(page);
     if (page < next_page) next_page = page;
     return true;
 }

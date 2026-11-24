@@ -15,6 +15,8 @@ struct boot_region {
 /* Однократная инициализация из проверенной карты до запуска других CPU. */
 bool pmm64_init(const struct boot_info *boot);
 uptr pmm64_alloc(void);
+bool pmm64_retain(uptr physical);
+bool pmm64_has_aliases(uptr physical);
 bool pmm64_free(uptr physical);
 /* Только для физических страниц под управлением аллокатора. */
 void *pmm64_pointer(uptr physical);
