@@ -681,7 +681,9 @@ bool linux64_special_node(const char *path, struct linux64_file *file) {
     enum linux64_proc_node proc = proc_path(path);
     if (proc == PROC_EXE) {
         const char *exe = linux64_current->process->executable_path;
-        return files.lookup && files.lookup(files.context, exe, file);
+        if (!files.lookup || !files.lookup(files.context, exe, file)) return false;
+        file->proc_exe = true;
+        return true;
     }
     if (proc == PROC_FDS) {
         struct linux64_process *process = linux64_current->process;
