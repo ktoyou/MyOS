@@ -3,7 +3,7 @@
 
 #include "linux.h"
 
-#define LINUX64_TASK_COUNT 64u
+#define LINUX64_TASK_COUNT 256u
 #define LINUX64_PROCESS_COUNT 16u
 #define LINUX64_RESERVE_COUNT 256u
 #define LINUX64_SIGNAL_COUNT 64u
@@ -178,7 +178,7 @@ struct linux64_task {
     u16 ds_selector, es_selector, fs_selector, gs_selector;
     enum linux64_task_state state;
     bool finish_wait, no_new_privs;
-    u8 xstate[LINUX64_XSTATE_SIZE] __attribute__((aligned(64)));
+    uptr xstate_physical;
 };
 
 extern struct linux64_task *linux64_current;
@@ -211,7 +211,7 @@ long linux64_userns_read(const struct linux64_userns *ns, enum linux64_proc_node
                          uptr buffer, uptr count, uptr offset);
 long linux64_userns_write(struct linux64_userns *ns, enum linux64_proc_node file,
                           uptr buffer, uptr count, uptr offset);
-void linux64_task_init(uptr data_bytes);
+bool linux64_task_init(uptr data_bytes);
 const struct linux64_process *linux64_process_by_pid(i32 pid);
 u16 linux64_task_count(void);
 void linux64_task_syscall(struct linux64_frame *frame);

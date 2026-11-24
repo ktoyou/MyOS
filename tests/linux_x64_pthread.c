@@ -7,7 +7,7 @@ static volatile unsigned timed_word;
 static volatile int parent_tid, result;
 static long pid, pipe_write, inherited_no_new_privs;
 
-enum { MAX_WORKERS = 63, MAX_CHILDREN = 15 };
+enum { MAX_WORKERS = 255, MAX_CHILDREN = 15 };
 static char worker_stacks[MAX_WORKERS + 1][4096] __attribute__((aligned(16)));
 static struct worker_slot {
     word index;
@@ -81,12 +81,17 @@ __attribute__((noreturn)) void worker(void) {
         __asm__ volatile("mov %%fs:0,%0" : "=r"(index));
         if (index > MAX_WORKERS || simple(186, 0) != workers[index].parent_tid ||
             simple(39, 0) != pid) finish(231, 24);
+        word pattern = 0x34df5b37abc15850ul + index;
+        __asm__ volatile("movq %0,%%xmm0" :: "r"(pattern) : "memory");
         __atomic_add_fetch(&arrived, 1, __ATOMIC_RELEASE);
         futex(&arrived, 0x81, 1, 0);
         while (!__atomic_load_n(&gate, __ATOMIC_ACQUIRE)) {
             long rc = futex(&gate, 0x80, 0, 0);
             if (rc && rc != -11) finish(231, 24);
         }
+        word observed;
+        __asm__ volatile("movq %%xmm0,%0" : "=r"(observed) :: "memory");
+        if (observed != pattern) finish(231, 32);
         finish(60, 0);
     }
     if (mode == 3) {
@@ -122,6 +127,9 @@ __attribute__((noreturn)) void worker(void) {
 }
 
 static int check_thread_capacity(unsigned count, int check_limit) {
+    word info[14];
+    if (check_limit && simple(99, (word)info)) return 33;
+    word free_before = check_limit ? info[5] : 0;
     mode = 4;
     __atomic_store_n(&gate, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&arrived, 0, __ATOMIC_RELAXED);
@@ -143,6 +151,8 @@ static int check_thread_capacity(unsigned count, int check_limit) {
         long rc = futex(&arrived, 0x80, seen, 0);
         if (rc && rc != -11) return 26;
     }
+    if (check_limit && (simple(99, (word)info) || (unsigned short)info[10] != count + 1 ||
+                        info[5] + count * 4096ul > free_before)) return 33;
     __atomic_store_n(&gate, 1, __ATOMIC_RELEASE);
     if (futex(&gate, 0x81, 0x7fffffff, 0) < 0) return 26;
     for (unsigned i = 0; i < count; ++i) {
@@ -151,6 +161,8 @@ static int check_thread_capacity(unsigned count, int check_limit) {
             if (rc && rc != -11) return 27;
         }
     }
+    if (check_limit && (simple(99, (word)info) || (unsigned short)info[10] != 1 ||
+                        info[5] != free_before)) return 33;
     mode = 0;
     return 0;
 }

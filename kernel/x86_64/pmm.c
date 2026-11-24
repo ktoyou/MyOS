@@ -64,17 +64,32 @@ bool pmm64_init(const struct boot_info *boot, const struct gop64_framebuffer *fb
 }
 
 uptr pmm64_alloc(void) {
-    u32 page = next_page;
-    if (page == PAGE_COUNT) return 0;
-    u64 bit = page_bit(page);
-    available[page / 64] &= ~bit;
-    --free_pages;
-    references[page] = 1;
-    next_page = find_available(page + 1);
+    return pmm64_alloc_contiguous(1);
+}
 
-    uptr physical = (uptr)page * PMM_PAGE_SIZE;
+uptr pmm64_alloc_contiguous(u32 count) {
+    if (!count || count > free_pages) return 0;
+    u32 first = next_page, run = 1;
+    while (run < count) {
+        u32 page = first + run;
+        if (page == PAGE_COUNT) return 0;
+        if (available[page / 64] & page_bit(page)) {
+            ++run;
+        } else {
+            first = find_available(page + 1);
+            if (first == PAGE_COUNT) return 0;
+            run = 1;
+        }
+    }
+    for (u32 page = first; page < first + count; ++page) {
+        available[page / 64] &= ~page_bit(page);
+        references[page] = 1;
+    }
+    free_pages -= count;
+    if (first == next_page) next_page = find_available(first + count);
+    uptr physical = (uptr)first * PMM_PAGE_SIZE;
     u64 *words = pmm64_pointer(physical);
-    for (u32 i = 0; i < PMM_PAGE_SIZE / sizeof(*words); ++i) words[i] = 0;
+    for (u32 i = 0; i < count * (PMM_PAGE_SIZE / sizeof(*words)); ++i) words[i] = 0;
     return physical;
 }
 

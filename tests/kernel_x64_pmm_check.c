@@ -64,6 +64,22 @@ bool pmm64_check(const struct boot_info *boot, const struct gop64_framebuffer *f
         pmm64_alloc() != first || words[0] || words[PMM_PAGE_SIZE / sizeof(*words) - 1])
         return false;
 
+    u32 total, before, free;
+    if (!pmm64_free(first)) return false;
+    pmm64_page_counts(&total, &before);
+    if (pmm64_alloc_contiguous(0) || pmm64_alloc_contiguous(before + 1)) return false;
+    uptr run = pmm64_alloc_contiguous(4);
+    if (!run || run == first || (run & (PMM_PAGE_SIZE - 1))) return false;
+    pmm64_page_counts(&total, &free);
+    if (free + 4 != before) return false;
+    if (pmm64_alloc() != first) return false;
+    for (uptr page = run; page < run + 4 * PMM_PAGE_SIZE; page += PMM_PAGE_SIZE) {
+        const volatile u8 *bytes = pmm64_pointer(page);
+        if (page == first || page == second || !usable(boot, page) || reserved(boot, page) ||
+            bytes[0] || bytes[PMM_PAGE_SIZE - 1] || !pmm64_free(page)) return false;
+    }
+    pmm64_page_counts(&total, &free);
+    if (free + 1 != before) return false;
     if (!pmm64_free(first) || !pmm64_free(second)) return false;
     uptr previous = 0;
     u32 count = 0;
