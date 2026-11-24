@@ -1,4 +1,5 @@
 #include "../kernel/x86_64/pmm.h"
+#include "../kernel/x86_64/framebuffer.h"
 
 extern const u8 _start[], __kernel_end[];
 
@@ -35,18 +36,15 @@ static u32 expected_pages(const struct boot_info *boot) {
     return count;
 }
 
-bool pmm64_check(const struct boot_info *boot) {
+bool pmm64_check(const struct boot_info *boot, const struct gop64_framebuffer *fb) {
     uptr first = pmm64_alloc();
     if (!first) return false;
-    /* GOP обычно выше управляемой памяти QEMU. Проверяем также частичное пересечение. */
-    struct boot_info low_gop = *boot;
-    low_gop.fb_phys = (u32)first + 16;
-    low_gop.pitch = PMM_PAGE_SIZE;
-    low_gop.height = 1;
-    if (!pmm64_init(&low_gop)) return false;
+    /* Реальный GOP обычно выше управляемой памяти QEMU. Проверяем две страницы внутри RAM. */
+    struct gop64_framebuffer low_gop = {.physical = first, .page_bytes = 2 * PMM_PAGE_SIZE};
+    if (!pmm64_init(boot, &low_gop)) return false;
     uptr without_gop = pmm64_alloc();
-    if (!without_gop || overlaps(without_gop, low_gop.fb_phys, PMM_PAGE_SIZE) ||
-        pmm64_free(first) || !pmm64_init(boot))
+    if (!without_gop || overlaps(without_gop, low_gop.physical, low_gop.page_bytes) ||
+        pmm64_free(first) || !pmm64_init(boot, fb))
         return false;
 
     first = pmm64_alloc();

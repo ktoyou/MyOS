@@ -8,6 +8,7 @@ extern const u8 ring3_stack_start[], ring3_stack_end[];
 extern const u8 ring3_kernel_start[], ring3_kernel_end[];
 extern const u8 ring3_nx_start[], ring3_nx_end[];
 extern const u8 ring3_write_start[], ring3_write_end[];
+extern const u8 ring3_gop_start[], ring3_gop_end[];
 
 bool ring3_check(unsigned mode) {
     const u8 *start, *end;
@@ -20,9 +21,12 @@ bool ring3_check(unsigned mode) {
     } else if (mode == 2) {
         start = ring3_nx_start;
         end = ring3_nx_end;
-    } else {
+    } else if (mode == 3) {
         start = ring3_write_start;
         end = ring3_write_end;
+    } else {
+        start = ring3_gop_start;
+        end = ring3_gop_end;
     }
     uptr length = (uptr)end - (uptr)start;
     if (paging64_user_code(0x100000, start, length) ||

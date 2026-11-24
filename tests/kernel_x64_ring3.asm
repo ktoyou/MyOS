@@ -32,4 +32,11 @@ ring3_write_start:
     hlt
 ring3_write_end:
 
+global ring3_gop_start, ring3_gop_end
+ring3_gop_start:
+    mov rax,0xffffc00000000000
+    mov al,[rax]
+    hlt
+ring3_gop_end:
+
 section .note.GNU-stack noalloc noexec nowrite progbits

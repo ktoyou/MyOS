@@ -1,8 +1,12 @@
 #include "paging.h"
+#include "framebuffer.h"
 
 #define PRESENT       (1ull << 0)
 #define WRITE         (1ull << 1)
 #define USER          (1ull << 2)
+#define WRITE_THROUGH (1ull << 3)
+#define CACHE_DISABLE (1ull << 4)
+#define LEAF_PAT      (1ull << 7)
 #define MMAP_OWNED    (1ull << 9)
 #define MMAP_PENDING  (1ull << 10)
 #define FILE_BACKED   (1ull << 11)
@@ -16,6 +20,7 @@
 #define CR0_WP        (1ul << 16)
 #define EFER_MSR      0xc0000080u
 #define EFER_NXE      (1u << 11)
+#define PAT_MSR       0x277u
 
 extern const u8 _start[], __text_end[], __rodata_end[], __kernel_end[];
 static uptr live_first, live_end;
@@ -74,16 +79,14 @@ static bool map_identity(uptr root, uptr start, uptr end, u64 flags) {
     return true;
 }
 
-static bool map_ram(uptr root, const struct boot_info *boot) {
+static bool map_ram(uptr root, const struct boot_info *boot, const struct gop64_framebuffer *fb) {
     const struct boot_region *map = (const void *)(uptr)boot->map_phys;
-    u64 fb_start = boot->fb_phys;
-    u64 fb_end = fb_start + (u64)boot->pitch * boot->height;
+    uptr fb_end = fb->physical + fb->page_bytes;
     for (u32 i = 0; i < boot->map_count; ++i) {
         if (map[i].type != 1 || !(map[i].attributes & 1u)) continue;
         u64 end = map[i].base + map[i].length;
         for (uptr page = (uptr)map[i].base; page < end; page += PMM_PAGE_SIZE) {
-            if (page < 0x100000u ||
-                (fb_start < fb_end && page < fb_end && fb_start < page + PMM_PAGE_SIZE))
+            if (page < 0x100000u || (page >= fb->physical && page < fb_end))
                 continue;
             /* Прямое отображение не должно давать запись в код и rodata. */
             bool readonly = (page >= (uptr)_start && page < (uptr)__rodata_end) ||
@@ -95,7 +98,36 @@ static bool map_ram(uptr root, const struct boot_info *boot) {
     return true;
 }
 
-bool paging64_init(const struct boot_info *boot) {
+static bool uncached_flags(u64 *flags) {
+    u32 eax = 1, ebx, ecx, edx;
+    __asm__ volatile("cpuid" : "+a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx));
+    if (!(edx & (1u << 16))) {
+        *flags = CACHE_DISABLE | WRITE_THROUGH;
+        return true;
+    }
+    u32 low, high;
+    __asm__ volatile("rdmsr" : "=a"(low), "=d"(high) : "c"(PAT_MSR));
+    u64 pat = ((u64)high << 32) | low;
+    for (unsigned index = 0; index < 8; ++index) {
+        if ((pat >> (index * 8)) & 0xff) continue;
+        *flags = (index & 1 ? WRITE_THROUGH : 0) | (index & 2 ? CACHE_DISABLE : 0) |
+                 (index & 4 ? LEAF_PAT : 0);
+        return true;
+    }
+    return false;
+}
+
+static bool map_framebuffer(uptr root, const struct gop64_framebuffer *fb) {
+    u64 flags;
+    if (!uncached_flags(&flags)) return false;
+    for (uptr offset = 0; offset < fb->page_bytes; offset += PMM_PAGE_SIZE) {
+        if (!map_page(root, X64_FRAMEBUFFER_BASE + offset, fb->physical + offset,
+                      flags | WRITE | NO_EXECUTE)) return false;
+    }
+    return true;
+}
+
+bool paging64_init(const struct boot_info *boot, const struct gop64_framebuffer *fb) {
     uptr previous;
     __asm__ volatile("mov %%cr3,%0" : "=r"(previous));
     if (!nx_supported()) return false;
@@ -111,7 +143,7 @@ bool paging64_init(const struct boot_info *boot) {
         !map_identity(root, (uptr)__rodata_end, (uptr)__kernel_end, WRITE | NO_EXECUTE) ||
         !map_identity(root, boot->arena_phys, (uptr)boot->arena_phys + boot->arena_bytes,
                       WRITE | NO_EXECUTE) ||
-        !map_ram(root, boot))
+        !map_ram(root, boot, fb) || !map_framebuffer(root, fb))
         return false;
 
     u32 low, high;
