@@ -42,7 +42,7 @@ struct elf_image {
     const struct elf_header *header;
     const struct elf_segment *segments;
     const char *interp;
-    u64 bias, entry, phdr, first, end;
+    u64 bias, entry, phdr, first, end, data_bytes;
     bool live_pages;
 };
 
@@ -136,6 +136,7 @@ static bool load_layout(struct elf_image *elf, const struct linux64_file *file,
         if (end - first > BOOT_MEMORY_LIMIT - *mapped || !paging64_range_free(first, end))
             return false;
         *mapped += end - first;
+        if (p->flags & PF_W) elf->data_bytes += end - first;
         if (first < elf->first) elf->first = first;
         if (end > elf->end) elf->end = end;
 
@@ -226,7 +227,8 @@ static uptr make_stack(const struct elf_image *main, u64 interp_bias, const u64 
 
 static long prepare_image(const struct linux64_file *file, const struct linux64_file_source *source,
                           const struct stack_arguments *args, uptr stack_size,
-                          uptr *entry, uptr *stack, const struct linux64_userns *ns, bool rooted) {
+                          uptr *entry, uptr *stack, uptr *data_bytes,
+                          const struct linux64_userns *ns, bool rooted, u64 data_limit) {
     struct elf_image main, interpreter = {0};
     u64 mapped = 0;
     uptr bottom = LINUX64_STACK_TOP - stack_size, guard = LINUX64_STACK_FLOOR - PMM_PAGE_SIZE;
@@ -243,6 +245,8 @@ static long prepare_image(const struct linux64_file *file, const struct linux64_
         if (!load_layout(&interpreter, &interp, true, guard, &mapped) ||
             (main.first < interpreter.end && interpreter.first < main.end)) return -ELIBBAD;
     }
+    *data_bytes = main.data_bytes + interpreter.data_bytes;
+    if (*data_bytes > data_limit) return -ENOMEM;
     u64 entropy[2];
     if (linux64_random_bytes(entropy, sizeof(entropy)) != sizeof(entropy)) {
         static const char message[] = "Linux x86-64 AT_RANDOM entropy unavailable\n";
@@ -303,10 +307,11 @@ long linux64_execve(struct linux64_frame *frame, uptr filename, uptr argv, uptr 
     uptr previous = paging64_active_root(), root = paging64_exec_root();
     if (!root) return -ENOMEM;
     paging64_switch_root(root);
-    uptr entry, stack;
-    result = prepare_image(&file, source, &args, EXEC_STACK_SIZE, &entry, &stack,
-                           linux64_current->process->userns, true);
-    if (!result && linux64_commit_exec(frame, root, entry, stack, exec_args.absolute, absolute_length))
+    const struct linux64_process *process = linux64_current->process;
+    uptr entry, stack, data_bytes;
+    result = prepare_image(&file, source, &args, EXEC_STACK_SIZE, &entry, &stack, &data_bytes,
+                           process->userns, true, process->data_limit.soft);
+    if (!result && linux64_commit_exec(frame, root, entry, stack, data_bytes, exec_args.absolute, absolute_length))
         return 0;
     paging64_switch_root(previous);
     paging64_drop_root(root);
@@ -322,10 +327,10 @@ bool linux64_run(const struct linux64_file *file, const char *path, uptr path_le
         .path = path, .path_length = path_length, .strings = path, .string_bytes = path_length + 1,
         .offsets = &offset, .argc = 1, .count = 1,
     };
-    uptr entry, stack;
-    if (prepare_image(file, source, &args, BOOT_STACK_SIZE, &entry, &stack, NULL, false) ||
+    uptr entry, stack, data_bytes;
+    if (prepare_image(file, source, &args, BOOT_STACK_SIZE, &entry, &stack, &data_bytes, NULL, false, (u64)-1) ||
         !linux64_enable_syscall()) return false;
-    linux64_task_init();
+    linux64_task_init(data_bytes);
     linux64_use_files(source, path, path_length);
     linux64_reset_signals();
     linux64_clock_init();
