@@ -114,18 +114,19 @@ def check_mmap(build):
     struct.pack_into('<Q', protected, 24, symbols['mmap_protection'])
     check_guest('mmap-protection', protected, 'Linux x86-64 exit status=0x00', files=files)
 
-    past_eof = bytearray(elf)
-    struct.pack_into('<Q', past_eof, 24, symbols['mmap_past_eof'])
-    host_past_eof = build / 'linux-mmap-past-eof.elf'
-    host_past_eof.write_bytes(past_eof)
-    host_past_eof.chmod(0o755)
-    host = subprocess.run([str(host_past_eof.resolve())], env={}, timeout=5,
-                          preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_CORE, (0, 0)))
-    assert host.returncode == -signal.SIGBUS, host
-    serial = check_guest('mmap-past-eof', past_eof, 'x86-64 exception halted',
-                         fault=True, files=files)
-    assert ('vector=0x000000000000000e error=0x0000000000000004' in serial and
-            'cr2=0x0000001000002000 cpl=3' in serial), serial
+    for entry, fault_page in (('mmap_past_eof', 2), ('mmap_shared_past_eof', 1)):
+        name = entry.replace('_', '-')
+        past_eof = bytearray(elf)
+        struct.pack_into('<Q', past_eof, 24, symbols[entry])
+        host_past_eof = build / f'linux-{name}.elf'
+        host_past_eof.write_bytes(past_eof)
+        host_past_eof.chmod(0o755)
+        host = subprocess.run([str(host_past_eof.resolve())], env={}, timeout=5,
+                              preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_CORE, (0, 0)))
+        assert host.returncode == -signal.SIGBUS, host
+        serial = check_guest(name, past_eof, 'x86-64 exception halted', fault=True, files=files)
+        assert ('vector=0x000000000000000e error=0x0000000000000004' in serial and
+                f'cr2=0x{0x1000000000 + fault_page * 4096:016x} cpl=3' in serial), serial
 
     relro = bytearray(elf)
     struct.pack_into('<Q', relro, 24, symbols['mprotect_relro_fault'])
@@ -135,7 +136,7 @@ def check_mmap(build):
     sparse_oom = bytearray(elf)
     struct.pack_into('<Q', sparse_oom, 24, symbols['mprotect_sparse_oom'])
     check_guest('mprotect-sparse-oom', sparse_oom, 'Linux x86-64 exit status=0x00', files=files)
-    print('OVMF: mmap, mprotect, RELRO and Linux futex wake with no waiters: PASS', flush=True)
+    print('OVMF: private and shared mmap, mprotect, RELRO and Linux futex wake: PASS', flush=True)
 
 
 def main():

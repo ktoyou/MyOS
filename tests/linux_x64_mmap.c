@@ -93,6 +93,28 @@ static long check_mprotect(long fd, word file_address) {
     return relro[0] == 0xa5 ? 0 : 18;
 }
 
+static long check_shared(void) {
+    long fd = open_data();
+    if (fd < 0 || mmap(0, 1, 1, 1, -1, 0) != -9 ||
+        mmap(0, 1, 3, 1, fd, 0) != -13) return 33;
+    long address = mmap(0, 0x2000, 1, 1, fd, 0x1000);
+    long private = mmap(0, 0x1000, 3, 2, fd, 0x1000);
+    if (address < 0 || private < 0 ||
+        mmap(address, 0x1000, 3, 0x100001, fd, 0x1000) != -17 ||
+        call(3, (word)fd, 0, 0, 0, 0, 0)) return 34;
+    volatile unsigned char *bytes = (void *)address;
+    *(volatile unsigned char *)private = 0xa5;
+    if (bytes[0] != 0x5a || bytes[1] || bytes[0xfff] ||
+        mprotect(address, 0x1000, 3) != -13 || mprotect(address, 0x2000, 0) ||
+        mprotect(address + 0x1000, 0x1000, 3) != -13 ||
+        mprotect(address, 0x2000, 1) || bytes[0] != 0x5a) return 35;
+    if (mmap(address, 0x1000, 0, 0x32, -1, 0) != address ||
+        mprotect(address, 0x1000, 3) || bytes[0]) return 36;
+    bytes[0] = 0x31;
+    if (bytes[0] != 0x31 || munmap(address, 0x2000) || munmap(private, 0x1000)) return 37;
+    return 0;
+}
+
 static long check_mmap(void) {
     long fd = open_data();
     if (fd < 0) return 1;
@@ -125,6 +147,7 @@ static __attribute__((noreturn)) void finish(long status) {
 
 __attribute__((noreturn)) void _start(void) {
     long status = check_mmap();
+    if (!status) status = check_shared();
     if (!status) status = check_sparse();
     if (!status) {
         static const char message[] = "Linux ELF64 mmap and mprotect probe\n";
@@ -140,6 +163,14 @@ __attribute__((noreturn)) void mmap_past_eof(void) {
     if (address < 0 || mprotect(address + 0x2000, 0x1000, 3)) finish(11);
     volatile unsigned char *bytes = (void *)address;
     finish(bytes[0x2000]);
+}
+
+__attribute__((noreturn)) void mmap_shared_past_eof(void) {
+    long fd = open_data();
+    long address = mmap(0, 0x2000, 0, 1, fd, 0x1000);
+    if (address < 0 || mprotect(address, 0x2000, 1)) finish(38);
+    volatile unsigned char *bytes = (void *)address;
+    finish(bytes[0x1000]);
 }
 
 __attribute__((noreturn)) void mmap_protection(void) {
