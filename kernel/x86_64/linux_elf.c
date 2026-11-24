@@ -184,20 +184,20 @@ static uptr make_stack(const struct elf_image *main, u64 interp_bias) {
     return stack;
 }
 
-bool linux64_run(const void *image, uptr size, linux64_resolve_interp resolve, void *context) {
+bool linux64_run(const void *image, uptr size, const struct linux64_file_source *source) {
     struct elf_image main, interpreter = {0};
     u64 mapped = 0;
     if (!load_layout(&main, image, size, false, &mapped) ||
         !paging64_range_free(STACK_GUARD, STACK_TOP)) return false;
     if (main.interp) {
-        uptr interp_size = 0;
-        if (!resolve) return false;
-        const void *interp = resolve(main.interp, context, &interp_size);
-        if (!interp || !load_layout(&interpreter, interp, interp_size, true, &mapped) ||
+        struct linux64_file interp;
+        if (!source || !source->lookup(source->context, main.interp, &interp) ||
+            !load_layout(&interpreter, interp.bytes, interp.size, true, &mapped) ||
             (main.first < interpreter.end && interpreter.first < main.end)) return false;
     }
     if (!map_image(&main) || (main.interp && !map_image(&interpreter))) return false;
     uptr stack = make_stack(&main, interpreter.bias);
     if (!stack || !linux64_enable_syscall()) return false;
+    linux64_use_files(source);
     segments64_enter_user(main.interp ? interpreter.entry : main.entry, stack);
 }

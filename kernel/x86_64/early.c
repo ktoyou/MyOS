@@ -80,39 +80,69 @@ static __attribute__((noreturn)) void halt(void) {
 }
 
 #ifdef X64_TEST_LINUX
-struct linux_test_interp {
-    const char *path;
-    const void *image;
-    uptr size;
+struct linux_test_files {
+    const u8 *cursor, *end;
+    uptr count;
 };
 
-static const void *linux_test_resolve(const char *path, void *context, uptr *size) {
-    const struct linux_test_interp *interp = context;
-    const char *expected = interp->path;
-    while (*path && *path == *expected) {
-        ++path;
-        ++expected;
+struct linux_test_entry {
+    u64 path_size, file_size;
+} __attribute__((packed));
+
+static struct linux_test_files test_files;
+
+static bool linux_test_next(struct linux_test_files *files, const char **path,
+                            struct linux64_file *file) {
+    uptr remaining = (uptr)(files->end - files->cursor);
+    if (remaining < sizeof(struct linux_test_entry)) return false;
+    const struct linux_test_entry *entry = (const void *)files->cursor;
+    remaining -= sizeof(*entry);
+    if (entry->path_size < 2 || entry->path_size > remaining ||
+        entry->file_size > remaining - entry->path_size) return false;
+    *path = (const char *)(entry + 1);
+    if (**path != '/' || (*path)[entry->path_size - 1]) return false;
+    for (uptr i = 1; i < entry->path_size - 1; ++i)
+        if (!(*path)[i]) return false;
+    file->bytes = (const u8 *)*path + entry->path_size;
+    file->size = entry->file_size;
+    files->cursor = file->bytes + file->size;
+    return true;
+}
+
+static bool linux_test_lookup(const void *context, const char *path, struct linux64_file *file) {
+    struct linux_test_files files = *(const struct linux_test_files *)context;
+    for (uptr i = 0; i < files.count; ++i) {
+        const char *expected;
+        if (!linux_test_next(&files, &expected, file)) return false;
+        const char *actual = path;
+        while (*actual && *actual == *expected) {
+            ++actual;
+            ++expected;
+        }
+        if (*actual == *expected) {
+            file->inode = i + 1;
+            return true;
+        }
     }
-    if (*path != *expected || !interp->size) return NULL;
-    *size = interp->size;
-    return interp->image;
+    return false;
 }
 
 static void linux_test_boot(uptr root_phys, uptr root_bytes) {
-    /* После заголовка идут основной ELF, путь с NUL и ELF интерпретатора. */
-    if (!root_phys || root_bytes < 32) return;
+    /* За основным ELF идут записи с путём и содержимым файла. */
+    if (!root_phys || root_bytes < 24) return;
     const u64 *header = pmm64_pointer(root_phys);
-    if (header[0] != 0x3236584c534f594dull) return;
-    uptr image_size = header[1], path_size = header[2], interp_size = header[3];
-    uptr remaining = root_bytes - 32;
-    if (image_size > remaining) return;
-    remaining -= image_size;
-    if (!path_size || path_size > remaining || interp_size > remaining - path_size) return;
-    const u8 *image = (const void *)(header + 4);
-    const char *path = (const char *)image + image_size;
-    if (path[path_size - 1]) return;
-    struct linux_test_interp interp = {path, path + path_size, interp_size};
-    linux64_run(image, image_size, linux_test_resolve, &interp);
+    if (header[0] != 0x3336584c534f594dull || header[1] > root_bytes - 24 || header[2] > 1024)
+        return;
+    const u8 *image = (const void *)(header + 3);
+    test_files = (struct linux_test_files){image + header[1], image + root_bytes - 24, header[2]};
+    struct linux_test_files scan = test_files;
+    for (uptr i = 0; i < scan.count; ++i) {
+        const char *path;
+        struct linux64_file file;
+        if (!linux_test_next(&scan, &path, &file)) return;
+    }
+    const struct linux64_file_source source = {linux_test_lookup, &test_files};
+    linux64_run(image, header[1], &source);
 }
 #endif
 

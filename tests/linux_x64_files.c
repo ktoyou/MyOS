@@ -1,0 +1,53 @@
+typedef unsigned long word;
+
+static const char path[] = FILE_PATH;
+static unsigned char buffer[8192] __attribute__((aligned(4096)));
+
+static long call(word number, word a0, word a1, word a2, word a3) {
+    register word fourth __asm__("r10") = a3;
+    __asm__ volatile("syscall" : "+a"(number) : "D"(a0), "S"(a1), "d"(a2), "r"(fourth)
+                     : "rcx", "r11", "memory");
+    return (long)number;
+}
+
+static long check_files(void) {
+    if (call(21, (word)path, 4, 0, 0) ||
+        call(21, (word)(FILE_PATH ".missing"), 0, 0, 0) != -2) return 1;
+    if (call(257, (unsigned)-7, (word)"relative", 0, 0) != -9) return 2;
+    long fd = call(257, (unsigned)-7, (word)path, 0x80000, 0);
+    if (fd < 3 || call(0, fd, (word)path, 1, 0) != -14) return 3;
+
+    unsigned char *cross = buffer + 4094;
+    if (call(17, fd, (word)cross, 1, 4) != 1 || cross[0] != 2 ||
+        call(17, fd, (word)cross, 1, (word)-1) != -22 ||
+        call(17, fd, (word)cross, 1, 0x100000) != 0) return 4;
+    if (call(0, fd, (word)cross, 4, 0) != 4 ||
+        cross[0] != 0x7f || cross[1] != 'E' || cross[2] != 'L' || cross[3] != 'F') return 5;
+    if (call(0, fd, (word)cross, 1, 0) != 1 || cross[0] != 2) return 6;
+
+    word *stat = (void *)(buffer + 4096 - 72);
+    if (call(262, fd, (word)"", (word)stat, 0x1000) ||
+        (stat[3] & 0170000) != 0100000 || stat[6] < 64 ||
+        call(17, fd, (word)cross, 1, stat[6]) != 0) return 7;
+    word size = stat[6], inode = stat[1];
+    if (call(5, fd, (word)path, 0, 0) != -14 ||
+        call(262, (unsigned)-100, (word)path, (word)stat, 0) ||
+        stat[6] != size || stat[1] != inode) return 8;
+    if (call(3, fd, 0, 0, 0) || call(0, fd, (word)cross, 1, 0) != -9) return 9;
+
+    for (unsigned i = 0; i < sizeof(path); ++i) cross[i] = (unsigned char)path[i];
+    if (call(257, (unsigned)-100, (word)cross, 0x80000, 0) != fd ||
+        call(0, fd, (word)cross, 1, 0) != 1 || cross[0] != 0x7f) return 10;
+    return call(3, fd, 0, 0, 0) ? 11 : 0;
+}
+
+__attribute__((noreturn)) void _start(void) {
+    long status = check_files();
+    if (!status) {
+        static const char message[] = "Linux ELF64 files probe\n";
+        if (call(1, 1, (word)message, sizeof(message) - 1, 0) != sizeof(message) - 1)
+            status = 12;
+    }
+    call(60, status, 0, 0, 0);
+    __builtin_trap();
+}

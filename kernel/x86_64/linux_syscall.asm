@@ -36,6 +36,7 @@ linux64_syscall_entry:
     push r8
     push r9
     sub rsp,8
+    mov r8,r10
     mov rcx,rdx
     mov rdx,rsi
     mov rsi,rdi

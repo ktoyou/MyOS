@@ -185,15 +185,23 @@ bool paging64_user_load(uptr address, const u8 *source, uptr offset, uptr length
     return map_user_page(address, source, offset, length, writable, executable) != NULL;
 }
 
-const u8 *paging64_user_read(uptr address) {
+static u8 *user_pointer(uptr address, u64 required) {
     if (address < 0x400000ul || address >= 0x0000800000000000ul) return NULL;
     const u64 *table = pmm64_pointer(active_root());
     for (int shift = 39; shift >= 12; shift -= 9) {
         u64 entry = table[(address >> shift) & 511u];
-        if ((entry & (PRESENT | USER)) != (PRESENT | USER)) return NULL;
+        if ((entry & required) != required) return NULL;
         if (shift == 12)
             return pmm64_pointer((entry & ADDRESS_MASK) | (address & (PMM_PAGE_SIZE - 1)));
         table = pmm64_pointer(entry & ADDRESS_MASK);
     }
     return NULL;
+}
+
+const u8 *paging64_user_read(uptr address) {
+    return user_pointer(address, PRESENT | USER);
+}
+
+u8 *paging64_user_write(uptr address) {
+    return user_pointer(address, PRESENT | USER | WRITE);
 }
