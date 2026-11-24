@@ -12,6 +12,7 @@
 #define LINUX64_STACK_FLOOR (LINUX64_STACK_TOP - 8 * 1024 * 1024ul)
 #define LINUX64_S_IFDIR 0040000u
 #define LINUX64_S_IFLNK 0120000u
+#define LINUX64_S_IFSOCK 0140000u
 #define LINUX64_S_IFMT  0170000u
 
 enum linux64_poll_events {
@@ -49,8 +50,21 @@ long linux64_get_file(i32 fd, struct linux64_fd_view *view);
 long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg3);
 long linux64_sockopt(bool get, i32 fd, i32 level, i32 option, uptr value, uptr length);
 struct linux64_socket;
+#define LINUX64_UNIX_PATH_LIMIT 108u
+struct linux64_sockaddr { u16 family; char path[LINUX64_UNIX_PATH_LIMIT + 1]; };
 long linux64_socket_create(i32 domain, u32 type, i32 protocol, struct linux64_socket **socket);
 long linux64_socket_pair(i32 domain, u32 type, i32 protocol, struct linux64_socket *ends[2]);
+bool linux64_socket_can_bind(const struct linux64_socket *socket);
+void linux64_socket_bind(struct linux64_socket *socket, u64 inode, const char *name);
+long linux64_socket_listen(struct linux64_socket *socket, u32 backlog);
+long linux64_socket_connect(struct linux64_socket *socket, u64 inode);
+bool linux64_socket_connect_ready(const struct linux64_socket *socket, u64 inode);
+bool linux64_socket_io_ready(const struct linux64_socket *socket, bool receive);
+bool linux64_socket_accept_ready(const struct linux64_socket *socket);
+long linux64_socket_pending(struct linux64_socket *socket, bool blocking, struct linux64_socket **accepted);
+void linux64_socket_dequeue(struct linux64_socket *socket);
+long linux64_socket_name(const struct linux64_socket *socket, bool peer, uptr address, uptr length);
+bool linux64_socket_is_stream(const struct linux64_socket *socket);
 void linux64_socket_close(struct linux64_socket *socket);
 long linux64_socket_shutdown(struct linux64_socket *socket, i32 how);
 long linux64_socket_option(struct linux64_socket *socket, bool get, i32 level, i32 option,
