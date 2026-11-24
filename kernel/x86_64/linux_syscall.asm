@@ -35,7 +35,9 @@ linux64_syscall_entry:
     push r10
     push r8
     push r9
-    sub rsp,8
+    ; Шестой аргумент Linux переходит из R9 в первый стековый аргумент C.
+    push r9
+    mov r9,r8
     mov r8,r10
     mov rcx,rdx
     mov rdx,rsi

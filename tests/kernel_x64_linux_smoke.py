@@ -1,6 +1,8 @@
 """Run the same Linux ELF64 files on the host and in the MyOS guest."""
 import os
 import pathlib
+import resource
+import signal
 import struct
 import subprocess
 import tempfile
@@ -92,6 +94,38 @@ def check_files(build):
     print('OVMF: Linux ELF64 file reads, metadata and descriptor errors: PASS', flush=True)
 
 
+def check_mmap(build):
+    probe = (build / 'linux-mmap.elf').absolute()
+    data = (build / 'linux-mmap-data.bin').absolute()
+    # mov eax,42; ret. Маркер во второй странице позволяет проверить смещение.
+    data.write_bytes(b'\xb8\x2a\0\0\0\xc3'.ljust(4096, b'\0') + b'\x5a')
+    files = {data: data.read_bytes()}
+    host = subprocess.run([str(probe)], env={}, capture_output=True, timeout=5)
+    assert (host.returncode, host.stdout, host.stderr) == (0, b'Linux ELF64 mmap probe\n', b''), host
+    elf = probe.read_bytes()
+    serial = check_guest('mmap', elf, 'Linux x86-64 exit status=0x00', files=files)
+    assert 'Linux ELF64 mmap probe' in serial, serial
+    symbols = {line.split()[-1]: int(line.split()[0], 16)
+               for line in subprocess.check_output(['nm', str(probe)], text=True).splitlines()}
+    protected = bytearray(elf)
+    struct.pack_into('<Q', protected, 24, symbols['mmap_protection'])
+    check_guest('mmap-protection', protected, 'Linux x86-64 exit status=0x00', files=files)
+
+    past_eof = bytearray(elf)
+    struct.pack_into('<Q', past_eof, 24, symbols['mmap_past_eof'])
+    host_past_eof = build / 'linux-mmap-past-eof.elf'
+    host_past_eof.write_bytes(past_eof)
+    host_past_eof.chmod(0o755)
+    host = subprocess.run([str(host_past_eof.resolve())], env={}, timeout=5,
+                          preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_CORE, (0, 0)))
+    assert host.returncode == -signal.SIGBUS, host
+    serial = check_guest('mmap-past-eof', past_eof, 'x86-64 exception halted',
+                         fault=True, files=files)
+    assert ('vector=0x000000000000000e error=0x0000000000000004' in serial and
+            'cr2=0x0000001000002000 cpl=3' in serial), serial
+    print('OVMF: private mmap, fixed replacement, rollback, W^X and past EOF: PASS', flush=True)
+
+
 def main():
     build = pathlib.Path('build/x86_64')
     probe = build / 'linux-probe.elf'
@@ -122,6 +156,7 @@ def main():
     print('OVMF: malformed ELF, noncanonical stack and stack guard: PASS', flush=True)
     check_interpreter(build)
     check_files(build)
+    check_mmap(build)
 
 
 if __name__ == '__main__':

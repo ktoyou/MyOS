@@ -3,6 +3,8 @@
 #define PRESENT       (1ull << 0)
 #define WRITE         (1ull << 1)
 #define USER          (1ull << 2)
+#define MMAP_OWNED    (1ull << 9)
+#define MMAP_PENDING  (1ull << 10)
 #define NO_EXECUTE    (1ull << 63)
 #define ADDRESS_MASK  0x000ffffffffff000ull
 #define CR0_WP        (1ul << 16)
@@ -20,7 +22,7 @@ static bool nx_supported(void) {
     return (edx & (1u << 20)) != 0;
 }
 
-static bool map_page(uptr root, uptr virtual, uptr physical, u64 flags) {
+static bool map_entry(uptr root, uptr virtual, u64 value) {
     u64 *table = pmm64_pointer(root);
     u64 *entries[3];
     uptr created[3] = {0, 0, 0};
@@ -38,10 +40,10 @@ static bool map_page(uptr root, uptr virtual, uptr physical, u64 flags) {
         ++depth;
     }
     u64 *leaf = &table[(virtual >> 12) & 511u];
-    if (*leaf & PRESENT) goto fail;
-    *leaf = physical | flags | PRESENT;
+    if (*leaf) goto fail;
+    *leaf = value;
     /* Верхние записи пропускают ring 3 только к листам с собственным флагом USER. */
-    if (flags & USER)
+    if (value & USER)
         for (unsigned i = 0; i < depth; ++i) *entries[i] |= USER;
     return true;
 
@@ -53,6 +55,10 @@ fail:
         pmm64_free(created[depth]);
     }
     return false;
+}
+
+static bool map_page(uptr root, uptr virtual, uptr physical, u64 flags) {
+    return map_entry(root, virtual, physical | flags | PRESENT);
 }
 
 static bool map_identity(uptr root, uptr start, uptr end, u64 flags) {
@@ -131,9 +137,115 @@ bool paging64_range_free(uptr start, uptr end) {
     uptr root = active_root();
     for (uptr page = start; page < end; page += PMM_PAGE_SIZE) {
         const u64 *leaf = find_leaf(root, page);
-        if (leaf && (*leaf & PRESENT)) return false;
+        if (leaf && *leaf) return false;
     }
     return true;
+}
+
+uptr paging64_find_free(uptr start, uptr end, uptr length) {
+    uptr root = active_root(), first = start;
+    for (uptr address = start; address < end; address += PMM_PAGE_SIZE) {
+        const u64 *leaf = find_leaf(root, address);
+        if (leaf && *leaf) first = address + PMM_PAGE_SIZE;
+        if (address + PMM_PAGE_SIZE - first == length) return first;
+    }
+    return 0;
+}
+
+static void prune_empty_tables(uptr root, uptr address) {
+    u64 *parents[3];
+    unsigned depth = 0;
+    u64 *table = pmm64_pointer(root);
+    for (int shift = 39; shift > 12; shift -= 9) {
+        u64 *entry = &table[(address >> shift) & 511u];
+        if (!(*entry & PRESENT)) break;
+        parents[depth++] = entry;
+        table = pmm64_pointer(*entry & ADDRESS_MASK);
+    }
+    while (depth) {
+        for (unsigned i = 0; i < 512; ++i)
+            if (table[i]) return;
+        u64 *entry = parents[--depth];
+        uptr physical = *entry & ADDRESS_MASK;
+        *entry = 0;
+        invalidate(address);
+        pmm64_free(physical);
+        table = (void *)((uptr)entry & ~(PMM_PAGE_SIZE - 1ul));
+    }
+}
+
+static void set_alias_write(uptr root, uptr physical, bool writable) {
+    uptr direct = (uptr)pmm64_pointer(physical);
+    u64 *alias = find_leaf(root, direct);
+    if (writable) *alias |= WRITE;
+    else *alias &= ~WRITE;
+    invalidate(direct);
+}
+
+/* Страницы и таблицы резервируются до замены старых отображений. */
+bool paging64_map_private(uptr start, uptr end, const u8 *source, uptr file_bytes,
+                          bool anonymous, bool accessible, bool writable, bool executable) {
+    if (start < 0x400000ul || end > X64_USER_TOP || start >= end ||
+        ((start | end) & (PMM_PAGE_SIZE - 1)) || (writable && executable) ||
+        (file_bytes && !source) || file_bytes > end - start) return false;
+    uptr root = active_root(), physical_list = 0, prepared = start;
+    for (uptr address = start; address < end; address += PMM_PAGE_SIZE) {
+        const u64 *leaf = find_leaf(root, address);
+        if (leaf && *leaf && !(*leaf & MMAP_OWNED)) return false;
+    }
+    uptr backed = anonymous ? end - start : file_bytes;
+    for (uptr offset = 0; offset < backed; offset += PMM_PAGE_SIZE) {
+        uptr physical = pmm64_alloc();
+        if (!physical) goto fail;
+        *(uptr *)pmm64_pointer(physical) = physical_list;
+        physical_list = physical;
+    }
+    for (; prepared < end; prepared += PMM_PAGE_SIZE) {
+        const u64 *leaf = find_leaf(root, prepared);
+        if ((!leaf || !*leaf) && !map_entry(root, prepared, MMAP_PENDING | USER)) goto fail;
+    }
+
+    for (uptr address = start; address < end; address += PMM_PAGE_SIZE) {
+        u64 *leaf = find_leaf(root, address);
+        uptr old = *leaf & ADDRESS_MASK;
+        *leaf = MMAP_OWNED;
+        invalidate(address);
+        if (old) {
+            set_alias_write(root, old, true);
+            pmm64_free(old);
+        }
+        uptr offset = address - start;
+        if (offset >= backed) continue;
+        uptr physical = physical_list;
+        u8 *target = pmm64_pointer(physical);
+        physical_list = *(uptr *)target;
+        *(uptr *)target = 0;
+        if (offset < file_bytes) {
+            uptr count = file_bytes - offset;
+            if (count > PMM_PAGE_SIZE) count = PMM_PAGE_SIZE;
+            for (uptr i = 0; i < count; ++i) target[i] = source[offset + i];
+        }
+        if (!writable) set_alias_write(root, physical, false);
+        *leaf = physical | MMAP_OWNED | USER | (accessible ? PRESENT : 0) |
+                (writable ? WRITE : 0) | (executable ? 0 : NO_EXECUTE);
+        invalidate(address);
+    }
+    return true;
+
+fail:
+    while (physical_list) {
+        uptr physical = physical_list;
+        physical_list = *(uptr *)pmm64_pointer(physical);
+        pmm64_free(physical);
+    }
+    for (uptr address = start; address < prepared; address += PMM_PAGE_SIZE) {
+        u64 *leaf = find_leaf(root, address);
+        if (*leaf & MMAP_PENDING) *leaf = 0;
+    }
+    const uptr table_span = 512 * PMM_PAGE_SIZE;
+    for (uptr address = start & ~(table_span - 1); address < prepared; address += table_span)
+        prune_empty_tables(root, address);
+    return false;
 }
 
 static void *map_user_page(uptr address, const u8 *source, uptr offset, uptr length,

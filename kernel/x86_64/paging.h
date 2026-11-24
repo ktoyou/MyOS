@@ -13,5 +13,8 @@ bool paging64_user_load(uptr address, const u8 *source, uptr offset, uptr length
 const u8 *paging64_user_read(uptr address);
 u8 *paging64_user_write(uptr address);
 bool paging64_range_free(uptr start, uptr end);
+uptr paging64_find_free(uptr start, uptr end, uptr length);
+bool paging64_map_private(uptr start, uptr end, const u8 *source, uptr file_bytes,
+                          bool anonymous, bool accessible, bool writable, bool executable);
 
 #endif
