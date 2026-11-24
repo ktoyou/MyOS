@@ -1,3 +1,5 @@
+#include "build_info.h"
+
 typedef unsigned long word;
 
 static const char path[] = FILE_PATH;
@@ -102,10 +104,45 @@ static long check_signal_mask(void) {
     return 0;
 }
 
+static int field_matches(const unsigned char field[65], const char *value) {
+    for (unsigned i = 0; i < 65; ++i) {
+        if (field[i] != (unsigned char)*value) return 0;
+        if (*value) ++value;
+    }
+    return !*value;
+}
+
+static long check_uname(void) {
+    unsigned char (*name)[65] = (void *)(buffer + 4096 - 195);
+    for (unsigned i = 0; i < 392; ++i) buffer[4096 - 196 + i] = 0xa5;
+    if (call(63, (word)name, 0, 0, 0) || buffer[4096 - 196] != 0xa5 ||
+        buffer[4096 + 195] != 0xa5 || !field_matches(name[4], "x86_64")) return 25;
+    for (unsigned field = 0; field < 6; ++field) {
+        unsigned i = 0;
+        while (i < 65 && name[field][i]) ++i;
+        if (i == 65) return 26;
+    }
+    int myos = field_matches(name[0], "MyOS");
+    if (myos) {
+        if (!field_matches(name[1], "myos") || !field_matches(name[2], MYOS_VERSION) ||
+            !field_matches(name[3], "MyOS " MYOS_VERSION) || !field_matches(name[5], "")) return 27;
+    } else if (!field_matches(name[0], "Linux")) {
+        return 27;
+    }
+    if (call(63, 0, 0, 0, 0) != -14 || call(63, (word)path, 0, 0, 0) != -14 ||
+        call(10, (word)(buffer + 4096), 4096, 1, 0) ||
+        call(63, (word)name, 0, 0, 0) != -14 ||
+        call(10, (word)(buffer + 4096), 4096, 3, 0)) return 28;
+    const char *marker = myos ? "Linux uname: MyOS\n" : "Linux uname: Linux\n";
+    word length = myos ? sizeof("Linux uname: MyOS\n") - 1 : sizeof("Linux uname: Linux\n") - 1;
+    return call(1, 1, (word)marker, length, 0) == (long)length ? 0 : 29;
+}
+
 __attribute__((noreturn)) void _start(void) {
     long status = check_files();
     if (!status) status = check_signals();
     if (!status) status = check_signal_mask();
+    if (!status) status = check_uname();
     if (!status) {
         static const char message[] = "Linux ELF64 files probe\n";
         if (call(1, 1, (word)message, sizeof(message) - 1, 0) != sizeof(message) - 1)
