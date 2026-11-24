@@ -5,7 +5,7 @@ enum {
     EBADF = 9, ENOENT = 2, EACCES = 13, EFAULT = 14, ENOTDIR = 20,
     EINVAL = 22, EMFILE = 24, EROFS = 30, ENAMETOOLONG = 36, ENOSYS = 38,
     AT_FDCWD = -100, AT_SYMLINK_NOFOLLOW = 0x100, AT_NO_AUTOMOUNT = 0x800,
-    AT_EMPTY_PATH = 0x1000, PATH_LIMIT = 4096,
+    AT_EMPTY_PATH = 0x1000,
     O_ACCMODE = 3, O_CREAT = 0x40, O_TRUNC = 0x200, O_NONBLOCK = 0x800,
     O_LARGEFILE = 0x8000, O_DIRECTORY = 0x10000, O_NOFOLLOW = 0x20000,
     O_CLOEXEC = 0x80000,
@@ -24,14 +24,18 @@ _Static_assert(sizeof(struct linux_stat) == 144, "Linux x86-64 stat size");
 _Static_assert(__builtin_offsetof(struct linux_stat, size) == 48, "Linux x86-64 st_size");
 
 static struct linux64_file_source files;
+static const char *executable_path;
+static uptr executable_path_length;
 static struct {
     struct linux64_file file;
     uptr offset;
     bool used;
 } handles[FD_COUNT];
 
-void linux64_use_files(const struct linux64_file_source *source) {
+void linux64_use_files(const struct linux64_file_source *source, const char *path, uptr path_length) {
     files = source ? *source : (struct linux64_file_source){0};
+    executable_path = path;
+    executable_path_length = path_length;
     for (unsigned i = STDIO_COUNT; i < FD_COUNT; ++i)
         handles[i].used = false;
 }
@@ -44,12 +48,12 @@ const struct linux64_file *linux64_get_file(i32 fd) {
     return open_file(fd) ? &handles[fd].file : NULL;
 }
 
-static long user_path(uptr address, char path[PATH_LIMIT]) {
-    for (uptr copied = 0; copied < PATH_LIMIT;) {
+static long user_path(uptr address, char path[LINUX64_PATH_LIMIT]) {
+    for (uptr copied = 0; copied < LINUX64_PATH_LIMIT;) {
         const u8 *source = paging64_user_read(address + copied);
         if (!source) return -EFAULT;
         uptr chunk = PMM_PAGE_SIZE - ((address + copied) & (PMM_PAGE_SIZE - 1));
-        if (chunk > PATH_LIMIT - copied) chunk = PATH_LIMIT - copied;
+        if (chunk > LINUX64_PATH_LIMIT - copied) chunk = LINUX64_PATH_LIMIT - copied;
         for (uptr i = 0; i < chunk; ++i) {
             path[copied + i] = (char)source[i];
             if (!source[i]) return 0;
@@ -59,8 +63,13 @@ static long user_path(uptr address, char path[PATH_LIMIT]) {
     return -ENAMETOOLONG;
 }
 
+static const char *root_path(char *path) {
+    path[0] = '/';
+    return path[1] == '/' ? path + 1 : path;
+}
+
 static long lookup(i32 dirfd, uptr address, bool empty_path, struct linux64_file *file) {
-    char path[PATH_LIMIT + 1];
+    char path[LINUX64_PATH_LIMIT + 1];
     path[1] = 0;
     if (address || !empty_path) {
         long result = user_path(address, path + 1);
@@ -76,10 +85,31 @@ static long lookup(i32 dirfd, uptr address, bool empty_path, struct linux64_file
     if (*absolute != '/') {
         if (dirfd != AT_FDCWD)
             return (dirfd >= 0 && dirfd < STDIO_COUNT) || open_file(dirfd) ? -ENOTDIR : -EBADF;
-        path[0] = '/';
-        absolute = path;
+        absolute = root_path(path);
     }
     return files.lookup && files.lookup(files.context, absolute, file) ? 0 : -ENOENT;
+}
+
+static long linux_readlink(uptr path_address, uptr destination, i32 size) {
+    if (size <= 0) return -EINVAL;
+    char path[LINUX64_PATH_LIMIT + 1];
+    long result = user_path(path_address, path + 1);
+    if (result) return result;
+    if (!path[1]) return -ENOENT;
+    const char *absolute = root_path(path);
+    const char *actual = absolute, *expected = "/proc/self/exe";
+    while (*actual && *actual == *expected) {
+        ++actual;
+        ++expected;
+    }
+    if (*actual != *expected) {
+        struct linux64_file file;
+        return files.lookup && files.lookup(files.context, absolute, &file) ? -EINVAL : -ENOENT;
+    }
+    if (!executable_path_length) return -ENOENT;
+    uptr length = executable_path_length;
+    if (length > (uptr)size) length = (uptr)size;
+    return paging64_copy_to_user(destination, executable_path, length) == length ? (long)length : -EFAULT;
 }
 
 static long linux_open(i32 dirfd, uptr path, u32 flags) {
@@ -147,6 +177,8 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
         result = lookup(AT_FDCWD, arg0, false, &file);
         if (result) return result;
         return (arg1 & 3u) ? -EACCES : 0;
+    case 89: /* readlink */
+        return linux_readlink(arg0, arg1, (i32)arg2);
     case 257: /* openat */
         return linux_open(fd, arg1, (u32)arg2);
     case 262: /* newfstatat */
