@@ -43,6 +43,7 @@ static int iabs(int v) { return v < 0 ? -v : v; }
 
 static int SW, SH;                      /* размер экрана */
 static color_t *wallpaper;              /* обои, нарисованные один раз */
+#define WALL_BG RGB(44, 0, 30)          /* вместо обоев, если на них не хватило памяти */
 static color_t *back;                   /* сюда собираем кадр */
 static bool gpu_scene, gpu_wallpaper_ready;
 static bool screen_copy_accelerated;
@@ -540,8 +541,9 @@ static void custom_wallpaper(void) {
 
 static void make_wallpaper(void) {
     gpu_wallpaper_ready = false;
+    free(wallpaper);
     wallpaper = malloc(SW * SH * 4);
-    if(!wallpaper)return;
+    if (!wallpaper) return;
     color_t *save = gfx_buf;
     int sw = gfx_w, sh = gfx_h;
     gfx_buf = wallpaper; gfx_w = SW; gfx_h = SH;
@@ -898,7 +900,7 @@ static void make_overview_bg(void) {
     overview_bg=NULL;
     if(!wallpaper)return;
     ov_sw = (SW + 7) / 8; ov_sh = (SH + 7) / 8;
-    overview_bg = malloc(ov_sw * ov_sh * 4);
+    overview_bg = wallpaper ? malloc(ov_sw * ov_sh * 4) : NULL;
     if (!overview_bg) return;
     for (int by = 0; by < ov_sh; by++)
         for (int bx = 0; bx < ov_sw; bx++) {
@@ -1063,10 +1065,9 @@ static void compose(struct rect r) {
     if (overview_open && overview_bg) {
         draw_overview(r);
     } else {
-        if(wallpaper) {
-            for (int y = r.y; y < r.y + r.h; y++)
-                memcpy(back + y * SW + r.x, wallpaper + y * SW + r.x, r.w * 4);
-        } else gfx_fill_rect(r.x,r.y,r.w,r.h,RGB(40,30,40));
+        if (!wallpaper) gfx_fill_rect(r.x, r.y, r.w, r.h, WALL_BG);
+        else for (int y = r.y; y < r.y + r.h; y++)                /* обои */
+            memcpy(back + y * SW + r.x, wallpaper + y * SW + r.x, r.w * 4);
         for (int k = 0; k < nz; k++) {                            /* окна снизу вверх */
             struct win *w = &wins[zorder[k]];
             if (w->minimized) continue;
@@ -1341,7 +1342,6 @@ static void screen_resized(void) {
     SW = gfx_w; SH = gfx_h;
     back = gfx_buf;
     gpu_reset();
-    free(wallpaper);
     make_wallpaper();
     close_popups();
     if (overview_open) { overview_open = false; free(overview_bg); overview_bg = NULL; }
@@ -1442,13 +1442,20 @@ static int app_by_prog(const char *prog) {
     return -1;
 }
 
+/* shm_map отдаёт уже отображённый id тем же адресом и без новой ссылки:
+ * такой буфер снимется вместе с окном, которому он принадлежит. */
+static bool shm_in_use(int id) {
+    for (int i = 0; i < MAXWIN; i++) if (wins[i].used && wins[i].shm == id) return true;
+    return false;
+}
+
 static void handle_msg(struct msg *m) {
     switch (m->type) {
     case WM_CREATE: {
         int idx = -1;
         for (int i = 0; i < MAXWIN; i++) if (!wins[i].used) { idx = i; break; }
         int needed=m->b>0 && m->c>0 && m->b<=VIDEO_MAX_WIDTH && m->c<=VIDEO_MAX_HEIGHT?m->b*m->c*4+((unsigned)m->d==WM_BUFFERED?WM_FRAME_BYTES:0):-1;
-        color_t *px=idx>=0 && needed>0 && shm_size(m->a)>=needed?shm_map(m->a):NULL;
+        color_t *px=idx>=0 && needed>0 && !shm_in_use(m->a) && shm_size(m->a)>=needed?shm_map(m->a):NULL;
         if (!px || m->b <= 0 || m->c <= 0 || m->b > VIDEO_MAX_WIDTH || m->c > VIDEO_MAX_HEIGHT) {
             if (px) shm_unmap(px);
             send(m->from, WM_CREATED, -1, 0, 0, 0);
@@ -1542,7 +1549,7 @@ static void handle_msg(struct msg *m) {
         if (m->c <= 0 || m->d <= 0 || m->c > VIDEO_MAX_WIDTH || m->d > VIDEO_MAX_HEIGHT) return;
         unsigned marker;memcpy(&marker,m->data,sizeof(marker));
         int needed=m->c*m->d*4+(marker==WM_BUFFERED?WM_FRAME_BYTES:0);
-        color_t *px=shm_size(m->b)>=needed?shm_map(m->b):NULL;
+        color_t *px=!shm_in_use(m->b) && shm_size(m->b)>=needed?shm_map(m->b):NULL;
         if (!px) return;
         bool buffered = marker == WM_BUFFERED;
         color_t *snapshot = buffered ? malloc(m->c * m->d * 4) : px;
@@ -1567,7 +1574,6 @@ static void handle_msg(struct msg *m) {
         return;
     }
     case WM_WALLPAPER:
-        free(wallpaper);
         make_wallpaper();
         if (overview_bg) { free(overview_bg); overview_bg = NULL; overview_open = false; }
         add_dirty(0, 0, SW, SH);
@@ -1961,13 +1967,12 @@ static bool desktop_login(void) {
     for (;;) {
         if (gfx_check_mode()) {
             SW = gfx_w; SH = gfx_h; back = gfx_buf;
-            free(wallpaper);
             make_wallpaper(); dock_build();
         }
         int x = (SW - 352) / 2, y = (SH - 300) / 2;
         gfx_no_clip();
-        if(wallpaper)memcpy(back,wallpaper,SW*SH*4);
-        else gfx_clear(RGB(40,30,40));
+        if (wallpaper) memcpy(back, wallpaper, SW * SH * 4);
+        else gfx_clear(WALL_BG);
         gfx_fill_rect_a(0, 0, SW, SH, C_BLACK, 95);
         gfx_round_rect(x, y, 352, 300, 18, RGB(42, 39, 45));
         const char *title = setup > 0 ? (stage ? "Confirm password" : "Set a password") : "Sign in";
