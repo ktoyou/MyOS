@@ -1,4 +1,5 @@
-"""Run the same static Linux ELF64 on the host and in the MyOS guest."""
+"""Run the same Linux ELF64 files on the host and in the MyOS guest."""
+import os
 import pathlib
 import struct
 import subprocess
@@ -8,15 +9,67 @@ from kernel_x64_smoke import image
 from uefi_x64_smoke import boot_x64
 
 
-def check_guest(name, elf, marker, *, fault=False):
+def check_guest(name, elf, marker, *, fault=False, path='', interpreter=b''):
     payload, kernel_end = image('kernel-linux')
-    root_header = b'MYOSLX64' + struct.pack('<Q', len(elf)) + elf
+    path = os.fsencode(path) + b'\0'
+    root_header = (b'MYOSLX62' + struct.pack('<QQQ', len(elf), len(path), len(interpreter))
+                   + elf + path + interpreter)
     with tempfile.TemporaryDirectory(prefix='myos-linux-x64-') as temp:
         serial = boot_x64(pathlib.Path(temp), 'x64-linux-' + name, payload,
                           kernel_end, [marker], live_root_header=root_header)
     if not fault:
         assert 'x86-64 exception' not in serial, serial
     return serial
+
+
+def program_headers(elf):
+    phoff = struct.unpack_from('<Q', elf, 32)[0]
+    phentsize, phnum = struct.unpack_from('<HH', elf, 54)
+    for i in range(phnum):
+        yield phoff + i * phentsize
+
+
+def check_interpreter(build):
+    pie = (build / 'linux-pie.elf').resolve()
+    linker = (build / 'linux-interp.elf').resolve()
+    elf, interp = pie.read_bytes(), linker.read_bytes()
+    path_header = next(p for p in program_headers(elf) if struct.unpack_from('<I', elf, p)[0] == 3)
+    path_offset = struct.unpack_from('<Q', elf, path_header + 8)[0]
+    path_length = struct.unpack_from('<Q', elf, path_header + 32)[0]
+    path_bytes = elf[path_offset:path_offset + path_length]
+    assert path_bytes.endswith(b'\0')
+    path = os.fsdecode(path_bytes[:-1])
+    assert pathlib.Path(path).resolve() == linker
+
+    host = subprocess.run([str(pie)], env={}, capture_output=True, timeout=5)
+    marker = b'Linux ELF64 interpreter\n'
+    assert (host.returncode, host.stdout, host.stderr) == (
+        42, marker + b'OK', b' Linux ELF64 syscall probe\n'), host
+    serial = check_guest('interp', elf, 'Linux x86-64 exit status=0x2a',
+                         path=path, interpreter=interp)
+    assert 'Linux ELF64 interpreter\nOK Linux ELF64 syscall probe' in serial, serial
+    print('OVMF: same PIE and interpreter as Linux: PASS', flush=True)
+
+    rejected = 'Linux x86-64 ELF rejected'
+    check_guest('interp-missing', elf, rejected, path=path)
+    check_guest('interp-wrong-path', elf, rejected, path='/missing/loader', interpreter=interp)
+    check_guest('interp-nested', elf, rejected, path=path, interpreter=elf)
+
+    broken = bytearray(elf)
+    broken[path_offset + path_length - 1] = ord('x')
+    check_guest('interp-unterminated', broken, rejected, path=path, interpreter=interp)
+
+    # Переносим интерпретатор ET_EXEC туда, где MyOS размещает основной PIE.
+    collision = bytearray(interp)
+    bias = 0x100000000
+    struct.pack_into('<H', collision, 16, 2)
+    struct.pack_into('<Q', collision, 24, struct.unpack_from('<Q', interp, 24)[0] + bias)
+    for p in program_headers(interp):
+        if struct.unpack_from('<I', interp, p)[0] == 1:
+            address = struct.unpack_from('<Q', interp, p + 16)[0]
+            struct.pack_into('<Q', collision, p + 16, address + bias)
+    check_guest('interp-overlap', elf, rejected, path=path, interpreter=collision)
+    print('OVMF: invalid interpreter paths, nesting and overlap: PASS', flush=True)
 
 
 def main():
@@ -29,10 +82,7 @@ def main():
     assert 'OK Linux ELF64 syscall probe' in serial and 'Linux x86-64 ELF rejected' not in serial, serial
     print('OVMF: same Linux ELF64, same output and exit status: PASS', flush=True)
 
-    phoff = struct.unpack_from('<Q', elf, 32)[0]
-    phentsize, phnum = struct.unpack_from('<HH', elf, 54)
-    executable = next(phoff + i * phentsize for i in range(phnum)
-                      if struct.unpack_from('<II', elf, phoff + i * phentsize) == (1, 5))
+    executable = next(p for p in program_headers(elf) if struct.unpack_from('<II', elf, p) == (1, 5))
     for name, offset, value in (('wx', executable + 4, struct.pack('<I', 7)),
                                 ('entry', 24, struct.pack('<Q', 0x100000)),
                                 ('phoff', 32, struct.pack('<Q', len(elf)))):
@@ -50,6 +100,7 @@ def main():
     assert ('vector=0x000000000000000e error=0x0000000000000004' in serial and
             'cr2=0x00007fffffefb000 cpl=3' in serial), serial
     print('OVMF: malformed ELF, noncanonical stack and stack guard: PASS', flush=True)
+    check_interpreter(build)
 
 
 if __name__ == '__main__':

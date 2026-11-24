@@ -79,6 +79,43 @@ static __attribute__((noreturn)) void halt(void) {
     for (;;) __asm__ volatile("cli; hlt");
 }
 
+#ifdef X64_TEST_LINUX
+struct linux_test_interp {
+    const char *path;
+    const void *image;
+    uptr size;
+};
+
+static const void *linux_test_resolve(const char *path, void *context, uptr *size) {
+    const struct linux_test_interp *interp = context;
+    const char *expected = interp->path;
+    while (*path && *path == *expected) {
+        ++path;
+        ++expected;
+    }
+    if (*path != *expected || !interp->size) return NULL;
+    *size = interp->size;
+    return interp->image;
+}
+
+static void linux_test_boot(uptr root_phys, uptr root_bytes) {
+    /* После заголовка идут основной ELF, путь с NUL и ELF интерпретатора. */
+    if (!root_phys || root_bytes < 32) return;
+    const u64 *header = pmm64_pointer(root_phys);
+    if (header[0] != 0x3236584c534f594dull) return;
+    uptr image_size = header[1], path_size = header[2], interp_size = header[3];
+    uptr remaining = root_bytes - 32;
+    if (image_size > remaining) return;
+    remaining -= image_size;
+    if (!path_size || path_size > remaining || interp_size > remaining - path_size) return;
+    const u8 *image = (const void *)(header + 4);
+    const char *path = (const char *)image + image_size;
+    if (path[path_size - 1]) return;
+    struct linux_test_interp interp = {path, path + path_size, interp_size};
+    linux64_run(image, image_size, linux_test_resolve, &interp);
+}
+#endif
+
 #ifdef X64_TEST_PAGING
 static void check_paging(unsigned mode, const struct boot_info *boot) {
     static const u8 readonly = 0x5a;
@@ -232,12 +269,7 @@ __attribute__((noreturn)) void kernel64_main(const struct boot_info *boot, u32 e
     if (!ring3_check(X64_TEST_RING3)) serial_puts("x86-64 ring3 FAIL\n");
 #endif
 #ifdef X64_TEST_LINUX
-    /* Тест передаёт отдельный ELF-файл в начале Live RAM-диска. */
-    if (boot->root_bytes >= 16) {
-        const u64 *fixture = pmm64_pointer(boot->root_phys);
-        if (fixture[0] == 0x3436584c534f594dull && fixture[1] <= boot->root_bytes - 16)
-            linux64_run(fixture + 2, fixture[1]);
-    }
+    linux_test_boot(boot->root_phys, boot->root_bytes);
     serial_puts("Linux x86-64 ELF rejected\n");
 #endif
 #endif

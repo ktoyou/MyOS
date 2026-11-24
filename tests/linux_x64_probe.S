@@ -32,7 +32,10 @@ aux:
     cmp eax,3
     jne pagesize
     cmp dword ptr [rdx],1
+    je phdr_ok
+    cmp dword ptr [rdx],6
     jne fail
+phdr_ok:
     or r12d,1
 pagesize:
     cmp eax,4
