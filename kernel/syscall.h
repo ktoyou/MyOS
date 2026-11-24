@@ -102,6 +102,7 @@ enum {
     SYS_SIGNAL,         /* signal(sig, handler, tramp) -> старый handler */
     SYS_SIGRETURN,      /* восстановить регистры после обработчика */
     SYS_INSTALLCTL,
+    SYS_GFX_MODES,
     SYS_COUNT
 };
 /* user/lib/myos.h держит те же номера TC_*. */

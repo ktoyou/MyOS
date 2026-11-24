@@ -13,13 +13,14 @@ struct boot_info {
     u32 magic,version,root_phys,root_bytes,font_phys,fb_phys,width,height,bpp,pitch;
     u32 bios_snapshot_magic,root_lba,root_disk_id,storage_flags,root_sectors;
     u32 firmware,rsdp,map_phys,map_count,arena_phys,arena_bytes,ap_safe;
+    u32 pixel_order,native_w,native_h;
 };
 struct config {
     char magic[8];u32 version,mode,disk_id,root_lba,root_sectors;
     u32 kernel_bytes,kernel_crc,kernel_end,width,height;
 };
 struct region {UINT64 base,length;u32 type,attributes;} __attribute__((packed));
-_Static_assert(sizeof(struct boot_info)==88,"boot ABI");
+_Static_assert(sizeof(struct boot_info)==100,"boot ABI v5");
 _Static_assert(sizeof(struct region)==24,"memory map ABI");
 static EFI_SYSTEM_TABLE *system;
 static EFI_BOOT_SERVICES *services;
@@ -94,39 +95,7 @@ static EFI_BLOCK_IO *boot_disk(EFI_HANDLE esp,const struct config *cfg,void *scr
     }
     services->FreePool(handles);return found;
 }
-static BOOLEAN usable_mode(const EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *m) {
-    return m->HorizontalResolution>=640 && m->HorizontalResolution<=2560 &&
-           m->VerticalResolution>=480 && m->VerticalResolution<=1600 &&
-           m->PixelsPerScanLine>=m->HorizontalResolution &&
-           (m->PixelFormat==PixelBlueGreenRedReserved8BitPerColor ||
-            (m->PixelFormat==PixelBitMask && m->PixelInformation.RedMask==0xff0000 &&
-             m->PixelInformation.GreenMask==0xff00 && m->PixelInformation.BlueMask==0xff));
-}
-static EFI_STATUS graphics(struct boot_info *boot,const struct config *cfg) {
-    EFI_GRAPHICS_OUTPUT_PROTOCOL *gop;
-    EFI_STATUS r=services->LocateProtocol(&gop_guid,NULL,(void **)&gop);if(EFI_ERROR(r))return r;
-    unsigned choice=~0u,score=0;
-    for(unsigned mode=0;mode<gop->Mode->MaxMode;mode++) {
-        EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *info;UINTN size;
-        if(EFI_ERROR(gop->QueryMode(gop,mode,&size,&info)))continue;
-        if(usable_mode(info)) {
-            unsigned rank=info->HorizontalResolution*info->VerticalResolution;
-            if(!cfg->width && mode==gop->Mode->Mode)rank+=5000000;
-            if(cfg->width && info->HorizontalResolution==cfg->width && info->VerticalResolution==cfg->height)rank+=10000000;
-            if(rank>score){choice=mode;score=rank;}
-        }
-        services->FreePool(info);
-    }
-    if(choice==~0u || EFI_ERROR(gop->SetMode(gop,choice)))return EFI_UNSUPPORTED;
-    EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *m=gop->Mode->Info;
-    UINT64 bytes=(UINT64)m->PixelsPerScanLine*4*m->VerticalResolution;
-    if(!usable_mode(m) || !gop->Mode->FrameBufferBase || (gop->Mode->FrameBufferBase&4095) ||
-       gop->Mode->FrameBufferBase+bytes>0x100000000ULL || bytes>16u*1024*1024 ||
-       bytes>gop->Mode->FrameBufferSize)return EFI_UNSUPPORTED;
-    boot->fb_phys=gop->Mode->FrameBufferBase;boot->width=m->HorizontalResolution;
-    boot->height=m->VerticalResolution;boot->bpp=32;boot->pitch=m->PixelsPerScanLine*4;
-    return EFI_SUCCESS;
-}
+#include "uefi-video.h"
 static u32 memory_type(u32 t) {
     if(t==EfiConventionalMemory || t==EfiLoaderCode || t==EfiLoaderData || t==EfiBootServicesCode || t==EfiBootServicesData)return 1;
     return t==EfiACPIReclaimMemory?3:t==EfiACPIMemoryNVS?4:2;
@@ -168,7 +137,7 @@ EFI_STATUS efi_main(EFI_HANDLE image,EFI_SYSTEM_TABLE *st) {
     if(EFI_ERROR(allocate(32,&arena,FALSE)))return fail(EFI_OUT_OF_RESOURCES,"UEFI: no bootstrap memory\r\n");
     memset((void *)(UINTN)arena,0,32*4096);
     struct boot_info *boot=(void *)(UINTN)arena;
-    *boot=(struct boot_info){.magic=0x534f594d,.version=4,.font_phys=arena+4096,
+    *boot=(struct boot_info){.magic=0x534f594d,.version=5,.font_phys=arena+4096,
         .root_lba=cfg->root_lba,.root_disk_id=cfg->disk_id,.firmware=1,
         .map_phys=arena+8192,.arena_phys=arena,.arena_bytes=32*4096};
     EFI_PHYSICAL_ADDRESS ap=0x7000;
@@ -180,7 +149,6 @@ EFI_STATUS efi_main(EFI_HANDLE image,EFI_SYSTEM_TABLE *st) {
        EFI_ERROR(read_file(root,L"\\EFI\\MYOS\\FONT.BIN",(void *)(UINTN)boot->font_phys,4096))) {
         return fail(EFI_LOAD_ERROR,"UEFI: kernel/font load or allocation failed\r\n");
     }
-    if(EFI_ERROR(graphics(boot,cfg)))return fail(EFI_UNSUPPORTED,"UEFI: supported 32-bit GOP mode unavailable\r\n");
     EFI_BLOCK_IO *disk=boot_disk(loaded->DeviceHandle,cfg,(void *)(UINTN)(arena+45056));
     if(!disk)return fail(EFI_NOT_FOUND,"UEFI: boot disk identity mismatch\r\n");
     if(cfg->mode==1) {
@@ -196,6 +164,7 @@ EFI_STATUS efi_main(EFI_HANDLE image,EFI_SYSTEM_TABLE *st) {
         }
         boot->root_phys=ram;boot->root_bytes=cfg->root_sectors*512;
     } else {boot->storage_flags=1;boot->root_sectors=cfg->root_sectors;}
+    if(EFI_ERROR(graphics(boot,cfg)))return fail(EFI_UNSUPPORTED,"UEFI: supported 32-bit GOP mode unavailable\r\n");
     root->Close(root);boot_root=NULL;
     /* ACPI comes from the UEFI configuration table, never a BIOS RAM scan. */
     EFI_CONFIGURATION_TABLE *table=st->ConfigurationTable;void *rsdp=NULL;

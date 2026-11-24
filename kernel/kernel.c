@@ -105,6 +105,8 @@ void kmain(void) {
         ok("Graphics: %s, %u MB VRAM, %ux%u, %u bpp -> console %ux%u",
            fi.driver, fi.vram >> 20, fi.width, fi.height, fi.bpp, vga_cols(), vga_rows());
         ok("Framebuffer: base=%x pitch=%u caps=%x",fi.phys,fi.pitch,fi.caps);
+        if(fi.native_w && fi.native_h)
+            ok("Monitor EDID: preferred %ux%u; scanout %s",fi.native_w,fi.native_h,fi.rgb_swap?"RGBX":"BGRX");
         if (fi.caps & FB_CAP_COMPOSITOR)
             ok("GPU: VirGL textures, shader alpha composition, buffered frames");
         else if (fi.caps & FB_CAP_GPU)

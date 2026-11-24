@@ -46,7 +46,7 @@ static void copy_title(char *dst, const char *src) {
 }
 
 window *win_create(const char *title, int w, int h) {
-    if (!win_desktop_pid() || w <= 0 || h <= 0 || w > 2560 || h > 1600) return NULL;
+    if (!win_desktop_pid() || w <= 0 || h <= 0 || w > VIDEO_MAX_WIDTH || h > VIDEO_MAX_HEIGHT) return NULL;
     if (!font_loaded) { gfx_load_font(); font_loaded = true; }
     int slot = -1;
     for (int i = 0; i < MAX_WINDOWS; i++) if (!wins[i]) { slot = i; break; }
@@ -168,7 +168,7 @@ void win_set_resizable(window *w, int min_w, int min_h) {
 /* Новый буфер под новый размер: старое содержимое — в левый верхний угол, остальное
  * цветом правого нижнего пикселя (обычно это фон окна), чтобы до перерисовки не мигало. */
 static bool resize_buffer(window *w, int nw, int nh) {
-    if (nw <= 0 || nh <= 0 || nw > 2560 || nh > 1600) return false;
+    if (nw <= 0 || nh <= 0 || nw > VIDEO_MAX_WIDTH || nh > VIDEO_MAX_HEIGHT) return false;
     if (nw == w->w && nh == w->h) return false;
     int id = shm_alloc((w->frame ? WM_FRAME_BYTES : 0) + nw * nh * 4);
     if (id < 0) return false;
@@ -290,4 +290,113 @@ void ui_button_accent(int x, int y, int w, int h, const char *label, bool presse
 
 void ui_sunken(int x, int y, int w, int h, color_t bg) {
     gfx_round_frame(x, y, w, h, 5, UI_SHADOW, bg);
+}
+
+void ui_button_state(int x,int y,int w,int h,const char *label,unsigned state) {
+    if(w<8 || h<8)return;
+    bool disabled=state&UI_BUTTON_DISABLED;
+    bool accent=state&UI_BUTTON_ACCENT, danger=state&UI_BUTTON_DANGER;
+    color_t bg=danger?RGB(192,53,53):accent?UI_ACCENT:C_WHITE;
+    color_t ink=(accent || danger)?C_WHITE:RGB(39,44,52);
+    if(disabled){bg=RGB(234,236,240);ink=RGB(150,157,168);}
+    else if(state&UI_BUTTON_PRESSED)bg=danger?RGB(149,36,36):accent?RGB(185,61,20):RGB(227,231,237);
+    else if(state&UI_BUTTON_HOVER)bg=danger?RGB(168,42,42):accent?RGB(210,71,24):RGB(239,241,244);
+    if(!disabled && (state&UI_BUTTON_FOCUSED))
+        gfx_round_frame(x-3,y-3,w+6,h+6,10,UI_ACCENT,RGB(255,227,213));
+    gfx_round_frame(x,y,w,h,8,(accent || danger || disabled)?bg:RGB(225,228,233),bg);
+    int tw=text_width(FONT_UI_MEDIUM,UI_FONT_SIZE,label),th=text_line_h(FONT_UI_MEDIUM,UI_FONT_SIZE);
+    /* Длинная подпись не должна затереть соседние элементы. */
+    int tx=x+(w-tw)/2;if(tx<x+6)tx=x+6;
+    int cx,cy,cw,ch,clipped=gfx_clip_get(&cx,&cy,&cw,&ch);
+    int left=x+4,top=y+2,right=x+w-4,bottom=y+h-2;
+    if(clipped){if(left<cx)left=cx;if(top<cy)top=cy;if(right>cx+cw)right=cx+cw;if(bottom>cy+ch)bottom=cy+ch;}
+    gfx_set_clip(left,top,right>left?right-left:0,bottom>top?bottom-top:0);
+    text_draw(FONT_UI_MEDIUM,UI_FONT_SIZE,tx,y+(h-th)/2,label,ink);
+    if(clipped)gfx_set_clip(cx,cy,cw,ch);else gfx_no_clip();
+}
+
+static unsigned edit_length(struct ui_edit *e) {
+    if(!e || !e->text || !e->capacity)return 0;
+    e->text[e->capacity-1]=0;
+    unsigned n=strlen(e->text);if(e->cursor>n)e->cursor=n;
+    while(e->cursor && ((unsigned char)e->text[e->cursor]&192)==128)e->cursor--;
+    return n;
+}
+static unsigned edit_prev(const struct ui_edit *e,unsigned at) {
+    if(at)do{at--;}while(at && ((unsigned char)e->text[at]&192)==128);
+    return at;
+}
+static unsigned edit_next(const struct ui_edit *e,unsigned at,unsigned length) {
+    if(at<length)do{at++;}while(at<length && ((unsigned char)e->text[at]&192)==128);
+    return at;
+}
+void ui_edit_init(struct ui_edit *e,char *text,unsigned capacity,unsigned flags) {
+    memset(e,0,sizeof(*e));e->text=text;e->capacity=capacity;e->flags=flags;
+    e->cursor=edit_length(e);
+}
+bool ui_edit_key(struct ui_edit *e,int key) {
+    if(!e || !e->text || !e->capacity)return false;
+    unsigned length=edit_length(e),at=e->cursor;
+    if(key==KEY_LEFT)e->cursor=edit_prev(e,at);
+    else if(key==KEY_RIGHT)e->cursor=edit_next(e,at,length);
+    else if(key==KEY_HOME)e->cursor=0;
+    else if(key==KEY_END)e->cursor=length;
+    else if(key==21){e->text[0]=0;e->cursor=0;e->scroll=0;}
+    else if(key==8 || key==127) {
+        unsigned before=edit_prev(e,at);
+        memmove(e->text+before,e->text+at,length-at+1);e->cursor=before;
+    } else if(key==KEY_DEL) {
+        unsigned after=edit_next(e,at,length);
+        memmove(e->text+at,e->text+after,length-after+1);
+    } else {
+        if(key<32 || key==127 || (key>=KEY_UP && key<=KEY_INS) || (key>=0xd800 && key<=0xdfff) || key>0xffff)return false;
+        if(key>=128 && (key<160 || (e->flags&UI_EDIT_ASCII)))return false;
+        char encoded[3];unsigned count;
+        if(key<128){encoded[0]=key;count=1;}
+        else if(key<2048){encoded[0]=192|(key>>6);encoded[1]=128|(key&63);count=2;}
+        else{encoded[0]=224|(key>>12);encoded[1]=128|((key>>6)&63);encoded[2]=128|(key&63);count=3;}
+        if(count>=e->capacity-length)return true;
+        memmove(e->text+at+count,e->text+at,length-at+1);
+        memcpy(e->text+at,encoded,count);e->cursor+=count;
+    }
+    return true;
+}
+void ui_edit_draw(struct ui_edit *e,int x,int y,int w,int h,bool focused) {
+    if(!e || !e->text || !e->capacity || w<28 || h<12)return;
+    edit_length(e);
+    int caret=text_width_n(FONT_UI,UI_FONT_SIZE,e->text,e->cursor),inner=w-24;
+    if(e->scroll<0)e->scroll=0;
+    if(caret<e->scroll)e->scroll=caret;
+    if(caret-e->scroll>inner-2)e->scroll=caret-inner+2;
+    int max_scroll=text_width(FONT_UI,UI_FONT_SIZE,e->text)-inner+2;
+    if(max_scroll<0)max_scroll=0;
+    if(e->scroll>max_scroll)e->scroll=max_scroll;
+    gfx_round_frame(x,y,w,h,8,focused?UI_ACCENT:RGB(225,228,233),C_WHITE);
+    int cx,cy,cw,ch,clipped=gfx_clip_get(&cx,&cy,&cw,&ch);
+    int left=x+12,top=y+3,right=x+w-12,bottom=y+h-3;
+    if(clipped){if(left<cx)left=cx;if(top<cy)top=cy;if(right>cx+cw)right=cx+cw;if(bottom>cy+ch)bottom=cy+ch;}
+    gfx_set_clip(left,top,right>left?right-left:0,bottom>top?bottom-top:0);
+    int ty=y+(h-text_line_h(FONT_UI,UI_FONT_SIZE))/2;
+    text_draw(FONT_UI,UI_FONT_SIZE,x+12-e->scroll,ty,e->text,UI_TEXT);
+    if(focused && (ticks()/500)%2==0)gfx_fill_rect(x+12+caret-e->scroll,y+8,1,h-16,UI_ACCENT);
+    if(clipped)gfx_set_clip(cx,cy,cw,ch);else gfx_no_clip();
+}
+void ui_edit_click(struct ui_edit *e,int x,int px) {
+    unsigned length=edit_length(e);if(!e || !e->text || !e->capacity)return;
+    int target=px-x-12+e->scroll,previous=0;e->cursor=0;
+    for(unsigned at=0;at<length;) {
+        unsigned next=edit_next(e,at,length);
+        int width=text_width_n(FONT_UI,UI_FONT_SIZE,e->text,next);
+        if(target<(previous+width)/2)return;
+        e->cursor=next;at=next;previous=width;
+    }
+}
+int ui_focus_step(int current,int count,unsigned disabled,int direction) {
+    if(count<1 || count>32)return 0;
+    if(current<1 || current>count)current=direction<0?1:count;
+    for(int i=0;i<count;i++) {
+        current=(current-1+(direction<0?count-1:1))%count+1;
+        if(!(disabled&(1u<<(current-1))))return current;
+    }
+    return 0;
 }

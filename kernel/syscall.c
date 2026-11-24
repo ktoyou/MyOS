@@ -666,6 +666,21 @@ static int sys_gfx_mode(u32 w, u32 h, u32 check_only) {
     if (check_only) return -EINVAL;
     return display_set_mode(w, h) < 0 ? -EINVAL : 0;
 }
+static int sys_gfx_modes(u32 out,u32 capacity) {
+    if(!fb_ready())return -ENODEV;
+    if(capacity>256)return -EINVAL;
+    if(!capacity)return 0;
+    struct mode_entry {u32 w,h,ok;};
+    if(!user_buf_ok(out,capacity*sizeof(struct mode_entry),true))return -EFAULT;
+    struct mode_entry *m=(void *)out;unsigned n=0;u32 w,h;
+    for(unsigned i=0;n<capacity && fb_mode_at(i,&w,&h);i++) {
+        if(!fb_mode_ok(w,h))continue;
+        bool duplicate=false;
+        for(unsigned j=0;j<n;j++)if(m[j].w==w && m[j].h==h)duplicate=true;
+        if(!duplicate)m[n++]=(struct mode_entry){w,h,1};
+    }
+    return n;
+}
 
 static int sys_gfx_info2(u32 uout) {
     if (!fb_ready()) return -ENODEV;
@@ -700,7 +715,7 @@ static int sys_gfx_accel(u32 op, u32 uargs) {
     if (op == GA_SURFACE_UPDATE) {
         if (!user_buf_ok(uargs, 8 * 4, false)) return -EFAULT;
         u32 a[8]; memcpy(a, (const void *)uargs, sizeof(a));
-        if (!a[2] || !a[3] || a[2] > 4096 || a[3] > 4096 || a[2] * a[3] > FB_VIRT_SZ / 4) return -EINVAL;
+        if (!a[2] || !a[3] || a[2] > VIDEO_SURFACE_WIDTH || a[3] > VIDEO_SURFACE_HEIGHT || a[2] * a[3] > FB_VIRT_SZ / 4) return -EINVAL;
         if (!user_buf_ok(a[1], a[2] * a[3] * 4, false)) return -EFAULT;
         u32 f = irq_save();
         bool ok = vgpu_surface_update(a[0], (const u32 *)a[1], a[2], a[3], a[4], a[5], a[6], a[7]);
@@ -719,7 +734,7 @@ static int sys_gfx_accel(u32 op, u32 uargs) {
     if (op == GA_SURFACE_UPLOAD) {
         if (!user_buf_ok(uargs, 6 * 4, false)) return -EFAULT;
         u32 a[6]; memcpy(a, (const void *)uargs, sizeof(a));
-        if (a[0] >= VGPU_SURFACE_LIMIT || a[2] > 4096 || a[3] > 4096 || a[2] * a[3] > FB_VIRT_SZ / 4) return -EINVAL;
+        if (a[0] >= VGPU_SURFACE_LIMIT || a[2] > VIDEO_SURFACE_WIDTH || a[3] > VIDEO_SURFACE_HEIGHT || a[2] * a[3] > FB_VIRT_SZ / 4) return -EINVAL;
         if ((a[2] || a[3]) && (!a[2] || !a[3] || !user_buf_ok(a[1], a[2] * a[3] * 4, false))) return -EFAULT;
         u32 f = irq_save();
         bool ok = vgpu_surface_upload(a[0], (const u32 *)a[1], a[2], a[3], a[4] != 0);
@@ -1381,6 +1396,7 @@ void syscall_dispatch(struct regs *r) {
     case SYS_SERVICE:     ret = sys_service(a, b); break;
     case SYS_TIME:        ret = sys_time(a); break;
     case SYS_GFX_MODE:    ret = sys_gfx_mode(a, b, c); break;
+    case SYS_GFX_MODES:   ret = sys_gfx_modes(a,b); break;
     case SYS_GFX_INFO2:   ret = sys_gfx_info2(a); break;
     case SYS_GFX_ACCEL:   ret = sys_gfx_accel(a, b); break;
     case SYS_GFX_CURSOR:  ret = sys_gfx_cursor(a, b); break;

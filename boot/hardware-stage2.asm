@@ -2,6 +2,7 @@
 ; protected-mode copies load the kernel and root image above 1 MiB.
 [bits 16]
 [org 0x9000]
+%include "build/video-policy/limits.inc"
 %ifndef VIDEO_WIDTH
 %define VIDEO_WIDTH 0
 %define VIDEO_HEIGHT 0
@@ -30,18 +31,19 @@ start:
     mov si,loading
     call print
     ; Build an explicit, versioned boot contract (see kernel/bootinfo.h).
+    xor ax,ax                  ; print оставляет AH=0x0e, а не ноль
     mov di,INFO
-    mov cx,64/2
+    mov cx,100/2
     rep stosw
     mov dword [INFO],0x534f594d
-    mov dword [INFO+4],2
+    mov dword [INFO+4],5
     mov dword [INFO+44],ROOT_LBA
     mov dword [INFO+48],ROOT_DISK_ID
     mov dword [INFO+8],ROOT
     mov dword [INFO+12],ROOT_SECTORS*512
     mov dword [INFO+16],FONT
 %ifdef INSTALLED_ROOT
-    mov dword [INFO+4],3
+    mov dword [INFO+4],5
     mov dword [INFO+8],0
     mov dword [INFO+12],0
     mov eax,[0x7c00+454] ; first MBR partition, selected by the installer
@@ -153,31 +155,8 @@ start:
     jb no_video
     mov eax,[0x100e]
     mov [mode_list],eax
-    cmp word [want_w],0
-    je .automatic
-    call find_mode
+    call select_video
     jnc video_done
-    jmp .fallback
-.automatic:
-    ; Prefer the monitor's first detailed timing when DDC/EDID is available.
-    call edid_preferred
-    jc .fallback
-    call find_mode
-    jnc video_done
-.fallback:
-    mov word [preference],video_modes
-.try:
-    mov si,[preference]
-    lodsw
-    test ax,ax
-    jz no_video
-    mov [want_w],ax
-    lodsw
-    mov [want_h],ax
-    mov [preference],si
-    call find_mode
-    jc .try
-    jmp video_done
 no_video:
     mov si,video_error
     call print
@@ -256,6 +235,10 @@ video_select:
     je .menu
     cmp al,'V'
     je .menu
+    cmp al,'s'
+    je .safe
+    cmp al,'S'
+    je .safe
     cmp al,13
     je .done
 .time:
@@ -263,6 +246,10 @@ video_select:
     sub ax,[video_start]
     cmp ax,54                  ; about three seconds
     jb .wait
+    ret
+.safe:
+    mov word [want_w],1024
+    mov word [want_h],768
     ret
 .menu:
     mov si,video_choices
@@ -272,11 +259,25 @@ video_select:
     int 0x16
     cmp al,13
     je .done
+    cmp al,'a'
+    jb .upper
+    cmp al,'d'
+    ja .upper
+    sub al,32
+.upper:
+    cmp al,'A'
+    jb .number
+    cmp al,'D'
+    ja .key
+    sub al,'A'-10
+    jmp .index
+.number:
     cmp al,'0'
     jb .key
     cmp al,'9'
     ja .key
     sub al,'0'
+.index:
     xor ah,ah
     shl ax,2
     mov si,select_modes
@@ -300,103 +301,205 @@ video_bios:
     cld
     ret
 
-edid_preferred:
-    xor ax,ax
-    mov es,ax
-    mov di,0x1400
-    mov cx,128/2
-    rep stosw
+select_video:
+    ; Копия списка переживает перезапись scratch-буферов прошивкой.
+    mov eax,[mode_list]
+    mov [cursor],eax
+    mov word [mode_count],0
+.ids:
+    mov si,[cursor]
+    mov ax,[cursor+2]
+    mov fs,ax
+    movzx eax,ax
+    shl eax,4
+    movzx edx,si
+    add eax,edx
+    cmp eax,0xffffe
+    ja .copied
+    mov ax,[fs:si]
+    cmp ax,0xffff
+    je .copied
+    mov bx,[mode_count]
+    shl bx,1
+    mov [bx+0x1a00],ax
+    inc word [mode_count]
+    add word [cursor],2
+    jnc .advance
+    add word [cursor+2],0x1000
+.advance:
+    cmp word [mode_count],256
+    jb .ids
+.copied:
+    mov word [edid_block],0
+    mov word [edid_count],1
+.edid:
+    mov ax,[edid_block]
+    shl ax,7
+    add ax,0x1400
+    mov di,ax
     mov ax,0x4f15
-    mov bx,1                   ; read base EDID block, default display
+    mov bx,1
     xor cx,cx
-    xor dx,dx
-    mov di,0x1400
+    mov dx,[edid_block]
     call video_bios
     cmp ax,0x004f
-    jne .fail
-    cmp dword [0x1400],0xffffff00
-    jne .fail
-    cmp dword [0x1404],0x00ffffff
-    jne .fail
-    mov si,0x1400
-    mov cx,128
-    xor al,al
-.checksum:
-    add al,[si]
-    inc si
-    loop .checksum
-    test al,al
-    jnz .fail
-    cmp byte [0x1412],1         ; EDID 1.x
-    jne .fail
-    test byte [0x1418],2        ; first DTD is preferred timing
+    jne .parse
+    inc word [edid_block]
+    cmp word [edid_block],1
+    jne .extension
+    movzx ax,byte [0x147e]
+    inc ax
+    cmp ax,8
+    jbe .count
+    mov ax,8
+.count:
+    mov [edid_count],ax
+.extension:
+    mov ax,[edid_block]
+    cmp ax,[edid_count]
+    jb .edid
+.parse:
+    movzx eax,word [edid_block]
+    shl eax,7
+    mov [policy_args+4],eax
+    mov dword [policy_args],0x1400
+    mov dword [policy_args+8],INFO+92
+    mov dword [policy_args+12],INFO+96
+    xor eax,eax
+    call policy_call
+%ifdef INSTALLED_ROOT
+    mov dword [policy_args],0
+%else
+    mov dword [policy_args],ROOT_SECTORS*512
+%endif
+    mov dword [policy_args+4],KERNEL_END
+    mov eax,2
+    call policy_call
+    mov [video_budget],eax
+    mov word [mode_index],0
+    mov word [candidate_count],0
+.query:
+    mov bx,[mode_index]
+    cmp bx,[mode_count]
+    jae .select
+    inc word [mode_index]
+    shl bx,1
+    mov cx,[bx+0x1a00]
+    mov [mode],cx
+    call query_video
+    jc .query
+    movzx eax,word [0x1212]
+    mov [policy_args],eax
+    movzx eax,word [0x1214]
+    mov [policy_args+4],eax
+    movzx eax,word [want_w]
+    mov [policy_args+8],eax
+    movzx eax,word [want_h]
+    mov [policy_args+12],eax
+    mov eax,[INFO+92]
+    mov [policy_args+16],eax
+    mov eax,[INFO+96]
+    mov [policy_args+20],eax
+    mov eax,1
+    call policy_call
+    movzx ebx,word [candidate_count]
+    imul bx,20
+    add bx,0x2000
+    mov [bx+16],eax
+    mov ax,[mode]
+    mov [bx],ax
+    mov eax,[0x1212]
+    mov [bx+2],eax
+    mov ax,[candidate_order]
+    mov [bx+6],ax
+    mov eax,[candidate_pitch]
+    mov [bx+8],eax
+    mov eax,[0x1228]
+    mov [bx+12],eax
+    inc word [candidate_count]
+    jmp .query
+.select:
+    mov cx,[candidate_count]
+    mov si,0x2000
+    xor eax,eax
+    xor di,di
+.best:
+    jcxz .chosen
+    cmp [si+16],eax
+    jbe .skip
+    mov eax,[si+16]
+    mov di,si
+.skip:
+    add si,20
+    dec cx
+    jmp .best
+.chosen:
+    test di,di
     jz .fail
-    cmp word [0x1436],0         ; pixel clock, not a monitor descriptor
-    je .fail
-    movzx ax,byte [0x143a]
-    and ax,0xf0
-    shl ax,4
-    mov al,[0x1438]
-    mov [want_w],ax
-    movzx ax,byte [0x143d]
-    and ax,0xf0
-    shl ax,4
-    mov al,[0x143b]
-    mov [want_h],ax
+    mov [candidate_ptr],di
+    mov dword [di+16],0
+    mov bx,[di]
+    mov [mode],bx
+    or bx,0x4000
+    mov ax,0x4f02
+    call video_bios
+    cmp ax,0x004f
+    jne .select
+    mov ax,0x4f03
+    call video_bios
+    cmp ax,0x004f
+    jne .select
+    and bx,0x3fff
+    cmp bx,[mode]
+    jne .select
+    mov cx,[mode]
+    call query_video
+    jc .select
+    mov di,[candidate_ptr]
+    mov eax,[0x1212]
+    cmp eax,[di+2]
+    jne .select
+    mov eax,[0x1228]
+    mov [INFO+20],eax
+    movzx eax,word [0x1212]
+    mov [INFO+24],eax
+    movzx eax,word [0x1214]
+    mov [INFO+28],eax
+    mov dword [INFO+32],32
+    mov eax,[candidate_pitch]
+    mov [INFO+36],eax
+    movzx eax,word [candidate_order]
+    mov [INFO+88],eax
     clc
     ret
 .fail:
     stc
     ret
 
-find_mode:
-    ; Match the kernel framebuffer/console limits before changing hardware.
-    cmp word [want_w],640
-    jb .fail
-    cmp word [want_w],2560
-    ja .fail
-    cmp word [want_h],480
-    jb .fail
-    cmp word [want_h],1600
-    ja .fail
-    mov word [mode_budget],1024
-    mov eax,[mode_list]
-    mov [cursor],eax
-.next:
-    dec word [mode_budget]
-    jz .fail
-    mov si,[cursor]
-    mov ax,[cursor+2]
-    mov fs,ax
-    mov cx,[fs:si]
-    add word [cursor],2
-    jnc .cursor_ok
-    add word [cursor+2],0x1000
-.cursor_ok:
-    cmp cx,0xffff
-    je .fail
-    mov [mode],cx
+query_video:
     xor ax,ax
     mov es,ax
     mov di,0x1200
     mov ax,0x4f01
     call video_bios
     cmp ax,0x004f
-    jne .next
+    jne .fail
     mov ax,[0x1200]
     and ax,0x99
     cmp ax,0x99
-    jne .next
-    mov ax,[want_w]
-    cmp [0x1212],ax
-    jne .next
-    mov ax,[want_h]
-    cmp [0x1214],ax
-    jne .next
+    jne .fail
+    cmp word [0x1212],640
+    jb .fail
+    cmp word [0x1212],VIDEO_MAX_W
+    ja .fail
+    cmp word [0x1214],480
+    jb .fail
+    cmp word [0x1214],VIDEO_MAX_H
+    ja .fail
     cmp byte [0x1219],32
-    jne .next
+    jne .fail
     cmp byte [0x121b],6
-    jne .next
+    jne .fail
     mov si,0x121f
     mov ax,[0x1210]
     cmp word [0x1004],0x300
@@ -404,53 +507,122 @@ find_mode:
     mov si,0x1236
     mov ax,[0x1232]
 .masks:
-    test ax,3
-    jnz .next
-    movzx edx,word [want_w]
-    shl edx,2
     movzx eax,ax
+    test eax,3
+    jnz .fail
+    movzx edx,word [0x1212]
+    shl edx,2
     cmp eax,edx
-    jb .next
-    cmp word [si],0x1008
-    jne .next
-    cmp word [si+2],0x0808
-    jne .next
-    cmp word [si+4],0x0008
-    jne .next
+    jb .fail
     mov [candidate_pitch],eax
-    movzx edx,word [want_h]
+    cmp word [si+2],0x0808
+    jne .fail
+    mov word [candidate_order],0
+    cmp word [si],0x1008
+    jne .rgb
+    cmp word [si+4],0x0008
+    jne .fail
+    jmp .geometry
+.rgb:
+    cmp word [si],0x0008
+    jne .fail
+    cmp word [si+4],0x1008
+    jne .fail
+    mov word [candidate_order],1
+.geometry:
+    cmp byte [si+6],0
+    je .reserved_ok
+    movzx ax,byte [si+6]
+    movzx dx,byte [si+7]
+    cmp dx,24
+    jb .fail
+    add ax,dx
+    cmp ax,32
+    ja .fail
+.reserved_ok:
+    ; Padding входит и в лимит отображения, и в оценку доступной памяти.
+    mov eax,[candidate_pitch]
+    movzx edx,word [0x1214]
     imul edx,eax
-    cmp edx,0x01000000         ; FB_VIRT_SZ: pitch includes scanline padding
-    ja .next
+    cmp edx,VIDEO_BYTES
+    ja .fail
+    cmp edx,[video_budget]
+    ja .fail
+    movzx eax,word [0x1012]
+    test eax,eax
+    jz .address
+    shl eax,16
+    cmp edx,eax
+    ja .fail
+.address:
     mov eax,[0x1228]
     test eax,eax
-    jz .next
+    jz .fail
     test eax,4095
-    jnz .next
+    jnz .fail
     add edx,eax
-    jc .next
-    mov [candidate_phys],eax
-    mov bx,[mode]
-    or bx,0x4000
-    mov ax,0x4f02
-    call video_bios
-    cmp ax,0x004f
-    jne .next
-    mov eax,[candidate_phys]
-    mov [INFO+20],eax
-    mov eax,[candidate_pitch]
-    mov [INFO+36],eax
-    movzx eax,word [want_w]
-    mov [INFO+24],eax
-    movzx eax,word [want_h]
-    mov [INFO+28],eax
-    mov dword [INFO+32],32
+    jc .fail
     clc
     ret
 .fail:
-    mov dword [INFO+20],0
     stc
     ret
+
+policy_call:
+    ; C работает с отдельным стеком: возврат BIOS остаётся ниже 0x7c00.
+    pushfd
+    pushad
+    push ds
+    push es
+    push fs
+    push gs
+    mov [policy_sp],sp
+    mov [policy_op],eax
+    cli
+    lgdt [gdt_desc]
+    mov eax,cr0
+    or al,1
+    mov cr0,eax
+    jmp 8:policy32
+[bits 32]
+policy32:
+    mov ax,16
+    mov ds,ax
+    mov es,ax
+    mov ss,ax
+    mov esp,0x7000
+    cld
+    push dword policy_args
+    push dword [policy_op]
+    mov eax,0xc000
+    call eax
+    mov [policy_result],eax
+    jmp 24:policy16
+[bits 16]
+policy16:
+    mov ax,32
+    mov ds,ax
+    mov es,ax
+    mov ss,ax
+    mov eax,cr0
+    and al,0xfe
+    mov cr0,eax
+    jmp 0:policy_return
+policy_return:
+    xor ax,ax
+    mov ds,ax
+    mov es,ax
+    mov ss,ax
+    mov sp,[policy_sp]
+    pop gs
+    pop fs
+    pop es
+    pop ds
+    popad
+    popfd
+    mov eax,[policy_result]
+    ret
+
 load:
     mov eax,[remaining]
     test eax,eax
@@ -565,23 +737,32 @@ destination: dd 0
 mode_list: dd 0
 cursor: dd 0
 mode: dw 0
-mode_budget: dw 0
-preference: dw 0
 candidate_pitch: dd 0
-candidate_phys: dd 0
-; Only firmware-advertised 32-bit RGB modes are ever programmed.
-video_modes: dw 1920,1080, 1920,1200, 1600,900, 1680,1050
-             dw 1280,1024, 1280,720, 1024,768, 800,600, 640,480, 0
+mode_count: dw 0
+mode_index: dw 0
+candidate_count: dw 0
+candidate_ptr: dw 0
+candidate_order: dw 0
+edid_block: dw 0
+edid_count: dw 0
+policy_sp: dw 0
+align 4
+policy_op: dd 0
+policy_result: dd 0
+policy_args: times 6 dd 0
+video_budget: dd VIDEO_BYTES
 want_w: dw 0
 want_h: dw 0
 video_start: dw 0
 select_modes: dw 0,0, 640,480, 800,600, 1024,768, 1280,720
               dw 1280,1024, 1600,900, 1920,1080, 1920,1200, 2560,1440
-video_hint: db 'Press V for resolution menu, Enter to boot (3 seconds).',13,10,0
+              dw 3440,1440, 3840,2160, 5120,2160, 2560,1080
+video_hint: db 'Press V for resolution menu, S for safe 1024x768, Enter to boot (3 seconds).',13,10,0
 video_choices: db 'Resolution (BIOS must support it):',13,10
     db '0 Auto, 1 640x480, 2 800x600, 3 1024x768, 4 1280x720',13,10
     db '5 1280x1024, 6 1600x900, 7 1920x1080, 8 1920x1200, 9 2560x1440',13,10
-    db 'Choose 0-9, or Enter for build default: ',0
+    db 'A 3440x1440, B 3840x2160, C 5120x2160, D 2560x1080',13,10
+    db 'Choose 0-9 / A-D, or Enter for build default: ',0
 align 4
 dap: db 16,0
 dap_count: dw 64
@@ -592,4 +773,6 @@ disk_error: db 'MyOS: disk read failed',0
 mem_error: db 'MyOS: insufficient usable E820 RAM for live root and working memory',0
 a20_msg: db 'MyOS: A20 enable failed',0
 video_error: db 'MyOS: no 32-bit RGB VBE mode, using text',13,10,0
+times 0x3000-($-$$) db 0
+incbin "build/video-policy/policy.bin"
 times 16384-($-$$) db 0

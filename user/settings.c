@@ -12,6 +12,11 @@
 #define BORDER RGB(225,228,233)
 #define CANVAS RGB(247,248,250)
 static int hover_x=-1, hover_y=-1;
+static int page,focus=1,gallery_cursor;
+static struct ui_edit dns_edit,path_edit;
+static int field_focus(void){return page==1?3:2;}
+static int primary_focus(void){return page==1?4:3;}
+static int focus_count(void){static const int counts[]={3,5,2,4};return counts[page];}
 static bool over(int x,int y,int w,int h) { return ui_inside(hover_x,hover_y,x,y,w,h); }
 static void label(int size,int x,int y,const char *s,color_t c) { text_draw(FONT_UI,size,x,y,s,c); }
 static void card(int x,int y,int w,int h) {
@@ -36,13 +41,14 @@ static void icon(int kind,int x,int y,color_t c) {
     }
 }
 static void button(int x,int y,int w,const char *name,bool primary) {
-    color_t bg=primary ? UI_ACCENT : C_WHITE;
-    if(over(x,y,w,38)) bg=primary ? RGB(212,71,24) : RGB(239,241,244);
-    gfx_round_frame(x,y,w,38,8,primary ? bg : BORDER,bg);
-    text_draw(FONT_UI_MEDIUM,14,x+(w-text_width(FONT_UI_MEDIUM,14,name))/2,y+10,name,primary ? C_WHITE : INK);
+    unsigned state=primary?UI_BUTTON_ACCENT:0;
+    if(over(x,y,w,38))state|=UI_BUTTON_HOVER;
+    if(focus==(primary?primary_focus():5))state|=UI_BUTTON_FOCUSED;
+    ui_button_state(x,y,w,38,name,state);
 }
 static void row(int y,int kind,const char *title,const char *description) {
     card(CX,y,CW,76);
+    if(focus==(page==2?2:2+(y-210)/88))gfx_round_frame(CX,y,CW,76,12,UI_ACCENT,C_WHITE);
     if(over(CX,y,CW,76)) gfx_round_rect(CX+1,y+1,CW-2,74,12,RGB(252,247,244));
     gfx_round_rect(CX+16,y+16,44,44,10,RGB(251,236,228));
     icon(kind,CX+26,y+27,UI_ACCENT);
@@ -60,6 +66,9 @@ static window *win;
 
 static void wall_path(int i, char *out, int cap) {
     snprintf(out,cap,"/usr/share/wallpapers/%s.jpg",wall_files[i]);
+}
+static void gallery_track(void) {
+    for(int i=0;i<6;i++){char name[128];wall_path(i,name,sizeof(name));if(!strcmp(path,name))gallery_cursor=i;}
 }
 static void load_thumbs(void) {
     for(int i=0;i<6;i++) {
@@ -79,6 +88,7 @@ static void gallery(void) {
         int x=CX+(i%3)*180, y=100+(i/3)*120;
         char name[128]; wall_path(i,name,sizeof(name));
         bool selected=!strcmp(path,name);
+        if(focus==2 && i==gallery_cursor)gfx_round_frame(x-3,y-3,168,114,12,UI_ACCENT,UI_SELECT);
         color_t edge=selected ? UI_ACCENT : over(x,y,162,108) ? RGB(177,184,195) : BORDER;
         gfx_round_rect(x,y+2,162,108,10,RGB(234,237,242));
         gfx_round_frame(x,y,162,108,10,edge,C_WHITE);
@@ -107,7 +117,6 @@ static void gallery(void) {
     }
 }
 
-static int page, focus;
 static int hover_region(void) {
     for(int i=0;i<4;i++)if(i!=page && over(12,102+i*52,166,44))return i+1;
     if(page<2 && over(CX,ACTION_Y,180,38))return 10;
@@ -124,16 +133,6 @@ static const char *tabs[] = {"Сеть", "Рабочий стол", "Экран"
 static void launch(const char *name) {
     char *args[] = {(char *)name, NULL};
     spawn(name, args, -1);
-}
-static void field(int y, const char *s, int selected) {
-    gfx_round_frame(CX,y,CW,38,8,selected ? UI_ACCENT : BORDER,C_WHITE);
-    gfx_set_clip(CX+12,y+5,CW-24,28);
-    int width=text_width(FONT_UI,14,s);
-    int x=CX+12;
-    if(selected && width>CW-30) x=CX+CW-18-width;
-    label(14,x,y+10,s,INK);
-    if(selected) gfx_line(x+width+2,y+10,x+width+2,y+27,UI_ACCENT);
-    gfx_no_clip();
 }
 static void detail(int x,int y,const char *name,const char *value) {
     label(12,x,y,name,MUTED);
@@ -153,6 +152,7 @@ static void draw(void) {
         int y=100+i*52;
         if(i==page) {
             gfx_round_rect(12,y+2,166,44,9,RGB(227,230,235));
+            if(focus==1)gfx_round_frame(12,y+2,166,44,9,UI_ACCENT,RGB(227,230,235));
             gfx_round_rect(12,y,166,44,9,C_WHITE);
             gfx_round_rect(12,y+11,3,22,1,UI_ACCENT);
         } else if(over(12,y,166,44)) gfx_round_rect(12,y,166,44,9,RGB(229,232,237));
@@ -181,14 +181,14 @@ static void draw(void) {
         detail(CX+280,266,"Получение адреса / пакеты",line);
         snprintf(line,sizeof(line),"DNS-сервер · сейчас %s",ip_str(n.dns,a));
         label(13,CX,352,line,MUTED);
-        field(FIELD_Y,dns,focus);
+        ui_edit_draw(&dns_edit,CX,FIELD_Y,CW,38,focus==field_focus());
         button(CX,ACTION_Y,180,"Применить DNS",true);
         label(12,CX+198,ACTION_Y+12,"Действует до перезагрузки",MUTED);
     } else if(page==1) {
         gallery();
         label(13,CX,352,"Своё изображение",INK);
         label(12,CX+343,353,"PNG · JPEG · GIF · BMP",MUTED);
-        field(FIELD_Y,path,focus);
+        ui_edit_draw(&path_edit,CX,FIELD_Y,CW,38,focus==field_focus());
         button(CX,ACTION_Y,180,"Установить обои",true);
         button(CX+194,ACTION_Y,180,"По умолчанию",false);
     } else if(page==2) {
@@ -220,11 +220,13 @@ static void draw(void) {
         gfx_fill_circle(CX+4,H-22,3,UI_ACCENT);
         gfx_set_clip(CX+14,H-34,CW-14,28);
         label(12,CX+14,H-30,status,MUTED); gfx_no_clip();
-    } else label(12,CX,H-30,page==1 ? "Выбор сохраняется · Стрелки влево/вправо — сменить фон" : "Alt+Shift или Win+Space — сменить язык",MUTED);
+    } else label(12,CX,H-30,page==1 ? (focus==2?"Стрелки — выбрать фон · Enter — применить":"Tab — перейти к элементу · Enter — нажать кнопку") : "Alt+Shift или Win+Space — сменить язык",MUTED);
     win_update(win);
 }
 static void wallpaper_save(int reset) {
     if (reset) wall_path(0,path,sizeof(path));
+    gallery_track();
+    ui_edit_key(&path_edit,KEY_END);
     {
         if(path[0]!='/') { strcpy(status,"Укажите абсолютный путь, начиная с /"); return; }
         int fd=open(path,O_READ); if(fd<0) { strcpy(status,"Не удалось открыть изображение"); return; }
@@ -240,69 +242,79 @@ static void wallpaper_save(int reset) {
     const char *value=path;
     int len=strlen(value);
     if(fd<0) { strcpy(status,"Не удалось сохранить настройки"); return; }
-    int ok=write(fd,value,len)==len; close(fd);
+    int ok=write(fd,value,len)==len;
+    if(ok && fsync(fd)<0)ok=0;
+    if(close(fd)<0)ok=0;
     if(!ok) { strcpy(status,"Ошибка записи настроек"); return; }
     struct msg m; memset(&m,0,sizeof(m)); m.type=WM_WALLPAPER;
     if(msg_send(win_desktop_pid(),&m)<0) strcpy(status,"Сохранено; откройте рабочий стол заново");
     else strcpy(status,"Обои сохранены и применяются");
 
 }
+static void apply_dns(void) {
+    unsigned ip;
+    if(!ip_parse(dns,&ip) || !ip)strcpy(status,"Введите корректный IPv4 адрес DNS");
+    else strcpy(status,set_dns(ip)<0?"Ошибка смены DNS":"DNS изменён до перезагрузки");
+}
 int main(void) {
     win=win_create("Панель управления",W,H); if(!win) return 1;
     struct net_info n; if(netinfo(&n)==0) ip_str(n.dns,dns);
     int fd=open("/etc/wallpaper",O_READ); if(fd>=0) { int k=read(fd,path,sizeof(path)-1); if(k>0) path[k]=0; close(fd); }
     if(!path[0]) wall_path(0,path,sizeof(path));
+    gallery_track();
+    ui_edit_init(&dns_edit,dns,sizeof(dns),UI_EDIT_ASCII);
+    ui_edit_init(&path_edit,path,sizeof(path),0);
     draw(); /* Show the window before decoding gallery images. */
     load_thumbs();
     draw(); struct event e;
-    while(win_event(&e,1000)) {
+    while(win_event(&e,400)) {
         if(e.type==EV_CLOSE || e.type==EV_QUIT || (e.type==EV_KEY && e.key==27)) break;
         if(e.type==EV_MOUSE_MOVE) {
             int before=hover_region();hover_x=e.x;hover_y=e.y;
             if(before==hover_region())continue;
         }
         if(e.type==EV_MOUSE_UP || e.type==EV_FOCUS || e.type==EV_MOUSE_WHEEL)continue;
-        if(e.type==EV_TIMEOUT && page!=0 && page!=3)continue;
-        if(e.type==EV_MOUSE_DOWN) {
-            focus=0;
+        if(e.type==EV_TIMEOUT && page!=0 && page!=3 && !(page==1 && focus==field_focus()))continue;
+        if(e.type==EV_MOUSE_DOWN && (e.buttons&MOUSE_LEFT)) {
+            focus=1;
             for(int i=0;i<4;i++) if(ui_inside(e.x,e.y,12,100+i*52,166,44)) { page=i; status[0]=0; }
             if(page==0) {
-                if(ui_inside(e.x,e.y,CX,FIELD_Y,CW,38)) focus=1;
-                if(ui_inside(e.x,e.y,CX,ACTION_Y,180,38)) { unsigned ip; if(!ip_parse(dns,&ip) || !ip) strcpy(status,"Введите корректный IPv4 адрес DNS"); else strcpy(status,set_dns(ip)<0 ? "Ошибка смены DNS" : "DNS изменён до перезагрузки"); }
+                if(ui_inside(e.x,e.y,CX,FIELD_Y,CW,38)){focus=2;ui_edit_click(&dns_edit,CX,e.x);}
+                if(ui_inside(e.x,e.y,CX,ACTION_Y,180,38)){focus=3;apply_dns();}
             } else if(page==1) {
                 for(int i=0;i<6;i++) if(ui_inside(e.x,e.y,CX+(i%3)*180,100+(i/3)*120,162,108)) {
-                    wall_path(i,path,sizeof(path)); wallpaper_save(0);
+                    focus=2;gallery_cursor=i;wall_path(i,path,sizeof(path)); wallpaper_save(0);
                 }
-                if(ui_inside(e.x,e.y,CX,FIELD_Y,CW,38)) focus=1;
-                if(ui_inside(e.x,e.y,CX,ACTION_Y,180,38)) wallpaper_save(0);
-                if(ui_inside(e.x,e.y,CX+194,ACTION_Y,180,38)) wallpaper_save(1);
-            } else if(page==2 && ui_inside(e.x,e.y,CX,290,CW,76)) launch("/bin/display");
+                if(ui_inside(e.x,e.y,CX,FIELD_Y,CW,38)){focus=3;ui_edit_click(&path_edit,CX,e.x);}
+                if(ui_inside(e.x,e.y,CX,ACTION_Y,180,38)){focus=4;wallpaper_save(0);}
+                if(ui_inside(e.x,e.y,CX+194,ACTION_Y,180,38)){focus=5;wallpaper_save(1);}
+            } else if(page==2 && ui_inside(e.x,e.y,CX,290,CW,76)){focus=2;launch("/bin/display");}
             else if(page==3) {
-                if(ui_inside(e.x,e.y,CX,210,CW,76)) launch("/bin/taskmgr");
-                if(ui_inside(e.x,e.y,CX,298,CW,76)) launch("/bin/terminal");
-                if(ui_inside(e.x,e.y,CX,386,CW,76)) launch("/bin/about");
+                if(ui_inside(e.x,e.y,CX,210,CW,76)){focus=2;launch("/bin/taskmgr");}
+                if(ui_inside(e.x,e.y,CX,298,CW,76)){focus=3;launch("/bin/terminal");}
+                if(ui_inside(e.x,e.y,CX,386,CW,76)){focus=4;launch("/bin/about");}
             }
         }
-        if(e.type==EV_KEY && focus && page<2) {
-            char *s=page==0 ? dns : path; int cap=page==0 ? sizeof(dns) : sizeof(path); int len=strlen(s);
-            if(e.key==21) s[0]=0;
-            else if(e.key==8 || e.key==127) { if(len) { do { len--; } while(len>0 && ((unsigned char)s[len]&192)==128); s[len]=0; } }
-            else if((e.key>=32 && e.key<127) || (page==1 && e.key>=160 && e.key<65536 && (e.key<KEY_UP || e.key>KEY_INS))) {
-                char u[4]; int count=utf8_put(u,e.key);
-                if(len+count<cap) { memcpy(s+len,u,count); s[len+count]=0; }
+        if(e.type==EV_KEY) {
+            bool activate=e.key=='\n' || e.key=='\r' || e.key==' ';
+            if(e.key=='\t')focus=ui_focus_step(focus,focus_count(),0,1);
+            else if(page<2 && focus==field_focus()) {
+                if(ui_edit_key(page==0?&dns_edit:&path_edit,e.key))status[0]=0;
+            } else if(focus==1 && (e.key==KEY_DOWN || e.key==KEY_UP)) {
+                page=(page+(e.key==KEY_DOWN?1:3))%4;status[0]=0;
+            } else if(page==1 && focus==2) {
+                int delta=e.key==KEY_LEFT?-1:e.key==KEY_RIGHT?1:e.key==KEY_UP?-3:e.key==KEY_DOWN?3:0;
+                if(delta)gallery_cursor=(gallery_cursor+delta+6)%6;
+                if(e.key==KEY_HOME)gallery_cursor=0;
+                if(e.key==KEY_END)gallery_cursor=5;
+                if(activate){wall_path(gallery_cursor,path,sizeof(path));wallpaper_save(0);}
+            } else if(activate) {
+                if(page==0 && focus==3)apply_dns();
+                if(page==1 && focus==4)wallpaper_save(0);
+                if(page==1 && focus==5)wallpaper_save(1);
+                if(page==2 && focus==2)launch("/bin/display");
+                if(page==3 && focus>=2 && focus<=4){static const char *programs[]={"/bin/taskmgr","/bin/terminal","/bin/about"};launch(programs[focus-2]);}
             }
-        }
-        if(e.type==EV_KEY && !focus && page==1 && (e.key==KEY_LEFT || e.key==KEY_RIGHT)) {
-            int selected=0;
-            for(int i=0;i<6;i++) { char name[128]; wall_path(i,name,sizeof(name)); if(!strcmp(path,name)) selected=i; }
-            selected=(selected+(e.key==KEY_RIGHT ? 1 : 5))%6;
-            wall_path(selected,path,sizeof(path)); wallpaper_save(0);
-        }
-        if(e.type==EV_KEY && !focus && (e.key==KEY_DOWN || e.key==KEY_UP)) { page=(page+(e.key==KEY_DOWN ? 1 : 3))%4; status[0]=0; }
-        if(e.type==EV_KEY && e.key=='\t' && page<2) focus=!focus;
-        if(e.type==EV_KEY && (e.key=='\n' || e.key=='\r')) {
-            if(page==0) { unsigned ip; if(!ip_parse(dns,&ip) || !ip) strcpy(status,"Введите корректный IPv4 адрес DNS"); else strcpy(status,set_dns(ip)<0 ? "Ошибка смены DNS" : "DNS изменён до перезагрузки"); }
-            if(page==1) wallpaper_save(0);
         }
         while(waitpid(-1,0,WNOHANG)>0) {}
         draw();

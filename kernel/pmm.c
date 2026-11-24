@@ -217,6 +217,20 @@ void pmm_free(u32 addr) {
     spin_unlock_irqrestore(&pmm_lock,flags);
 }
 
+u32 pmm_alloc_contiguous(u32 pages) {
+    if(!pages || pages>MAX_FRAMES)return 0;
+    u32 flags=spin_lock_irqsave(&pmm_lock),start=0,run=0,result=0;
+    if(refs && pages<=total_frames-used_frames)
+        for(u32 f=LOW_RESERVED/PAGE_SIZE;f<limit_frame;f++) {
+            if(is_used(f)){run=0;continue;}
+            if(!run)start=f;
+            if(++run!=pages)continue;
+            for(u32 i=start;i<=f;i++){set_used(i);refs[i]=1;}
+            used_frames+=pages;next_hint=f+1;result=start*PAGE_SIZE;break;
+        }
+    spin_unlock_irqrestore(&pmm_lock,flags);return result;
+}
+
 bool pmm_share(u32 addr) {
     u32 flags=spin_lock_irqsave(&pmm_lock);
     bool result=pmm_share_locked(addr);

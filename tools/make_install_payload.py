@@ -8,6 +8,8 @@ from make_usb_image import live_limits
 
 
 def build(nasm='nasm', nm='nm', video_defines=(), uefi=True):
+    from video_policy import bios_policy
+    bios_policy()
     directory = pathlib.Path('build/hardware')
     kernel = (directory / 'kernel.bin').read_bytes()
     symbols = subprocess.check_output([nm, '-n', str(directory / 'kernel.elf')], text=True)

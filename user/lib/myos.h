@@ -74,7 +74,7 @@ enum {
     SYS_THREAD_CTL, SYS_HWINFO, SYS_SCHEDINFO, SYS_KERNELINFO,
     SYS_UMOUNT, SYS_SYNC, SYS_FSYNC, SYS_FSCK,
     SYS_PREAD, SYS_PWRITE, SYS_GETPGID,
-    SYS_SIGNAL, SYS_SIGRETURN, SYS_INSTALLCTL
+    SYS_SIGNAL, SYS_SIGRETURN, SYS_INSTALLCTL, SYS_GFX_MODES
 };
 /* Совпадают с kernel/syscall.h. Первое поле thread_tcb — errno этого потока. */
 #define TC_SET_TCB   0

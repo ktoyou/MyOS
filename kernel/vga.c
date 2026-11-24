@@ -12,19 +12,20 @@
 #include "heap.h"
 #include "bootinfo.h"
 
-#define MAX_W   (FB_MAX_W / FONT_W)     /* 320 */
-#define MAX_H   (FB_MAX_H / FONT_H)     /* 100 */
+#define MAX_W   (FB_MAX_W / FONT_W)
+#define MAX_H   (FB_MAX_H / FONT_H)
 #define VGA_MEM ((volatile u16 *)0xB8000)
 
 static volatile u16 *cells = VGA_MEM;
-static u16  shadow[MAX_W * MAX_H];
+static u16 *shadow;
 static u16  saved_text[80 * 25];        /* текстовый экран до включения графики */
 static int  PW, PH;                     /* размер экрана в пикселях (графика) */
 static int  W = 80, H = 25;
 static bool fbmode;                     /* рисуем пикселями */
 static bool firmware_console;           /* avoid slow reads of physical VBE VRAM */
 static unsigned cursor_defer;           /* draw the final cursor once per output */
-static u32 dirty_cells[(MAX_W*MAX_H+31)/32];
+#define DIRTY_BYTES (((MAX_W*MAX_H+31)/32)*sizeof(u32))
+static u32 *dirty_cells;
 static u32 dirty_count;
 /* Поток строк (tar -v) не ждёт VirGL на каждой переводке: пиксели догоняют сетку по таймеру. */
 static bool scroll_burst;
@@ -165,7 +166,7 @@ static void clear_nolock(void) {
     if (fbmode && !suspended) { cur_x = -1; fb_fill(0, 0, PW, PH, palette[attr >> 4]); }
     dirty_count = 0;
     scroll_burst = false;
-    memset(dirty_cells, 0, sizeof dirty_cells);
+    if(dirty_cells)memset(dirty_cells,0,DIRTY_BYTES);
     col = row = 0;
     update_cursor();
 }
@@ -206,6 +207,10 @@ static void fb_dims(void) {
 
 /* Перейти на графическую консоль: сохранённый текст — в новую, большую сетку */
 void vga_switch_to_fb(void) {
+    /* Ранний текст не требует большой сетки; в BIOS-ядре она не влезает в BSS. */
+    if(!shadow)shadow=kmalloc(MAX_W*MAX_H*sizeof(*shadow));
+    if(!dirty_cells)dirty_cells=kcalloc(1,DIRTY_BYTES);
+    if(!shadow || !dirty_cells){kprintf("Graphics console: insufficient memory\n");return;}
     u32 f = irq_save();
     fb_dims();
     int nw = PW / FONT_W, nh = PH / FONT_H;
@@ -226,7 +231,7 @@ void vga_switch_to_fb(void) {
  * загрузочным стеком 0x9b000. */
 void vga_resize(void) {
     if (!fbmode) return;
-    u16 *tmp = kmalloc(sizeof(shadow));
+    u16 *tmp = kmalloc(MAX_W*MAX_H*sizeof(*shadow));
     u32 f = irq_save();
     fb_dims();
     int nw = PW / FONT_W, nh = PH / FONT_H;

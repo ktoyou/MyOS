@@ -15,6 +15,7 @@ struct boot_info {
     u32 root_lba,root_disk_id; /* version 2+: identifies the boot partition */
     u32 storage_flags,root_sectors; /* version 3: native installed disk, no RAM root */
     u32 firmware,rsdp,map_phys,map_count,arena_phys,arena_bytes,ap_safe; /* version 4 UEFI */
+    u32 pixel_order,native_w,native_h; /* v5: 0=BGRX, 1=RGBX; предпочтительный режим EDID */
 };
 static inline bool boot_uefi(const struct boot_info *b){return b && b->version>=4 && b->firmware==1;}
 static inline bool boot_disk_root(const struct boot_info *b) {
@@ -34,7 +35,7 @@ static inline const struct boot_info *boot_info_get(void) {
 #ifdef MYOS_HARDWARE
     extern u32 boot_info_address;
     const struct boot_info *b=(const void *)boot_info_address;
-    return b->magic==BOOT_INFO_MAGIC && (b->version>=1 && b->version<=4) ? b : NULL;
+    return b->magic==BOOT_INFO_MAGIC && (b->version>=1 && b->version<=5) ? b : NULL;
 #else
     return NULL;
 #endif

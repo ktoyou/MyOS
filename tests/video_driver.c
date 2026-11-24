@@ -48,11 +48,11 @@ int main(void) {
     for(int test=0;test<11;test++) {
         b=good();
         if(test==0)b.magic=0;
-        if(test==1)b.version=5;
+        if(test==1)b.version=6;
         if(test==2)b.font_phys=0;
         if(test==3)b.fb_phys++;
         if(test==4)b.bpp=24;
-        if(test==5)b.width=2561;
+        if(test==5)b.width=VIDEO_MAX_WIDTH+1;
         if(test==6)b.height=0;
         if(test==7)b.pitch=4;
         if(test==8)b.pitch++;
@@ -62,7 +62,15 @@ int main(void) {
     }
     b=good();b.width=2560;b.height=1600;b.pitch=10240;
     CHECK(video_firmware_init(&b,&info));
-    b.version=2;CHECK(video_firmware_init(&b,&info));
+    for(unsigned i=0;i<4;i++) {
+        unsigned w[]={3440,3840,5120,2160},h[]={1440,2160,2880,3840};
+        b=good();b.version=5;b.width=w[i];b.height=h[i];b.pitch=w[i]*4;
+        b.pixel_order=1;b.native_w=w[i];b.native_h=h[i];
+        CHECK(video_firmware_init(&b,&info));
+        CHECK(info.rgb_swap==1 && info.native_w==w[i] && info.native_h==h[i]);
+        b.pixel_order=2;CHECK(!video_firmware_init(&b,&info));
+    }
+    b=good();b.version=2;CHECK(video_firmware_init(&b,&info));
     b.version=3;CHECK(video_firmware_init(&b,&info));
     b.version=4;b.firmware=1;b.arena_phys=0x10000000;b.arena_bytes=131072;b.font_phys=b.arena_phys+4096;
     CHECK(video_firmware_init(&b,&info)&&!strcmp(info.driver,"UEFI GOP framebuffer"));

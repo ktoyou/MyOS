@@ -18,6 +18,7 @@
 #ifndef GFX_H
 #define GFX_H
 #include "myos.h"
+#include "video_mode.h"
 
 typedef uint32_t color_t;
 #define RGB(r, g, b) ((color_t)(((r) & 255) << 16 | ((g) & 255) << 8 | ((b) & 255)))
@@ -71,10 +72,10 @@ int gfx_surface_scaled(int slot,int x,int y,int w,int h,int cx,int cy,int cw,int
 int  gfx_hw_copy(int sx, int sy, int dx, int dy, int w, int h);
 int  gfx_hw_fill(int x, int y, int w, int h, color_t c);
 int  gfx_hw_cursor(int on);         /* 0 или -ENODEV (нет аппаратного курсора) */
-/* Список стандартных разрешений: -> сколько; поддерживаемые картой — с флагом ok */
+/* Каталог драйвера (до 256), включая текущий нестандартный размер; -> сколько. */
 struct gfx_mode { int w, h, ok; };
 int  gfx_modes(struct gfx_mode *out, int max);
-/* /etc/display: сохранить/прочитать выбор пользователя («1280x720» и «cursor=hw») */
+/* /etc/display: 0,0 означает Auto; иначе ручной размер. Ошибки записи возвращаются. */
 int  gfx_save_config(int w, int h, int hw_cursor);
 int  gfx_load_config(int *w, int *h, int *hw_cursor);
 

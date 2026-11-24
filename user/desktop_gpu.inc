@@ -157,6 +157,7 @@ static bool gpu_overlay(struct rect r) {
 
 static bool gpu_compose(struct rect r) {
     if (!gpu_wallpaper_ready) {
+        if(!wallpaper)return false;
         if (gfx_surface_upload(64, wallpaper, SW, SH, false) < 0) return false;
         gpu_wallpaper_ready = true;
     }

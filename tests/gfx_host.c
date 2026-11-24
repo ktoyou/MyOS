@@ -1,13 +1,30 @@
 /* tests/gfx_host.c — сглаженная графика и шрифты на Linux: рисует пробную
  * картинку в PPM (stdout).  make gfxtest -> build/gfxtest.ppm */
-#include "gfx.h"
+#include "win.h"
 
 int ttymode(int m) { return m; }
+unsigned ticks(void) { return 0; }
+int myos_open_default(const char *path,int flags) { return open(path,flags,0666); }
 
 int main(int argc, char **argv) {
     font_set_dir(argc > 1 ? argv[1] : "fonts");
-    gfx_w = 720; gfx_h = 520;
+    gfx_w = 720; gfx_h = 780;
     gfx_buf = malloc(gfx_w * gfx_h * 4);
+    color_t sentinel=RGB(11,22,33);gfx_clear(sentinel);
+    gfx_set_clip(40,40,20,20);
+    ui_button_state(20,20,140,38,"Обрезка",UI_BUTTON_FOCUSED);
+    char clipped_text[48]="Проверка поля";struct ui_edit clipped_edit;
+    ui_edit_init(&clipped_edit,clipped_text,sizeof(clipped_text),0);
+    ui_edit_draw(&clipped_edit,20,20,140,38,true);
+    int cx,cy,cw,ch;
+    if(!gfx_clip_get(&cx,&cy,&cw,&ch) || cx!=40 || cy!=40 || cw!=20 || ch!=20)return 1;
+    int changed=0;
+    for(int y=0;y<gfx_h;y++)for(int x=0;x<gfx_w;x++) {
+        if(x>=40 && x<60 && y>=40 && y<60){changed+=gfx_buf[y*gfx_w+x]!=sentinel;continue;}
+        if(gfx_buf[y*gfx_w+x]!=sentinel)return 2;
+    }
+    if(!changed)return 3;
+    gfx_no_clip();
     gfx_gradient(0, 0, gfx_w, gfx_h, RGB(119, 33, 111), RGB(233, 84, 32));
     gfx_shadow(40, 40, 400, 300, 12, 18, 4, 110, 40, 40, 400, 300);
     gfx_round_rect_ex(40, 40, 400, 38, 12, 3, RGB(235, 235, 235), 255);
@@ -37,6 +54,26 @@ int main(int argc, char **argv) {
     text_draw(FONT_UI_BOLD, 40, 470, 380, "MyOS", C_WHITE);
     text_draw(FONT_UI, 13, 470, 430, "Activities", C_WHITE);
     gfx_cursor_draw(600, 200);
+    gfx_fill_rect(30,490,660,145,RGB(247,248,250));
+    text_draw(FONT_UI_MEDIUM,14,46,500,"Общие кнопки MyOS",UI_TEXT);
+    ui_button_state(46,530,180,38,"Обычная",0);
+    ui_button_state(250,530,180,38,"Наведение",UI_BUTTON_HOVER);
+    ui_button_state(454,530,180,38,"Фокус",UI_BUTTON_ACCENT|UI_BUTTON_FOCUSED);
+    ui_button_state(46,582,180,38,"Недоступно",UI_BUTTON_ACCENT|UI_BUTTON_DISABLED|UI_BUTTON_HOVER);
+    ui_button_state(250,582,180,38,"Нажатие",UI_BUTTON_ACCENT|UI_BUTTON_PRESSED);
+    ui_button_state(454,582,180,38,"Удалить",UI_BUTTON_DANGER);
+    gfx_fill_rect(30,640,660,112,RGB(247,248,250));
+    text_draw(FONT_UI_MEDIUM,14,46,650,"Общие поля ввода · UTF-8 и курсор",UI_TEXT);
+    char path[128]="/root/Изображения/длинное имя файла с обоями.png",confirm[32]="erase /dev/nvme0";
+    struct ui_edit path_edit,confirmation_edit;
+    ui_edit_init(&path_edit,path,sizeof(path),0);ui_edit_init(&confirmation_edit,confirm,sizeof(confirm),UI_EDIT_ASCII);
+    ui_edit_draw(&path_edit,46,680,300,38,true);
+    if(path_edit.scroll<=0)return 4;
+    ui_edit_key(&path_edit,KEY_HOME);ui_edit_draw(&path_edit,46,680,300,38,true);
+    if(path_edit.scroll!=0)return 5;
+    ui_edit_click(&path_edit,46,58);if(path_edit.cursor!=0)return 6;
+    ui_edit_click(&confirmation_edit,368,2000);if(confirmation_edit.cursor!=strlen(confirm))return 7;
+    ui_edit_draw(&confirmation_edit,368,680,266,38,false);
     printf("P6\n%d %d\n255\n", gfx_w, gfx_h);
     for (int i = 0; i < gfx_w * gfx_h; i++) { putchar(gfx_buf[i] >> 16 & 255); putchar(gfx_buf[i] >> 8 & 255); putchar(gfx_buf[i] & 255); }
     return 0;

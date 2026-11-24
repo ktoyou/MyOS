@@ -1,5 +1,8 @@
 """Real runtime BIOS calls, console/desktop resize and SMP in the hardware guest."""
 import pathlib
+import shutil
+import tempfile
+import hardware_smoke
 from hardware_smoke import VM, clean, digest, IMAGE, save_png, B
 
 def dimensions(vm,name):
@@ -7,8 +10,8 @@ def dimensions(vm,name):
     vm.qmp('screendump',{'filename':str(p.resolve())})
     return tuple(map(int,p.read_bytes().split(b'\n',3)[1].split()))
 
-def main():
-    before=digest(IMAGE)
+def check():
+    before=digest(hardware_smoke.IMAGE)
     vm=VM('video-runtime',usb=False,cpus=2)
     try:
         vm.wait('New password:')
@@ -28,9 +31,9 @@ def main():
             vm.send('whoami','\nroot\n')
             vm.check_console_pixels("video-runtime-scroll")
             print('Runtime switch',w,h,'console pixels OK',flush=True)
-        vm.send('mode 2552x1599','is not supported')
+        vm.send('mode 2552x1599','unavailable')
         assert dimensions(vm,'video-runtime')==(800,600)
-        vm.send('mode','Usage: mode WIDTHxHEIGHT')
+        vm.send('mode','Usage: mode auto')
         # The script starts desktop, waits for it to acquire the screen, then
         # resizes from another process while the desktop is alive.
         vm.send("echo 'desktop &' > /runtime.sh",'root:/')
@@ -42,7 +45,14 @@ def main():
         save_png(B/'video-runtime-desktop.ppm',B/'video-runtime-desktop.png')
         assert 'EXCEPTION' not in clean(vm.log)
     finally:vm.stop()
-    assert digest(IMAGE)==before
+    assert digest(hardware_smoke.IMAGE)==before
     print('Runtime VBE + repeated resize + console pixel comparison + desktop + SMP: OK')
+
+def main():
+    with tempfile.TemporaryDirectory(prefix='myos-video-runtime-') as directory:
+        copy=pathlib.Path(directory)/'live.img';shutil.copyfile(IMAGE,copy)
+        hardware_smoke.IMAGE=copy
+        try:check()
+        finally:hardware_smoke.IMAGE=IMAGE
 
 if __name__=='__main__':main()

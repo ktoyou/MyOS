@@ -6,15 +6,36 @@
 #include "vga.h"
 #include "mouse.h"
 #include "fs.h"
+#include "pmm.h"
+
+static int display_auto(void) {
+    struct fb_info fi;fb_get_info(&fi);
+    struct candidate {u32 w,h,rank;} modes[256];unsigned n=0;u32 w,h;
+    for(unsigned i=0;n<256 && fb_mode_at(i,&w,&h);i++)
+        if(fb_mode_ok(w,h))modes[n++]=(struct candidate){w,h,video_rank(w,h,0,0,fi.native_w,fi.native_h)};
+    for(unsigned attempt=0;attempt<n;attempt++) {
+        unsigned best=n;u32 rank=0;
+        for(unsigned i=0;i<n;i++)if(modes[i].rank>rank){best=i;rank=modes[i].rank;}
+        if(best==n)break;
+        modes[best].rank=0;
+        if(!display_set_mode(modes[best].w,modes[best].h))return 0;
+    }
+    return -1;
+}
 
 int display_set_mode(u32 w, u32 h) {
     if (!fb_ready()) return -1;
+    if(!w && !h)return display_auto();
     struct fb_info fi;
     fb_get_info(&fi);
     if (fi.width == w && fi.height == h) {
         mouse_set_bounds(fi.width,fi.height);
         return 0;
     }
+    struct pmm_stats memory;pmm_stats(&memory);
+    unsigned available=(memory.total_frames-memory.used_frames)*4096;
+    /* Уже выделенные экранные буферы освобождаются после смены режима. */
+    if((u64)w*h*4>video_memory_budget(available))return -1;
     if (fb_set_mode(w, h) < 0) return -1;
     vga_resize();
     mouse_set_bounds(w, h);
@@ -23,16 +44,7 @@ int display_set_mode(u32 w, u32 h) {
 
 /* «1280x720» -> w, h */
 bool display_parse(const char *s, u32 *w, u32 *h) {
-    u32 a = 0, b = 0;
-    while (*s == ' ' || *s == '\t') s++;
-    if (*s < '0' || *s > '9') return false;
-    while (*s >= '0' && *s <= '9') a = a * 10 + (*s++ - '0');
-    if (*s != 'x' && *s != 'X') return false;
-    s++;
-    if (*s < '0' || *s > '9') return false;
-    while (*s >= '0' && *s <= '9') b = b * 10 + (*s++ - '0');
-    *w = a; *h = b;
-    return true;
+    return video_parse_mode(s,w,h);
 }
 
 void display_load_config(void) {

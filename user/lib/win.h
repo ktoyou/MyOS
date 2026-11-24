@@ -84,6 +84,24 @@ int     win_desktop_pid(void);
 
 void ui_button(int x, int y, int w, int h, const char *label, bool pressed);
 void ui_button_accent(int x, int y, int w, int h, const char *label, bool pressed);   /* оранжевая */
+enum {
+    UI_BUTTON_ACCENT=1, UI_BUTTON_DANGER=2, UI_BUTTON_DISABLED=4,
+    UI_BUTTON_HOVER=8, UI_BUTTON_PRESSED=16, UI_BUTTON_FOCUSED=32
+};
+/* Отрисовка состояния; доступность действия и фокус обрабатывает приложение. */
+void ui_button_state(int x,int y,int w,int h,const char *label,unsigned state);
+enum { UI_EDIT_ASCII=1 };
+struct ui_edit {
+    char *text;
+    unsigned capacity,cursor,flags; /* курсор — граница символа UTF-8 в байтах */
+    int scroll;                   /* горизонтальное смещение в пикселях */
+};
+void ui_edit_init(struct ui_edit *edit,char *text,unsigned capacity,unsigned flags);
+bool ui_edit_key(struct ui_edit *edit,int key); /* Tab, Enter и Escape не поглощаются */
+void ui_edit_draw(struct ui_edit *edit,int x,int y,int w,int h,bool focused);
+void ui_edit_click(struct ui_edit *edit,int x,int px);
+/* Номера фокуса 1..count; бит 0 маски запрещает элемент 1. Ноль — нет фокуса. */
+int ui_focus_step(int current,int count,unsigned disabled,int direction);
 void ui_sunken(int x, int y, int w, int h, color_t bg);       /* поле ввода / список */
 void ui_text_center(int x, int y, int w, int h, const char *s, color_t c);
 int  ui_text(int x, int y, const char *s, color_t c);         /* шрифт интерфейса, -> ширина */

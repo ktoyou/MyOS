@@ -73,7 +73,8 @@ static unsigned access(x86emu_t *e,u32 at,u32 *val,unsigned type) {
     } else if (kind!=X86EMU_MEMIO_X && nv_mmio && at>=nv_mmio &&
                at-nv_mmio<=NV_MMIO_BYTES-bytes) p=(volatile u8 *)(NV_MMIO_VIRT+at-nv_mmio);
     else if (kind!=X86EMU_MEMIO_X && lfb_base && at>=lfb_base &&
-             at-lfb_base<=lfb_bytes-bytes) p=(volatile u8 *)(FB_VIRT+at-lfb_base);
+             at-lfb_base<=lfb_bytes-bytes && at-lfb_base<=video_aperture(lfb_base)-bytes)
+        p=(volatile u8 *)(FB_VIRT+at-lfb_base);
     else return bad_access(e,at,type);
     if(kind==X86EMU_MEMIO_W) {
         if (bytes==4 && !((u32)p&3)) *(volatile u32 *)p=*val;
@@ -140,14 +141,15 @@ static bool query(u16 id,struct fb_info *out) {
     if(bpp!=32) {audit.bpp++;return reject_mode(id,w,h,bpp,"renderer requires 32 bpp");}
     if(low[p+27]!=6) {audit.model++;return reject_mode(id,w,h,bpp,"not direct color");}
     u32 m=vbe_version>=0x300?p+54:p+31;
-    if(rd16(m)!=0x1008 || rd16(m+2)!=0x0808 || rd16(m+4)!=8) {
+    bool swap=rd16(m)==8 && rd16(m+4)==0x1008;
+    if(rd16(m+2)!=0x0808 || (!swap && (rd16(m)!=0x1008 || rd16(m+4)!=8)) ||
+       (low[m+6] && (low[m+7]<24 || (u32)low[m+6]+low[m+7]>32))) {
         audit.masks++;return reject_mode(id,w,h,bpp,"not RGB 8:8:8");
     }
-    struct boot_info b={.magic=BOOT_INFO_MAGIC,.version=1,.font_phys=0x5000,
+    struct boot_info b={.magic=BOOT_INFO_MAGIC,.version=5,.font_phys=0x5000,.pixel_order=swap,
         .fb_phys=rd32(p+40),.width=rd16(p+18),.height=rd16(p+20),.bpp=32,
         .pitch=rd16(p+(vbe_version>=0x300?50:16))};
-    if(!video_firmware_init(&b,out) || out->vram>lfb_bytes ||
-       out->phys>0xffffffffu-FB_VIRT_SZ) {
+    if(!video_firmware_init(&b,out) || out->vram>lfb_bytes) {
         audit.layout++;return reject_mode(id,w,h,bpp,"geometry/pitch/framebuffer limit");
     }
     kprintf("VBE mode: id=%x %ux%u %u bpp accepted\n",id,w,h,bpp);
@@ -225,6 +227,10 @@ bool video_runtime_mode_ok(u32 w,u32 h) {
     for(u32 i=0;i<nmodes;i++)if(modes[i].info.width==w && modes[i].info.height==h)return true;
     return false;
 }
+bool video_runtime_mode(unsigned index,u32 *w,u32 *h) {
+    if(!enabled || index>=nmodes)return false;
+    *w=modes[index].info.width;*h=modes[index].info.height;return true;
+}
 bool video_runtime_set_mode(u32 w,u32 h,struct fb_info *info) {
     if(!enabled)return false;
     for(u32 i=0;i<nmodes;i++) {
@@ -239,6 +245,7 @@ bool video_runtime_set_mode(u32 w,u32 h,struct fb_info *info) {
         current_mode=m->id;
         struct fb_info next=m->info;
         next.driver=info->driver;next.max_w=info->max_w;next.max_h=info->max_h;
+        next.native_w=info->native_w;next.native_h=info->native_h;
         next.vram=info->vram;next.gen=info->gen+1;next.caps&=~FB_CAP_FIXED_MODE;
         *info=next;lfb_base=next.phys;
         kprintf("VBE runtime: switched mode=%x to %ux%u pitch=%u\n",m->id,w,h,next.pitch);
@@ -249,5 +256,6 @@ bool video_runtime_set_mode(u32 w,u32 h,struct fb_info *info) {
 #else
 bool video_runtime_init(const struct boot_info *b,struct fb_info *i) {(void)b;(void)i;return false;}
 bool video_runtime_mode_ok(u32 w,u32 h) {(void)w;(void)h;return false;}
+bool video_runtime_mode(unsigned n,u32 *w,u32 *h) {(void)n;(void)w;(void)h;return false;}
 bool video_runtime_set_mode(u32 w,u32 h,struct fb_info *i) {(void)w;(void)h;(void)i;return false;}
 #endif

@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Установка MyOS
+Exec=setup-gui
+Icon=disk
+X-MyOS-Desktop=true
+Keywords=setup install disk nvme установка диск система

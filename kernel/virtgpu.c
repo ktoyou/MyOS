@@ -12,7 +12,7 @@
 
 #define MMIO_BASE 0xE3000000u
 #define QN 8
-#define CMD_BYTES 65536
+#define CMD_BYTES 0x50000 /* До 16384 страниц кадра плюс заголовок ATTACH_BACKING. */
 #define BATCH_BYTES 8192
 #define FORMAT 2u                 /* PIPE_FORMAT_B8G8R8X8_UNORM */
 #define CTX 1u
@@ -50,7 +50,8 @@ static void damage(u32 x,u32 y,u32 w,u32 h) {
 }
 static struct { u32 id, w, h, format; } surfaces[VGPU_SURFACE_LIMIT];
 static u32 surface_bytes;
-static u8 command[CMD_BYTES] __attribute__((aligned(4096)));
+/* Длинный DMA-пакет должен быть физически непрерывным; в низком BSS ему нет места. */
+static u8 *command;
 static u8 batch[BATCH_BYTES] __attribute__((aligned(4096)));
 static u32 batch_words;
 static struct header response __attribute__((aligned(16)));
@@ -355,6 +356,8 @@ bool vgpu_init(struct fb_info *info) {
     cfg->queue_enable = 1;
     bool have_cursor = cursor_queue_init(notify_base, mult, notify_len);
     cfg->status = 15;
+    if(!command)command=(void *)pmm_alloc_contiguous(CMD_BYTES/PAGE_SIZE);
+    if(!command)return false;
     live = true;
     if (virgl) {
         memset(command, 0, 96);
@@ -435,7 +438,7 @@ bool vgpu_surface_upload(u32 slot, const u32 *pixels, u32 w, u32 h, bool alpha) 
         memset(&surfaces[slot], 0, sizeof(surfaces[slot]));
         return true;
     }
-    if (!w || !h || w > 4096 || h > 4096 || w * h > FB_VIRT_SZ / 4) return false;
+    if (!w || !h || w > VIDEO_SURFACE_WIDTH || h > VIDEO_SURFACE_HEIGHT || w * h > FB_VIRT_SZ / 4) return false;
     u32 bytes = w * h * 4, format = alpha ? 1 : FORMAT;
     u32 old_bytes = surfaces[slot].w * surfaces[slot].h * 4;
     if (surface_bytes - old_bytes + bytes > 128u * 1024 * 1024) return false;

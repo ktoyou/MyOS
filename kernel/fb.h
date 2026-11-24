@@ -1,6 +1,7 @@
 #ifndef FB_H
 #define FB_H
 #include "types.h"
+#include "../user/lib/video_mode.h"
 
 /* Графика. Драйверы видеокарт:
  *   VirtIO-GPU / VirGL — GPU textures, shader alpha composition and hidden
@@ -14,11 +15,11 @@
 
 #define FB_DEF_W   1024
 #define FB_DEF_H   768
-#define FB_MAX_W   2560
-#define FB_MAX_H   1600
+#define FB_MAX_W   VIDEO_MAX_WIDTH
+#define FB_MAX_H   VIDEO_MAX_HEIGHT
 #define FB_BPP     32
-#define FB_VIRT    0xE0000000u     /* VRAM or private VirtIO upload RAM (up to 16 MB) */
-#define FB_VIRT_SZ 0x01000000u
+#define FB_VIRT    0xE8000000u     /* 64 МиБ отдельно от сетевого и дискового MMIO в E1..E6. */
+#define FB_VIRT_SZ VIDEO_BUFFER_BYTES
 #define FIFO_VIRT  0xE2000000u     /* очередь команд SVGA (до 256 КБ) */
 #define FONT_W     8
 #define FONT_H     16
@@ -46,6 +47,7 @@ struct fb_info {
     u32 gen;                        /* +1 при каждой смене режима */
     const char *driver;
     u32 hwcaps;                     /* регистр возможностей карты (SVGA) */
+    u32 rgb_swap,native_w,native_h;
 };
 
 bool fb_init(void);                 /* найти карту, забрать шрифт, включить режим */
@@ -54,6 +56,7 @@ void fb_get_info(struct fb_info *out);
 const u8 *fb_font(void);            /* 256 символов по 16 байт */
 int  fb_set_mode(u32 w, u32 h);     /* 0 или -1 (не поддерживается) */
 bool fb_mode_ok(u32 w, u32 h);
+bool fb_mode_at(unsigned index,u32 *w,u32 *h);
 
 /* рисование (координаты обрезаются по экрану) */
 void fb_glyph(int col, int row, u8 ch, u32 fg, u32 bg);

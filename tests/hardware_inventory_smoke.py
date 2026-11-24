@@ -30,6 +30,8 @@ def live_image(root, output, temporary,uefi=False):
     import sys
     sys.path.insert(0, str(Path('tools').resolve()))
     from make_usb_image import live_limits
+    from video_policy import bios_policy
+    bios_policy()
     phys, minimum, maximum, reserve = live_limits()
     kernel = (B/'hardware/kernel.bin').read_bytes()
     symbols = subprocess.check_output(['nm', '-n', str(B/'hardware/kernel.elf')], text=True)

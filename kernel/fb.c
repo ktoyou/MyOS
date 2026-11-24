@@ -233,6 +233,12 @@ static bool bochs_init(void) {
     return true;
 }
 
+bool fb_mode_at(unsigned index,u32 *w,u32 *h) {
+    if(!drv)return false;
+    if(!index){*w=info.width;*h=info.height;return true;}
+    if(drv==DRV_FIRMWARE)return video_runtime_mode(index-1,w,h);
+    return video_common_mode(index-1,w,h);
+}
 bool fb_mode_ok(u32 w, u32 h) {
     if (drv==DRV_FIRMWARE) return (w==info.width && h==info.height) || video_runtime_mode_ok(w,h);
     if (!drv || w < 640 || h < 480 || (w & 7)) return false;
@@ -342,6 +348,15 @@ static bool clip(int *x, int *y, int *w, int *h) {
     return *w > 0 && *h > 0;
 }
 
+static bool map_firmware(void) {
+    u32 bytes=video_aperture(info.phys);
+    for(u32 off=0;off<FB_VIRT_SZ;off+=4096) {
+        if(off<bytes) {
+            if(vmm_map(FB_VIRT+off,info.phys+off,PG_WRITE|paging_video_flags()))return false;
+        } else vmm_unmap(FB_VIRT+off);
+    }
+    return true;
+}
 int fb_set_mode(u32 w, u32 h) {
     if (!fb_mode_ok(w, h)) return -1;
     if (drv==DRV_FIRMWARE) {
@@ -349,11 +364,7 @@ int fb_set_mode(u32 w, u32 h) {
         u32 f=irq_save();
         bool ok=video_runtime_set_mode(w,h,&info);
         if(ok) {
-            /* Tables for the entire window were allocated before processes. */
-            for(u32 off=0;off<FB_VIRT_SZ;off+=4096)
-                if(vmm_map(FB_VIRT+off,info.phys+off,PG_WRITE|paging_video_flags())) {
-                    irq_restore(f);return -1;
-                }
+            if(!map_firmware()){irq_restore(f);return -1;}
             stride=info.pitch/4;frame_depth=0;
         }
         irq_restore(f);
@@ -395,12 +406,13 @@ bool fb_init(void) {
         if (!video_firmware_init(boot,&info)) return false;
         drv=DRV_FIRMWARE;
         nvidia_firmware_identify(&info);
-        /* Reserve every page-table slot before creating process directories. */
-        if(info.phys<=0xffffffffu-FB_VIRT_SZ) {
-            for(u32 off=0;off<FB_VIRT_SZ;off+=4096)
-                if(vmm_map(FB_VIRT+off,info.phys+off,PG_WRITE|paging_video_flags()))return false;
-            video_runtime_init(boot,&info);
+        /* Пустые таблицы тоже должны попасть в каталоги будущих процессов. */
+        for(u32 off=0;off<FB_VIRT_SZ;off+=4u*1024*1024) {
+            if(vmm_map(FB_VIRT+off,info.phys,PG_WRITE|paging_video_flags()))return false;
+            vmm_unmap(FB_VIRT+off);
         }
+        if(!map_firmware())return false;
+        video_runtime_init(boot,&info);
     } else {
         /* Capture the BIOS font before a VirtIO scanout takes over VGA. */
         if (vgpu_init(&info)) {
@@ -416,6 +428,7 @@ bool fb_init(void) {
     /* отобразить видеопамять в ядро — до создания процессов, тогда эти записи
      * каталога попадут и во все каталоги процессов */
     u32 size = info.vram < FB_VIRT_SZ ? info.vram : FB_VIRT_SZ;
+    if(size>video_aperture(info.phys))size=video_aperture(info.phys);
     for (u32 off = 0; off < size; off += 4096)
         if (vmm_map(FB_VIRT + off, info.phys + off,
                     PG_WRITE | (drv==DRV_FIRMWARE ? paging_video_flags() : 0))) return false;
@@ -447,6 +460,7 @@ void fb_glyph(int col, int row, u8 ch, u32 fg, u32 bg) {
     int x = col * FONT_W, y = row * FONT_H;
     if (x + FONT_W > (int)info.width || y + FONT_H > (int)info.height) return;
     cpu_touch();
+    fg=video_pixel_order(fg,info.rgb_swap);bg=video_pixel_order(bg,info.rgb_swap);
     volatile u32 *p = fb + y * stride + x;
     const u8 *g = font + ch * FONT_H;
     for (int j = 0; j < FONT_H; j++, p += stride) {
@@ -461,6 +475,7 @@ void fb_glyph(int col, int row, u8 ch, u32 fg, u32 bg) {
 
 static void cpu_fill(int x, int y, int w, int h, u32 color) {
     cpu_touch();
+    color=video_pixel_order(color,info.rgb_swap);
     for (int j = 0; j < h; j++) {
         volatile u32 *p = fb + (y + j) * stride + x;
         for (int i = 0; i < w; i++) p[i] = color;
@@ -557,8 +572,11 @@ void fb_blit(const u32 *src, u32 sstride, int x, int y, int w, int h) {
     if (y + h > (int)info.height) h = info.height - y;
     if (w <= 0 || h <= 0) return;
     cpu_touch();
-    for (int j = 0; j < h; j++)
-        copy32(fb + (y + j) * stride + x, src + (y + j) * sstride + x, w);
+    for (int j = 0; j < h; j++) {
+        volatile u32 *dst=fb+(y+j)*stride+x;const u32 *from=src+(y+j)*sstride+x;
+        if(info.rgb_swap)for(int i=0;i<w;i++)dst[i]=video_pixel_order(from[i],1);
+        else copy32(dst,from,w);
+    }
     mark(x, y, w, h);
     present();                                                    /* программе важна задержка */
 }

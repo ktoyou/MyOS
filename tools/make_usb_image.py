@@ -7,6 +7,7 @@ import hashlib
 import json
 import re
 import shutil
+from video_policy import limits, bios_policy
 
 def live_limits():
     header=pathlib.Path('kernel/bootinfo.h').read_text()
@@ -17,6 +18,7 @@ def live_limits():
     return tuple(value(name) for name in ('LIVE_ROOT_PHYS','LIVE_ROOT_MIN_MB','LIVE_ROOT_MAX_MB','LIVE_ROOT_RESERVE_MB'))
 
 def main():
+    bios_policy()
     config=settings()
     ap=argparse.ArgumentParser(description=__doc__)
     root_phys,root_min,root_max,reserve_mb=live_limits()
@@ -33,8 +35,9 @@ def main():
         if not match:
             ap.error('--video must be auto or WIDTHxHEIGHT')
         width,height=map(int,match.groups())
-        if not (640<=width<=2560 and 480<=height<=1600):
-            ap.error('--video exceeds framebuffer limits (640..2560 x 480..1600)')
+        max_w,max_h,bytes_limit=limits()
+        if not (640<=width<=max_w and 480<=height<=max_h and width*height*4<=bytes_limit):
+            ap.error(f'--video exceeds framebuffer limits ({max_w}x{max_h}, {bytes_limit} bytes)')
         video_defines=[f'-DVIDEO_WIDTH={width}',f'-DVIDEO_HEIGHT={height}']
     b=pathlib.Path('build/hardware'); b.mkdir(parents=True,exist_ok=True)
     kernel=(b/'kernel.bin').read_bytes()

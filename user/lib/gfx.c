@@ -61,7 +61,12 @@ int gfx_check_mode(void) {
     if (gfx_info2(&gi) < 0) return 0;
     if ((int)gi.width == gfx_w && (int)gi.height == gfx_h) return 0;
     color_t *nb = malloc(gi.width * gi.height * 4);
-    if (!nb) return 0;
+    if (!nb) {
+        if(gfx_set_mode(gfx_w,gfx_h)==0)return 0;
+        gfx_close();
+        dprintf(STDERR,"graphics: insufficient memory for %ux%u\n",gi.width,gi.height);
+        exit(1);
+    }
     free(gfx_buf);
     gfx_buf = nb;
     gfx_w = gi.width;
@@ -102,18 +107,18 @@ int gfx_hw_fill(int x, int y, int w, int h, color_t c) {
     return sc(SYS_GFX_ACCEL, 2, (int)a);
 }
 
-static const int std_modes[][2] = {
-    { 640, 480 }, { 800, 600 }, { 1024, 768 }, { 1152, 864 }, { 1280, 720 }, { 1280, 800 },
-    { 1280, 1024 }, { 1360, 768 }, { 1440, 900 }, { 1600, 900 }, { 1600, 1200 },
-    { 1680, 1050 }, { 1920, 1080 }, { 1920, 1200 }, { 2560, 1440 }, { 2560, 1600 },
-};
-
 int gfx_modes(struct gfx_mode *out, int max) {
+    if(max<=0)return 0;
+    if(max>256)max=256;
+    int actual=sc(SYS_GFX_MODES,(int)out,max);
+    if(actual>=0)return actual;
     struct gfx_info2 gi;
     int n = 0;
     if (gfx_info2(&gi) < 0) return 0;
-    for (int i = 0; i < (int)(sizeof(std_modes) / sizeof(std_modes[0])) && n < max; i++) {
-        int w = std_modes[i][0], h = std_modes[i][1];
+    out[n++]=(struct gfx_mode){gi.width,gi.height,1};
+    unsigned w,h;
+    for (unsigned i = 0; n < max && video_common_mode(i,&w,&h); i++) {
+        if(w==gi.width && h==gi.height)continue;
         out[n].w = w; out[n].h = h;
         out[n].ok = sc_flags(SYS_GFX_MODE,w,h,1)==0;
         n++;
@@ -125,9 +130,12 @@ int gfx_save_config(int w, int h, int hw_cursor) {
     mkdir("/etc");
     int fd = open("/etc/display", O_WRITE);
     if (fd < 0) return fd;
-    dprintf(fd, "%dx%d\ncursor=%s\n", w, h, hw_cursor ? "hw" : "sw");
-    close(fd);
-    return 0;
+    char text[64];
+    int size=(!w && !h)?snprintf(text,sizeof(text),"auto\ncursor=%s\n",hw_cursor?"hw":"sw"):
+        snprintf(text,sizeof(text),"%dx%d\ncursor=%s\n",w,h,hw_cursor?"hw":"sw");
+    int result=write(fd,text,size)==size?fsync(fd):-EIO;
+    int closed=close(fd);
+    return result<0?result:closed;
 }
 
 int gfx_load_config(int *w, int *h, int *hw_cursor) {
@@ -138,9 +146,9 @@ int gfx_load_config(int *w, int *h, int *hw_cursor) {
     close(fd);
     if (n <= 0) return -EINVAL;
     buf[n] = 0;
-    *w = atoi(buf);
-    char *x = strchr(buf, 'x');
-    *h = x ? atoi(x + 1) : 0;
+    unsigned pw,ph;
+    if(!video_parse_mode(buf,&pw,&ph))return -EINVAL;
+    *w=pw;*h=ph;
     *hw_cursor = strstr(buf, "cursor=hw") != NULL;
     return 0;
 }

@@ -30,7 +30,7 @@ static bool shm_owner(struct shm *s,struct task *p){return s->owner_pid==p->id &
 static void shm_destroy(struct shm *s){for(u32 i=0;i<s->npages;i++)pmm_free(s->frames[i]);kfree(s->frames);s->frames=NULL;grants_free(&s->grants);s->used=false;}
 static void shm_put(struct shm *s){if(--s->refs==0)shm_destroy(s);}
 int shm_alloc(u32 size) {
-    if(!size || size>16*1024*1024)return -EINVAL;
+    if(!size || size>VIDEO_BUFFER_BYTES)return -EINVAL;
     u32 n=(size+PAGE_SIZE-1)/PAGE_SIZE,*frames=kcalloc(n,sizeof(u32));if(!frames)return -ENOMEM;
     for(u32 i=0;i<n;i++){frames[i]=pmm_alloc();if(!frames[i]){for(u32 j=0;j<i;j++)pmm_free(frames[j]);kfree(frames);return -ENOMEM;}memset((void*)frames[i],0,PAGE_SIZE);}
     struct task *p=task_process(task_current());

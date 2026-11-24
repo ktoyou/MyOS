@@ -59,8 +59,8 @@ static int mouse_x, mouse_y;
 #define APP_PROG 32
 #define APP_PATH 64
 #define APP_KEYWORDS 128
-enum { APP_GENERIC, APP_BROWSER, APP_FILES, APP_TERMINAL, APP_NOTEPAD, APP_CALC, APP_PAINT, APP_MINES, APP_BATTLE, APP_TASKMGR, APP_DISPLAY, APP_CODE, APP_ABOUT };
-struct app { char name[APP_NAME], prog[APP_PROG], path[APP_PATH], keywords[APP_KEYWORDS]; int icon; bool fav; };
+enum { APP_GENERIC, APP_BROWSER, APP_FILES, APP_TERMINAL, APP_NOTEPAD, APP_CALC, APP_PAINT, APP_MINES, APP_BATTLE, APP_TASKMGR, APP_DISPLAY, APP_CODE, APP_ABOUT, APP_DISK };
+struct app { char name[APP_NAME], prog[APP_PROG], path[APP_PATH], keywords[APP_KEYWORDS]; int icon; bool fav, desktop; };
 static struct app apps[MAX_APPS];
 static int N_APPS;
 
@@ -77,6 +77,7 @@ static int app_icon_kind(const char *s) {
     if (!strcmp(s, "display")) return APP_DISPLAY;
     if (!strcmp(s, "code")) return APP_CODE;
     if (!strcmp(s, "about")) return APP_ABOUT;
+    if (!strcmp(s, "disk")) return APP_DISK;
     return APP_GENERIC;
 }
 
@@ -122,6 +123,7 @@ static void load_apps(void) {
             } else if (!strcmp(line, "Icon")) a.icon = app_icon_kind(eq);
             else if (!strcmp(line, "Keywords") || !strcmp(line, "Comment")) app_append(a.keywords, sizeof(a.keywords), eq);
             else if (!strcmp(line, "X-MyOS-Favorite") && (!strcmp(eq, "true") || !strcmp(eq, "1"))) a.fav = true;
+            else if (!strcmp(line, "X-MyOS-Desktop") && (!strcmp(eq, "true") || !strcmp(eq, "1"))) a.desktop = true;
         }
         close(fd);
         if (a.name[0] && a.prog[0] && a.path[0]) apps[N_APPS++] = a;
@@ -199,11 +201,14 @@ static struct rect mkrect(int x, int y, int w, int h) { struct rect r = { x, y, 
 static void add_dirty(int x, int y, int w, int h) {
     struct rect screen = { 0, 0, SW, SH }, r = { x, y, w, h };
     if (!intersect(r, screen, &r)) return;
-    for (int i = 0; i < ndirty; i++) {                  /* пересекается — объединяем */
-        if (intersect(dirty[i], r, NULL)) {
-            dirty[i] = bounding(dirty[i], r);
-            return;
-        }
+    for (int i = 0; i < ndirty;) {
+        struct rect merged = bounding(dirty[i], r);
+        /* Пересечение узких полос не должно превращаться в перерисовку всего окна. */
+        if (merged.w * merged.h <= dirty[i].w * dirty[i].h + r.w * r.h) {
+            r = merged;
+            dirty[i] = dirty[--ndirty];
+            i = 0;                         /* расширение могло захватить прежние области */
+        } else i++;
     }
     if (ndirty == MAXDIRTY) {                           /* слишком много — один общий */
         for (int i = 1; i < ndirty; i++) dirty[0] = bounding(dirty[0], dirty[i]);
@@ -428,6 +433,15 @@ static void draw_app_icon(int app, int x, int y, int size) {
         ell(21, 10, 6, 6, C_WHITE, 255);
         rr(21, 19, 6, 19, 3, C_WHITE);
         break;
+    case APP_DISK:
+        rr_grad(5, 8, 38, 34, 6, RGB(221, 225, 231), RGB(141, 150, 163));
+        rr(9, 12, 30, 17, 3, RGB(58, 66, 79));
+        ln(22, 69, 46, 69, 2, RGB(245, 247, 250));
+        ell(29, 27, 18, 18, UI_ACCENT, 255);
+        ln(76, 60, 76, 80, 3, C_WHITE);
+        ln(68, 73, 76, 81, 3, C_WHITE);
+        ln(76, 81, 84, 73, 3, C_WHITE);
+        break;
     default: draw_generic_icon(apps[app].name, x, y, size); break;
     }
 }
@@ -468,6 +482,27 @@ static uint32_t *app_icon(int app, int which, int size) {
 
 /* ------------------------------------------------------------ обои */
 
+static struct rect desktop_app_rect(int ordinal) {
+    int rows=(SH-TOPBAR_H-32)/112;if(rows<1)rows=1;
+    return (struct rect){88+(ordinal/rows)*144,TOPBAR_H+18+(ordinal%rows)*112,132,104};
+}
+
+/* Ярлыки входят в слой обоев: оба композитора перекрывают их окнами. */
+static void draw_desktop_apps(void) {
+    int ordinal=0;
+    for(int i=0;i<N_APPS;i++)if(apps[i].desktop) {
+        struct rect r=desktop_app_rect(ordinal++);
+        if(r.x+r.w>SW)break;
+        gfx_round_rect_a(r.x,r.y,r.w,r.h,10,C_BLACK,40);
+        draw_app_icon(i,r.x+(r.w-64)/2,r.y+3,64);
+        int x=r.x+(r.w-text_width(FONT_UI_MEDIUM,12,apps[i].name))/2;
+        gfx_set_clip(r.x,r.y,r.w,r.h);
+        text_draw(FONT_UI_MEDIUM,12,x+1,r.y+77,apps[i].name,C_BLACK);
+        text_draw(FONT_UI_MEDIUM,12,x,r.y+76,apps[i].name,C_WHITE);
+        gfx_no_clip();
+    }
+}
+
 static color_t lerp3(int t) {                                      /* t 0..1023: баклажан -> пурпур -> оранжевый */
     static const color_t stops[4] = { RGB(44, 0, 30), RGB(94, 22, 80), RGB(170, 40, 70), RGB(233, 84, 32) };
     if (t < 0) t = 0;
@@ -506,6 +541,7 @@ static void custom_wallpaper(void) {
 static void make_wallpaper(void) {
     gpu_wallpaper_ready = false;
     wallpaper = malloc(SW * SH * 4);
+    if(!wallpaper)return;
     color_t *save = gfx_buf;
     int sw = gfx_w, sh = gfx_h;
     gfx_buf = wallpaper; gfx_w = SW; gfx_h = SH;
@@ -544,6 +580,7 @@ static void make_wallpaper(void) {
     const char *s = "MyOS";
     text_draw(FONT_UI_BOLD, 30, SW - text_width(FONT_UI_BOLD, 30, s) - 34, SH - 76, s, RGB(255, 220, 200));
     custom_wallpaper();
+    draw_desktop_apps();
     gfx_buf = save; gfx_w = sw; gfx_h = sh;
 }
 
@@ -858,6 +895,8 @@ static struct rect ov_cell(int i) {                               /* i — но�
 
 static void make_overview_bg(void) {
     free(overview_bg);
+    overview_bg=NULL;
+    if(!wallpaper)return;
     ov_sw = (SW + 7) / 8; ov_sh = (SH + 7) / 8;
     overview_bg = malloc(ov_sw * ov_sh * 4);
     if (!overview_bg) return;
@@ -1024,8 +1063,10 @@ static void compose(struct rect r) {
     if (overview_open && overview_bg) {
         draw_overview(r);
     } else {
-        for (int y = r.y; y < r.y + r.h; y++)                     /* обои */
-            memcpy(back + y * SW + r.x, wallpaper + y * SW + r.x, r.w * 4);
+        if(wallpaper) {
+            for (int y = r.y; y < r.y + r.h; y++)
+                memcpy(back + y * SW + r.x, wallpaper + y * SW + r.x, r.w * 4);
+        } else gfx_fill_rect(r.x,r.y,r.w,r.h,RGB(40,30,40));
         for (int k = 0; k < nz; k++) {                            /* окна снизу вверх */
             struct win *w = &wins[zorder[k]];
             if (w->minimized) continue;
@@ -1406,9 +1447,9 @@ static void handle_msg(struct msg *m) {
     case WM_CREATE: {
         int idx = -1;
         for (int i = 0; i < MAXWIN; i++) if (!wins[i].used) { idx = i; break; }
-        int needed=m->b>0 && m->c>0 && m->b<=2560 && m->c<=1600?m->b*m->c*4+((unsigned)m->d==WM_BUFFERED?WM_FRAME_BYTES:0):-1;
+        int needed=m->b>0 && m->c>0 && m->b<=VIDEO_MAX_WIDTH && m->c<=VIDEO_MAX_HEIGHT?m->b*m->c*4+((unsigned)m->d==WM_BUFFERED?WM_FRAME_BYTES:0):-1;
         color_t *px=idx>=0 && needed>0 && shm_size(m->a)>=needed?shm_map(m->a):NULL;
-        if (!px || m->b <= 0 || m->c <= 0 || m->b > 2560 || m->c > 1600) {
+        if (!px || m->b <= 0 || m->c <= 0 || m->b > VIDEO_MAX_WIDTH || m->c > VIDEO_MAX_HEIGHT) {
             if (px) shm_unmap(px);
             send(m->from, WM_CREATED, -1, 0, 0, 0);
             return;
@@ -1498,7 +1539,7 @@ static void handle_msg(struct msg *m) {
         if (m->a < 0 || m->a >= MAXWIN || !wins[m->a].used || wins[m->a].owner != m->from) return;
         struct win *w = &wins[m->a];
         w->awaiting = false;
-        if (m->c <= 0 || m->d <= 0 || m->c > 2560 || m->d > 1600) return;
+        if (m->c <= 0 || m->d <= 0 || m->c > VIDEO_MAX_WIDTH || m->d > VIDEO_MAX_HEIGHT) return;
         unsigned marker;memcpy(&marker,m->data,sizeof(marker));
         int needed=m->c*m->d*4+(marker==WM_BUFFERED?WM_FRAME_BYTES:0);
         color_t *px=shm_size(m->b)>=needed?shm_map(m->b):NULL;
@@ -1785,6 +1826,12 @@ static void mouse_down(int x, int y) {
         send(w->owner, WM_MOUSE, idx, x - w->x, y - w->y - HEAD_H, prev_buttons | (1 << 8));
         return;
     }
+    int ordinal=0;
+    for(int i=0;i<N_APPS;i++)if(apps[i].desktop) {
+        struct rect r=desktop_app_rect(ordinal++);
+        if(r.x+r.w>SW)break;
+        if(ui_inside(x,y,r.x,r.y,r.w,r.h)){launch(i);return;}
+    }
     if (focus >= 0) set_focus(-1);                                /* клик по обоям */
 }
 
@@ -1800,8 +1847,8 @@ static void mouse_move(int ox, int oy, int x, int y) {
         if (rs_edges & E_T) nh = rs_h - dy;
         if (nw < w->min_w) nw = w->min_w;
         if (nh < w->min_h) nh = w->min_h;
-        if (nw > 2560) nw = 2560;
-        if (nh > 1600) nh = 1600;
+        if (nw > VIDEO_MAX_WIDTH) nw = VIDEO_MAX_WIDTH;
+        if (nh > VIDEO_MAX_HEIGHT) nh = VIDEO_MAX_HEIGHT;
         int nx = rs_edges & E_L ? rs_x + rs_w - nw : rs_x;
         int ny = rs_edges & E_T ? rs_y + rs_h - nh : rs_y;
         if (ny < TOPBAR_H) { nh -= TOPBAR_H - ny; ny = TOPBAR_H; }
@@ -1914,11 +1961,13 @@ static bool desktop_login(void) {
     for (;;) {
         if (gfx_check_mode()) {
             SW = gfx_w; SH = gfx_h; back = gfx_buf;
+            free(wallpaper);
             make_wallpaper(); dock_build();
         }
         int x = (SW - 352) / 2, y = (SH - 300) / 2;
         gfx_no_clip();
-        memcpy(back, wallpaper, SW * SH * 4);
+        if(wallpaper)memcpy(back,wallpaper,SW*SH*4);
+        else gfx_clear(RGB(40,30,40));
         gfx_fill_rect_a(0, 0, SW, SH, C_BLACK, 95);
         gfx_round_rect(x, y, 352, 300, 18, RGB(42, 39, 45));
         const char *title = setup > 0 ? (stage ? "Confirm password" : "Set a password") : "Sign in";

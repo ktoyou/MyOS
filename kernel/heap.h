@@ -4,7 +4,7 @@
 
 #ifndef HEAP_START                  /* тесты на хосте подставляют свои адреса */
 #define HEAP_START 0xD0000000u
-#define HEAP_MAX   0xD4000000u      /* до 64 МБ */
+#define HEAP_MAX   0xD8000000u      /* До 128 МиБ; страницы выделяются по мере надобности. */
 #endif
 
 struct heap_stats {

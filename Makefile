@@ -490,13 +490,13 @@ programs: $(UBINS)
 # Библиотеки для cc — статические архивы, собранные самим cc: /lib/libc.a и
 # /lib/libgfx.a на диске MyOS ($(BUILD)/mlib) и такие же для cc-host -linux ($(CCROOT)/lib).
 CCROOT    := $(BUILD)/ccroot
-CC_HDRS   := user/lib/myos.h user/lib/installer.h user/lib/build_jobs.h user/lib/hwinfo.h user/lib/scheduler.h user/lib/kernelinfo.h user/lib/sysinfo.h user/lib/gfx.h user/lib/win.h $(wildcard user/include/*.h) $(wildcard user/include/sys/*.h) $(wildcard user/include/netinet/*.h) $(wildcard user/include/arpa/*.h) $(wildcard user/include/libxml/*.h) user/include/netdb.h $(wildcard $(OSSL_SRC)/include/openssl/*.h) $(wildcard $(OSSL_BLD)/include/openssl/*.h) $(wildcard $(CURL_SRC)/include/curl/*.h)
+CC_HDRS   := user/lib/video_mode.h user/lib/myos.h user/lib/installer.h user/lib/build_jobs.h user/lib/hwinfo.h user/lib/scheduler.h user/lib/kernelinfo.h user/lib/sysinfo.h user/lib/gfx.h user/lib/win.h $(wildcard user/include/*.h) $(wildcard user/include/sys/*.h) $(wildcard user/include/netinet/*.h) $(wildcard user/include/arpa/*.h) $(wildcard user/include/libxml/*.h) user/include/netdb.h $(wildcard $(OSSL_SRC)/include/openssl/*.h) $(wildcard $(OSSL_BLD)/include/openssl/*.h) $(wildcard $(CURL_SRC)/include/curl/*.h)
 CC_LIBSRC := user/lib/libc.c user/lib/regex.c user/lib/zlib.c user/lib/gfx.c user/lib/vec.c user/lib/font.c user/lib/win.c user/lib/bzip2.c user/lib/lzma.c user/lib/iconv.c user/lib/pcre.c user/lib/ncurses.c user/lib/intl.c user/lib/png.c user/lib/jpeg.c user/lib/gd.c user/lib/xml.c
 GFX_PARTS := gfx vec font win
 
 $(CCROOT)/.stamp: $(CC_HDRS) $(CC_LIBSRC) $(OSSL_BLD)/.configured
 	@mkdir -p $(CCROOT)/include/sys $(CCROOT)/include/netinet $(CCROOT)/include/arpa $(CCROOT)/include/openssl $(CCROOT)/include/curl $(CCROOT)/include/libxml $(CCROOT)/lib
-	@cp user/lib/myos.h user/lib/installer.h user/lib/build_jobs.h user/lib/hwinfo.h user/lib/scheduler.h user/lib/kernelinfo.h user/lib/sysinfo.h user/lib/gfx.h user/lib/win.h user/include/*.h $(CCROOT)/include/
+	@cp user/lib/video_mode.h user/lib/myos.h user/lib/installer.h user/lib/build_jobs.h user/lib/hwinfo.h user/lib/scheduler.h user/lib/kernelinfo.h user/lib/sysinfo.h user/lib/gfx.h user/lib/win.h user/include/*.h $(CCROOT)/include/
 	@cp user/include/sys/*.h $(CCROOT)/include/sys/
 	@cp user/include/netinet/*.h $(CCROOT)/include/netinet/
 	@cp user/include/arpa/*.h $(CCROOT)/include/arpa/
@@ -684,7 +684,7 @@ install: $(UBINS) $(MLIBS) $(BUILD)/myfs $(BUILD)/ld.so $(BUILD)/user/libz.so $(
 	@$(BUILD)/myfs $(DISK) mkdir /usr/share/wallpapers >/dev/null || exit 1
 	@for f in wallpapers/*.jpg; do $(BUILD)/myfs $(DISK) put $$f /usr/share/wallpapers/$$(basename $$f) >/dev/null || exit 1; done
 	@for f in apps/*.desktop; do $(BUILD)/myfs $(DISK) put $$f /usr/share/applications/$$(basename $$f) >/dev/null || exit 1; done
-	@for f in myos.h installer.h build_jobs.h hwinfo.h scheduler.h kernelinfo.h sysinfo.h gfx.h win.h tls.h; do $(BUILD)/myfs $(DISK) put user/lib/$$f /include/$$f >/dev/null || exit 1; done
+	@for f in video_mode.h myos.h installer.h setup-copy.h build_jobs.h hwinfo.h scheduler.h kernelinfo.h sysinfo.h gfx.h win.h tls.h; do $(BUILD)/myfs $(DISK) put user/lib/$$f /include/$$f >/dev/null || exit 1; done
 	@for f in user/include/*.h; do $(BUILD)/myfs $(DISK) put $$f /include/$$(basename $$f) >/dev/null || exit 1; done
 	@$(BUILD)/myfs $(DISK) mkdir /include/sys >/dev/null 2>&1 || true
 	@for f in user/include/sys/*.h; do $(BUILD)/myfs $(DISK) put $$f /include/sys/$$(basename $$f) >/dev/null || exit 1; done
@@ -694,7 +694,7 @@ install: $(UBINS) $(MLIBS) $(BUILD)/myfs $(BUILD)/ld.so $(BUILD)/user/libz.so $(
 	@for f in user/include/arpa/*.h; do $(BUILD)/myfs $(DISK) put $$f /include/arpa/$$(basename $$f) >/dev/null || exit 1; done
 	@$(BUILD)/myfs $(DISK) mkdir /include/libxml >/dev/null 2>&1 || true
 	@for f in user/include/libxml/*.h; do $(BUILD)/myfs $(DISK) put $$f /include/libxml/$$(basename $$f) >/dev/null || exit 1; done
-	@for f in libc.c regex.c zlib.c gfx.c vec.c font.c win.c tls.c bzip2.c lzma.c iconv.c pcre.c ncurses.c intl.c png.c jpeg.c gd.c xml.c; do $(BUILD)/myfs $(DISK) put user/lib/$$f /lib/$$f >/dev/null || exit 1; done
+	@for f in libc.c regex.c zlib.c gfx.c vec.c font.c win.c tls.c bzip2.c lzma.c iconv.c pcre.c ncurses.c intl.c png.c jpeg.c gd.c xml.c setup-copy.c; do $(BUILD)/myfs $(DISK) put user/lib/$$f /lib/$$f >/dev/null || exit 1; done
 	@for f in $(MLIBS); do $(BUILD)/myfs $(DISK) put $$f /lib/$$(basename $$f) >/dev/null || exit 1; done
 	@$(BUILD)/myfs $(DISK) put $(BUILD)/ld.so /lib/ld.so >/dev/null || exit 1
 	@$(BUILD)/myfs $(DISK) put $(BUILD)/user/libc.so /lib/libc.so >/dev/null || exit 1
@@ -872,9 +872,14 @@ browsertest: user/lib/dom_prelude.h browserprofiletest | $(BUILD)
 
 # Сглаженная графика и шрифты на Linux: пробная картинка build/gfxtest.ppm
 gfxtest: | $(BUILD)
-	gcc -std=gnu17 -m32 -O1 -g -fno-builtin -nostdinc -w -Iuser/lib tests/gfx_host.c user/lib/gfx.c user/lib/vec.c \
-	    user/lib/font.c -o $(BUILD)/gfx-host
+	gcc -std=gnu17 -m32 -O1 -g -fno-builtin -nostdinc -w -ffunction-sections -fdata-sections -Iuser/lib tests/gfx_host.c user/lib/gfx.c user/lib/vec.c \
+	    user/lib/font.c user/lib/win.c -Wl,--gc-sections -o $(BUILD)/gfx-host
 	./$(BUILD)/gfx-host fonts > $(BUILD)/gfxtest.ppm && echo "==> $(BUILD)/gfxtest.ppm"
+
+.PHONY: uitest
+uitest: | $(BUILD)
+	$(HOSTCC) -m32 -std=gnu11 -O1 -g -fno-builtin -ffunction-sections -fdata-sections -fsanitize=address,undefined -Iuser/include -Iuser/lib tests/ui_edit_test.c user/lib/win.c -Wl,--gc-sections -o $(BUILD)/ui-edit-test
+	./$(BUILD)/ui-edit-test
 
 # Тесты компилятора cc на Linux: тестовые программы и «cc собирает сам себя»
 cctest: $(BUILD)/cc-host $(CCROOT_READY)
@@ -1530,6 +1535,11 @@ persistence-large-test: $(BUILD)/myfs
 $(BUILD)/fs.o $(HWBUILD)/fs.o: kernel/fs-install.inc user/lib/installer.h
 $(BUILD)/myfs: kernel/fs-install.inc user/lib/installer.h
 $(BUILD)/user/libc.o $(BUILD)/user/libc.so: user/lib/installer.h
+$(BUILD)/user/setup-copy.o: user/lib/setup-copy.c user/lib/setup-copy.h user/lib/installer.h | $(BUILD)/user
+	$(CC) $(UCFLAGS) -c $< -o $@
+$(BUILD)/user/setup.o $(BUILD)/user/setup-gui.o: user/lib/setup-copy.h
+$(BUILD)/user/setup $(BUILD)/user/setup-gui: $(BUILD)/user/%: $(BUILD)/user/%.o $(BUILD)/user/setup-copy.o $(BUILD)/user/crt0.o $(BUILD)/user/libc.so $(BUILD)/user/libgfx.so
+	$(LD) $(DYNLDFLAGS) -o $@ $(BUILD)/user/crt0.o $< $(BUILD)/user/setup-copy.o -L$(BUILD)/user -lc -lgfx
 .PHONY: install-payload
 install-payload: $(HWBUILD)/kernel.bin
 	python3 tools/make_install_payload.py --nasm $(NASM) --nm "$(NM)"
@@ -1559,3 +1569,37 @@ uefi-smoke: $(HWBUILD)/kernel.bin $(BUILD)/myfs $(BUILD)/ld.so $(BUILD)/user/lib
 	python3 tests/uefi_smoke.py
 uefi-installer-smoke: $(HWBUILD)/kernel.bin $(BUILD)/myfs $(BUILD)/ld.so $(BUILD)/user/libc.so $(BUILD)/user/installercheck $(addprefix $(BUILD)/user/,sh setup cat mkdir sync stat poweroff)
 	python3 tests/disk_install_smoke.py --storage nvme --firmware uefi
+
+.PHONY: setup-gui-test
+setup-gui-test: $(HWBUILD)/kernel.bin $(BUILD)/myfs $(BUILD)/ld.so $(BUILD)/user/libc.so $(BUILD)/user/libgfx.so $(BUILD)/user/installercheck $(addprefix $(BUILD)/user/,sh setup setup-gui desktop sleep cat mkdir sync stat poweroff)
+	python3 tests/disk_install_smoke.py --storage nvme --firmware uefi --gui
+	python3 tests/disk_install_smoke.py --firmware uefi --gui --windowed
+
+$(BUILD)/user/settings-ui-check.o: tests/settings_ui_check.c user/settings.c user/lib/win.h | $(BUILD)/user
+	$(CC) $(UCFLAGS) -c $< -o $@
+$(BUILD)/user/settings-ui-check: $(BUILD)/user/settings-ui-check.o $(BUILD)/user/l_img.o $(IMG_OBJS) $(ULIB) user/user.ld
+	$(LD) $(ULDFLAGS) $< $(BUILD)/user/l_img.o $(IMG_OBJS) $(ULIB) -o $@
+.PHONY: settings-ui-smoke
+settings-ui-smoke: $(HWBUILD)/kernel.bin $(BUILD)/myfs $(BUILD)/ld.so $(BUILD)/user/libc.so $(BUILD)/user/libgfx.so $(addprefix $(BUILD)/user/,sh desktop sleep poweroff settings-ui-check)
+	python3 tests/settings_ui_smoke.py
+
+# Пределы графики общие для загрузчиков, ядра и гостевого SDK.
+$(OBJS) $(patsubst kernel/%.c,$(HWBUILD)/%.o,$(C_SRC)) $(patsubst drivers/video/%.c,$(HWBUILD)/video/%.o,$(VIDEO_SRC)): user/lib/video_mode.h
+$(wildcard $(BUILD)/user/*.o) $(wildcard $(BUILD)/user/pic/*.o): user/lib/video_mode.h
+
+.PHONY: videopolicytest
+videopolicytest: videodrivertest | $(BUILD)
+	$(HOSTCC) -m32 -std=gnu11 -g -O1 -fno-builtin -ffunction-sections -fdata-sections -fsanitize=address,undefined tests/video_dma_test.c -Wl,--gc-sections -o $(BUILD)/video-dma-test
+	./$(BUILD)/video-dma-test
+	$(HOSTCC) -std=gnu11 -g -O1 -fsanitize=address,undefined tests/video_policy_test.c -o $(BUILD)/video-policy-test
+	./$(BUILD)/video-policy-test
+	$(HOSTCC) -std=gnu11 -g -O1 -fsanitize=address,undefined -DGNU_EFI_USE_MS_ABI -I/usr/include/efi -I/usr/include/efi/x86_64 tests/uefi_video_test.c -o $(BUILD)/uefi-video-test
+	./$(BUILD)/uefi-video-test
+
+$(BUILD)/user/nativewindowcheck.o: tests/native_window_check.c user/lib/win.h user/lib/video_mode.h | $(BUILD)/user
+	$(CC) $(UCFLAGS) -c $< -o $@
+$(BUILD)/user/nativewindowcheck: $(BUILD)/user/nativewindowcheck.o $(ULIB) user/user.ld
+	$(LD) $(ULDFLAGS) $< $(ULIB) -o $@
+.PHONY: video-native-smoke
+video-native-smoke: videopolicytest $(BUILD)/os.img $(HWBUILD)/kernel.bin $(BUILD)/myfs $(BUILD)/ld.so $(BUILD)/user/libc.so $(BUILD)/user/libgfx.so $(addprefix $(BUILD)/user/,sh mode cat stat poweroff sleep desktop display nativewindowcheck)
+	python3 tests/video_native_smoke.py

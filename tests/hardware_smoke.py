@@ -126,7 +126,11 @@ class VM:
                 path=pathlib.Path(self.temp.name)/(name+'.bin')
                 self.qmp('pmemsave',{'val':addresses[name],'size':size,'filename':str(path)})
                 return path.read_bytes()
-            cells=struct.unpack('<'+'H'*(columns*rows),memory('shadow',columns*rows*2))
+            # Сетка теперь в куче: разыменовываем указатель через виртуальную память CPU.
+            shadow=struct.unpack('<I',memory('shadow',4))[0]
+            path=pathlib.Path(self.temp.name)/'console-cells.bin'
+            self.qmp('memsave',{'val':shadow,'size':columns*rows*2,'filename':str(path)})
+            cells=struct.unpack('<'+'H'*(columns*rows),path.read_bytes())
             font=memory('font',4096)
             palette=(0x000000,0x0000aa,0x00aa00,0x00aaaa,0xaa0000,0xaa00aa,0xaa5500,0xaaaaaa,
                      0x555555,0x5555ff,0x55ff55,0x55ffff,0xff5555,0xff55ff,0xffff55,0xffffff)

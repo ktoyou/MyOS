@@ -15,6 +15,52 @@ import hardware_smoke as hardware
 from hardware_inventory_smoke import live_image, login
 
 B = pathlib.Path('build')
+
+def gui_install(vm, disk, before, device, label, windowed):
+    def type_text(value):
+        for char in value:
+            vm.key({' ':'spc','/':'slash','-':'minus'}.get(char,char))
+    def shot(suffix):
+        time.sleep(.7)
+        ppm=B/(label+'-'+suffix+'.ppm')
+        vm.qmp('screendump',{'filename':str(ppm.resolve())})
+        hardware.save_png(ppm,B/(label+'-'+suffix+'.png'))
+    if windowed:
+        vm.send("echo 'desktop &' > /tmp/gui.sh",'root:/')
+        vm.send("echo 'sleep 3' >> /tmp/gui.sh",'root:/')
+        vm.send("echo 'setup --gui' >> /tmp/gui.sh",'root:/')
+        vm.send("echo 'poweroff' >> /tmp/gui.sh",'root:/')
+        vm.send('sh /tmp/gui.sh','SETUP GUI: choose')
+        assert 'desktop: software compositor' in hardware.clean(vm.log)
+    else:
+        vm.send('setup --gui','SETUP GUI: choose')
+    shot('choose')
+    if device=='/dev/nvme0': vm.key('down')
+    offset=len(hardware.clean(vm.log));vm.key('ret')
+    vm.wait('SETUP GUI: review device='+device,offset)
+    shot('review')
+    type_text('erase /dev/wrong');vm.key('tab');vm.key('spc');vm.key('tab');vm.key('tab');vm.key('ret')
+    time.sleep(1)
+    assert hardware.digest(disk)==before,'Wrong confirmation wrote target'
+    offset=len(hardware.clean(vm.log));vm.key('esc');vm.wait('SETUP GUI: choose',offset)
+    assert hardware.digest(disk)==before,'Back/cancel wrote target'
+    offset=len(hardware.clean(vm.log));vm.key('ret');vm.wait('SETUP GUI: review device='+device,offset)
+    type_text('erase '+device)
+    vm.key('home');type_text('x');vm.key('home');vm.key('delete');vm.key('end')
+    vm.key('ret');time.sleep(.5)
+    assert hardware.digest(disk)==before,'Enter in input wrote target'
+    vm.key('tab');vm.key('spc');vm.key('tab');vm.key('tab')
+    offset=len(hardware.clean(vm.log));vm.key('ret')
+    vm.wait('SETUP GUI: installing',offset)
+    vm.key('esc');vm.wait('SETUP GUI: close blocked while installing',offset)
+    vm.wait('SETUP GUI: done',offset)
+    shot('done')
+    vm.key('ret')
+    if windowed:
+        vm.wait('Powering off...',offset)
+    else:
+        vm.wait('root:/',offset)
+    print('Native gfx: wrong phrase, cancel, input Enter unchanged; guarded install and close: PASS',flush=True)
 def uefi_firmware(temp,name):
     ovmf=pathlib.Path('/usr/share/OVMF');variables=temp/(name+'-vars.fd')
     shutil.copyfile(ovmf/'OVMF_VARS_4M.fd',variables)
@@ -59,12 +105,15 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--storage',choices=['ahci','nvme'],default='ahci')
     parser.add_argument('--firmware',choices=['bios','uefi'],default='bios')
+    parser.add_argument('--gui',action='store_true')
+    parser.add_argument('--windowed',action='store_true')
     args=parser.parse_args()
     nvme=args.storage=='nvme'
     uefi=args.firmware=='uefi'
     binary='qemu-system-x86_64' if uefi else 'qemu-system-i386'
     device='/dev/nvme0' if nvme else '/dev/sdc'
     label=('uefi-' if uefi else '')+('nvme-install' if nvme else 'disk-install')
+    if args.gui: label+='-gui'+('-window' if args.windowed else '')
     sys.path.insert(0, str(pathlib.Path('tools').resolve()))
     from make_install_payload import build
     payload = build()
@@ -76,6 +125,13 @@ def main():
             run(B/'myfs',root,'mkdir',d)
         for name in ['sh','setup','cat','mkdir','sync','stat','poweroff','installercheck']:
             run(B/'myfs',root,'put',B/'user'/name,'/bin/'+name)
+        if args.gui:
+            for name in ['setup-gui']+(['desktop','sleep'] if args.windowed else []):
+                run(B/'myfs',root,'put',B/'user'/name,'/bin/'+name)
+            run(B/'myfs',root,'put',B/'user/libgfx.so','/lib/libgfx.so')
+            run(B/'myfs',root,'mkdir','/lib/fonts')
+            for font in pathlib.Path('fonts').glob('*.ttf'):
+                run(B/'myfs',root,'put',font,'/lib/fonts/'+font.name)
         run(B/'myfs',root,'put',B/'ld.so','/lib/ld.so')
         run(B/'myfs',root,'put',B/'user/libc.so','/lib/libc.so')
         run(B/'myfs',root,'put',payload,'/boot/install/payload.bin')
@@ -104,15 +160,19 @@ def main():
             '-device','usb-storage,bus=xhci.0,drive=stick,bootindex=1',*storage],binary=binary)
         try:
             login(vm)
-            vm.send('setup --list',device)
-            vm.send('setup '+device,"Type exactly 'erase "+device+"'")
-            vm.send('cancel','Disk unchanged.')
-            assert hardware.digest(disk)==before, 'Cancelled install wrote target'
             vm.send('installercheck create','INSTALL FIXTURE READY')
-            vm.send('setup '+device,"Type exactly 'erase "+device+"'")
-            vm.send('erase '+device,'Installation complete:')
+            if args.gui:
+                gui_install(vm,disk,before,device,label,args.windowed)
+            else:
+                vm.send('setup --list',device)
+                vm.send('setup '+device,"Type exactly 'erase "+device+"'")
+                vm.send('cancel','Disk unchanged.')
+                assert hardware.digest(disk)==before, 'Cancelled install wrote target'
+                vm.send('setup '+device,"Type exactly 'erase "+device+"'")
+                vm.send('erase '+device,'Installation complete:')
             assert hardware.digest(source)==source_before, 'Live source image changed'
-            vm.send('poweroff','Powering off...')
+            if not (args.gui and args.windowed):
+                vm.send('poweroff','Powering off...')
             vm.p.wait(timeout=25)
         finally:
             vm.stop()
