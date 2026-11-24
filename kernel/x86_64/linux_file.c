@@ -444,13 +444,30 @@ static long linux_pipe2(uptr address, u32 flags) {
     return pipe ? -EFAULT : -ENOMEM;
 }
 
+static long new_socket_handle(struct linux64_socket *socket, u32 type) {
+    long fd = new_handle(NULL, NULL, O_RDWR | (type & (O_CLOEXEC | O_NONBLOCK)));
+    if (fd < 0) return fd;
+    file_at(fd)->socket = socket;
+    file_at(fd)->file.inode = next_special_inode++;
+    return fd;
+}
+
+static long linux_socket(i32 domain, u32 type, i32 protocol) {
+    struct linux64_socket *socket;
+    long error = linux64_socket_create(domain, type, protocol, &socket);
+    if (error) return error;
+    long fd = new_socket_handle(socket, type);
+    if (fd < 0) linux64_socket_close(socket);
+    return fd;
+}
+
 static long linux_socketpair(i32 domain, u32 type, i32 protocol, uptr address) {
     struct linux64_socket *ends[2];
     long error = linux64_socket_pair(domain, type, protocol, ends);
     if (error) return error;
     i32 fds[2];
     for (unsigned i = 0; i < 2; ++i) {
-        long fd = new_handle(NULL, NULL, O_RDWR | (type & (O_CLOEXEC | O_NONBLOCK)));
+        long fd = new_socket_handle(ends[i], type);
         if (fd < 0) {
             if (i) close_file(fds[0]);
             else linux64_socket_close(ends[0]);
@@ -458,8 +475,6 @@ static long linux_socketpair(i32 domain, u32 type, i32 protocol, uptr address) {
             return fd;
         }
         fds[i] = (i32)fd;
-        file_at(fd)->socket = ends[i];
-        file_at(fd)->file.inode = next_special_inode++;
     }
     if (copy_fd_pair(address, fds[0], fds[1])) return 0;
     close_file(fds[0]);
@@ -550,6 +565,12 @@ static long linux_fcntl(i32 fd, i32 command, u32 value) {
         return 0;
     }
     if (command == F_GETFL) return file_at(fd)->flags;
+    if (command == F_SETFL && file_at(fd)->socket) {
+        if (value & O_DIRECT) return -EINVAL;
+        const u32 mask = O_APPEND | O_NONBLOCK;
+        file_at(fd)->flags = (file_at(fd)->flags & ~mask) | (value & mask);
+        return 0;
+    }
     if (command == F_SETFL && file_at(fd)->pipe) {
         if (value & O_DIRECT) return -EINVAL;
         file_at(fd)->flags = (file_at(fd)->flags & ~O_NONBLOCK) | (value & O_NONBLOCK);
@@ -937,7 +958,7 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
     case 18: /* pwrite64 */
         if ((long)arg3 < 0) return -EINVAL;
         if (!open_file(fd)) return -EBADF;
-        if (file_at(fd)->serial) return -ESPIPE;
+        if (file_at(fd)->serial || file_at(fd)->socket) return -ESPIPE;
         return file_at(fd)->null_device ? null_io(file_at(fd), true, arg1, arg2) : -ENOSYS;
     case 21: /* access */
         if ((u32)arg1 & ~7u) return -EINVAL;
@@ -959,6 +980,8 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
         return dup_fd(fd, 0, false);
     case 33: /* dup2 */
         return dup_to(fd, (i32)arg1, false);
+    case 41: /* socket */
+        return linux_socket(fd, (u32)arg1, (i32)arg2);
     case 46: /* sendmsg */
     case 47: /* recvmsg */
         if (!open_file(fd)) return -EBADF;

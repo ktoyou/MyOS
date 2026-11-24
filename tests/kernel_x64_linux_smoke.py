@@ -154,13 +154,13 @@ def check_mmap(build):
 
 def check_socket(build):
     probe = (build / 'linux-socket.elf').resolve()
-    marker = 'Linux ELF64 seqpacket probe'
+    marker = 'Linux ELF64 socket probe'
     host = subprocess.run([str(probe)], env={}, capture_output=True, timeout=5,
                           preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_NOFILE, (32, 32)))
     assert (host.returncode, host.stdout, host.stderr) == (0, (marker + '\n').encode(), b''), host
     serial = check_guest('socket', probe.read_bytes(), 'Linux x86-64 exit status=0x00')
     assert marker in serial, serial
-    print('OVMF: AF_UNIX seqpacket, SO_PASSCRED, shutdown and descriptor cleanup: PASS', flush=True)
+    print('OVMF: AF_UNIX stream and seqpacket, flags, shutdown and descriptor cleanup: PASS', flush=True)
 
 
 def check_pipe(build):

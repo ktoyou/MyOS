@@ -22,7 +22,7 @@ struct credentials {
 };
 
 enum {
-    AF_UNIX = 1, SOCK_SEQPACKET = 5, SOCK_NONBLOCK = 0x800, SOCK_CLOEXEC = 0x80000,
+    AF_UNIX = 1, SOCK_STREAM = 1, SOCK_SEQPACKET = 5, SOCK_NONBLOCK = 0x800, SOCK_CLOEXEC = 0x80000,
     SOL_SOCKET = 1, SO_TYPE = 3, SO_PASSCRED = 16,
     MSG_PEEK = 2, MSG_CTRUNC = 8, MSG_TRUNC = 0x20, MSG_NOSIGNAL = 0x4000,
     SHUT_RD = 0, SHUT_WR = 1, SHUT_RDWR = 2,
@@ -63,6 +63,73 @@ static long send(int fd, const struct msghdr *msg) {
 
 static long receive(int fd, struct msghdr *msg, unsigned flags) {
     return call(47, fd, (word)msg, flags, 0, 0);
+}
+
+static long stream(word flags) {
+    return call(41, AF_UNIX, SOCK_STREAM | flags, 0, 0, 0);
+}
+
+static long check_stream(void) {
+    if (call(41, 999, SOCK_STREAM, 0, 0, 0) != -97 ||
+        call(41, AF_UNIX, SOCK_STREAM | 0x40000000, 0, 0, 0) != -22 ||
+        call(41, AF_UNIX, 4, 0, 0, 0) != -94 ||
+        call(41, AF_UNIX, 4, 2, 0, 0) != -93) return 30;
+    long fd = stream(0);
+    if (fd < 3 || call(72, fd, 1, 0, 0, 0) || call(72, fd, 3, 0, 0, 0) != 2) return 31;
+    int type;
+    unsigned length = sizeof(type);
+    word info[18];
+    if (option(fd, SO_TYPE, &type, &length) || type != SOCK_STREAM || length != sizeof(type) ||
+        call(5, fd, (word)info, 0, 0, 0) || (info[3] & 0177777) != 0140777 ||
+        !info[1] || info[2] != 1 || info[6] != 0) return 32;
+
+    long duplicate = call(32, fd, 0, 0, 0, 0);
+    if (duplicate <= fd || call(72, fd, 4, 0x400 | SOCK_NONBLOCK, 0, 0) ||
+        call(72, duplicate, 3, 0, 0, 0) != (2 | 0x400 | SOCK_NONBLOCK) ||
+        call(72, fd, 4, 0x4000, 0, 0) != -22 ||
+        call(72, duplicate, 4, 0, 0, 0) || call(72, fd, 3, 0, 0, 0) != 2 ||
+        call(72, fd, 2, 1, 0, 0) || call(72, fd, 1, 0, 0, 0) != 1 ||
+        call(72, duplicate, 1, 0, 0, 0) || close_fd(fd)) return 33;
+
+    char byte;
+    const word invalid = 0xffff800000000000ul;
+    struct msghdr message = {0};
+    struct { int fd; short events, revents; } pollfd = {(int)duplicate, 0x2205, 0};
+    if (call(0, duplicate, (word)&byte, 0, 0, 0) ||
+        call(0, duplicate, (word)&byte, 1, 0, 0) != -22 ||
+        call(1, duplicate, (word)&byte, 0, 0, 0) != -107 ||
+        send(duplicate, &message) != -107 || receive(duplicate, &message, 0) != -22 ||
+        send(duplicate, 0) != -14 || receive(duplicate, 0, 0) != -14) return 34;
+    if (call(0, duplicate, invalid, 1, 0, 0) != -14 ||
+        call(1, duplicate, invalid, 1, 0, 0) != -14 ||
+        call(17, duplicate, (word)&byte, 1, 0, 0) != -29 ||
+        call(18, duplicate, (word)&byte, 1, 0, 0) != -29) return 42;
+    if (call(7, (word)&pollfd, 1, 0, 0, 0) != 1 || pollfd.revents != 0x214 ||
+        shutdown(duplicate, -1) != -22 || shutdown(duplicate, SHUT_RD) ||
+        call(7, (word)&pollfd, 1, 0, 0, 0) != 1 || pollfd.revents != 0x2215 ||
+        close_fd(duplicate)) return 35;
+
+    fd = stream(SOCK_NONBLOCK | SOCK_CLOEXEC);
+    if (fd < 3 || call(72, fd, 1, 0, 0, 0) != 1 ||
+        call(72, fd, 3, 0, 0, 0) != (2 | SOCK_NONBLOCK) || close_fd(fd)) return 36;
+    return 0;
+}
+
+static long check_stream_fd_limit(void) {
+    int descriptors[29];
+    for (unsigned i = 0; i < sizeof(descriptors) / sizeof(*descriptors); ++i) {
+        long fd = stream(0);
+        if (fd < 3) return 37;
+        descriptors[i] = (int)fd;
+    }
+    for (unsigned i = 0; i < 300; ++i)
+        if (stream(0) != -24) return 38;
+    if (close_fd(descriptors[0])) return 39;
+    long fd = stream(0);
+    if (fd != descriptors[0] || close_fd(fd)) return 40;
+    for (unsigned i = 1; i < sizeof(descriptors) / sizeof(*descriptors); ++i)
+        if (close_fd(descriptors[i])) return 41;
+    return 0;
 }
 
 static long check_options(int fd) {
@@ -188,13 +255,16 @@ static long check_fd_limit(void) {
 }
 
 static long check(void) {
+    long status = check_stream();
+    if (!status) status = check_stream_fd_limit();
+    if (status) return status;
     int ends[2];
     for (unsigned i = 0; i < 40; ++i)
         if (pair(0) != -14) return 14;
     if (pair(ends) || ends[0] != 3 || ends[1] != 4 ||
         call(72, ends[0], 1, 0, 0, 0) != 1 ||
         call(72, ends[0], 3, 0, 0, 0) != 0x802) return 15;
-    long status = check_options(ends[1]);
+    status = check_options(ends[1]);
     if (!status) status = check_packets(ends[0], ends[1]);
     if (!status) status = check_close(ends[0], ends[1]);
     if (!status) status = check_shutdown();
@@ -204,7 +274,7 @@ static long check(void) {
 __attribute__((noreturn)) void _start(void) {
     long status = check();
     if (!status) {
-        static const char message[] = "Linux ELF64 seqpacket probe\n";
+        static const char message[] = "Linux ELF64 socket probe\n";
         if (call(1, 1, (word)message, sizeof(message) - 1, 0, 0) != sizeof(message) - 1) status = 16;
     }
     call(60, status, 0, 0, 0, 0);

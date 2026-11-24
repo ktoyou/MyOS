@@ -47,6 +47,7 @@ long linux64_get_file(i32 fd, struct linux64_fd_view *view);
 long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg3);
 long linux64_sockopt(bool get, i32 fd, i32 level, i32 option, uptr value, uptr length);
 struct linux64_socket;
+long linux64_socket_create(i32 domain, u32 type, i32 protocol, struct linux64_socket **socket);
 long linux64_socket_pair(i32 domain, u32 type, i32 protocol, struct linux64_socket *ends[2]);
 void linux64_socket_close(struct linux64_socket *socket);
 long linux64_socket_shutdown(struct linux64_socket *socket, i32 how);
