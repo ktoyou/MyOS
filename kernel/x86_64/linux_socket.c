@@ -64,7 +64,7 @@ struct linux64_socket {
 };
 
 /* Один конец может оставаться открытым после закрытия его пары. */
-static struct linux64_socket pairs[LINUX64_TASK_COUNT * LINUX64_FD_COUNT][2];
+static struct linux64_socket pairs[LINUX64_PROCESS_COUNT * LINUX64_FD_COUNT][2];
 
 static struct linux64_socket *free_pair(void) {
     for (unsigned i = 0; i < sizeof(pairs) / sizeof(*pairs); ++i)

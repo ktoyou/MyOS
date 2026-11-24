@@ -7,6 +7,15 @@ static volatile unsigned timed_word;
 static volatile int parent_tid, result;
 static long pid, pipe_write, inherited_no_new_privs;
 
+enum { MAX_WORKERS = 63, MAX_CHILDREN = 15 };
+static char worker_stacks[MAX_WORKERS + 1][4096] __attribute__((aligned(16)));
+static struct worker_slot {
+    word index;
+    volatile unsigned clear_tid;
+    volatile int parent_tid;
+} workers[MAX_WORKERS + 1];
+static unsigned arrived, gate;
+
 extern long clone_thread(word stack_top, volatile int *ptid, volatile unsigned *ctid, const word *fs);
 
 /* Поток начинает выполнение на новом стеке, где нет адреса возврата в родителя. */
@@ -67,6 +76,19 @@ static __attribute__((noreturn)) void finish(word number, long status) {
 static int mode;
 
 __attribute__((noreturn)) void worker(void) {
+    if (mode == 4) {
+        word index;
+        __asm__ volatile("mov %%fs:0,%0" : "=r"(index));
+        if (index > MAX_WORKERS || simple(186, 0) != workers[index].parent_tid ||
+            simple(39, 0) != pid) finish(231, 24);
+        __atomic_add_fetch(&arrived, 1, __ATOMIC_RELEASE);
+        futex(&arrived, 0x81, 1, 0);
+        while (!__atomic_load_n(&gate, __ATOMIC_ACQUIRE)) {
+            long rc = futex(&gate, 0x80, 0, 0);
+            if (rc && rc != -11) finish(231, 24);
+        }
+        finish(60, 0);
+    }
     if (mode == 3) {
         const struct timespec delay = {0, 25000000};
         result = futex_timed(&timed_word, 0x80, 0, 0, &delay) == -110 ? 0 : 21;
@@ -97,6 +119,66 @@ __attribute__((noreturn)) void worker(void) {
         if (!woken) simple(24, 0);
     } while (!woken);
     finish(60, 0);
+}
+
+static int check_thread_capacity(unsigned count, int check_limit) {
+    mode = 4;
+    __atomic_store_n(&gate, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&arrived, 0, __ATOMIC_RELAXED);
+    for (unsigned i = 0; i < count + (unsigned)check_limit; ++i) {
+        struct worker_slot *slot = &workers[i];
+        *slot = (struct worker_slot){.index = i, .clear_tid = 1};
+        word top = (word)(worker_stacks[i] + sizeof(worker_stacks[i]));
+        long tid = clone_thread(top, &slot->parent_tid, &slot->clear_tid, &slot->index);
+        if (i == count) {
+            if (tid != -11 || slot->parent_tid) return 25;
+        } else if (tid <= 0 || tid != slot->parent_tid) return 25;
+    }
+    for (;;) {
+        unsigned seen = __atomic_load_n(&arrived, __ATOMIC_ACQUIRE);
+        if (seen >= count) {
+            if (seen != count) return 26;
+            break;
+        }
+        long rc = futex(&arrived, 0x80, seen, 0);
+        if (rc && rc != -11) return 26;
+    }
+    __atomic_store_n(&gate, 1, __ATOMIC_RELEASE);
+    if (futex(&gate, 0x81, 0x7fffffff, 0) < 0) return 26;
+    for (unsigned i = 0; i < count; ++i) {
+        while (workers[i].clear_tid) {
+            long rc = futex(&workers[i].clear_tid, 0x109, 1, -1);
+            if (rc && rc != -11) return 27;
+        }
+    }
+    mode = 0;
+    return 0;
+}
+
+static int check_process_capacity(unsigned count, int check_limit) {
+    int ends[2];
+    long children[MAX_CHILDREN];
+    if (simple(22, (word)ends)) return 28;
+    for (unsigned i = 0; i < count + (unsigned)check_limit; ++i) {
+        long child = simple(57, 0);
+        if (!child) {
+            char byte;
+            if (simple(3, ends[1]) || call(0, ends[0], (word)&byte, 1, 0, 0, 0)) finish(60, 1);
+            finish(60, 0);
+        }
+        if (i == count) {
+            if (child != -11) return 28;
+        } else {
+            if (child < 0) return 28;
+            children[i] = child;
+        }
+    }
+    if (simple(3, ends[0]) || simple(3, ends[1])) return 29;
+    for (unsigned i = 0; i < count; ++i) {
+        int status;
+        if (call(61, children[i], (word)&status, 0, 0, 0, 0) != children[i] || status) return 29;
+    }
+    return 0;
 }
 
 static int check_thread(void) {
@@ -210,6 +292,12 @@ void _start(void) {
     if (inherited) finish(231, inherited);
     for (int i = 1; i <= 2; ++i) {
         int status = check_process_exit(i);
+        if (status) finish(231, status);
+    }
+    int guest = system[0] == 'M';
+    for (unsigned wave = 0; wave < 2; ++wave) {
+        int status = check_thread_capacity(guest ? MAX_WORKERS : 12, guest);
+        if (!status) status = check_process_capacity(guest ? MAX_CHILDREN : 10, guest);
         if (status) finish(231, status);
     }
     static const char marker[] = "Linux ELF64 pthread probe\n";
