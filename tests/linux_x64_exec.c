@@ -2,6 +2,7 @@
 
 extern long clone_exec(word stack, unsigned empty_argv);
 __attribute__((noreturn)) void child_exec(unsigned empty_argv);
+__attribute__((noreturn)) void exec_shared(word argc);
 
 __asm__(
     ".text\n"
@@ -20,6 +21,11 @@ __asm__(
     "call child_exec\n"
     "ud2\n"
     "1: ret\n"
+    ".global exec_shared_entry\n"
+    "exec_shared_entry:\n"
+    "mov (%rsp),%rdi\n"
+    "call exec_shared\n"
+    "ud2\n"
 );
 
 static char huge[131073];
@@ -130,6 +136,50 @@ __attribute__((noreturn)) void _start(void) {
         if (sys(1, 1, (word)marker, sizeof(marker) - 1, 0, 0, 0) != sizeof(marker) - 1) status = 12;
     }
     finish(status);
+}
+
+__attribute__((noreturn)) void exec_shared(word argc) {
+    const word address = 0x50000000, tail = 52ul * 1024 * 1024;
+    volatile unsigned char *bytes = (void *)address;
+    if (bytes[0] != 0x29 || bytes[tail] != 0x63 || bytes[tail + 1]) finish(60);
+    if (argc == 2) {
+        if (sys(10, address, 4096, 7, 0, 0, 0) != -13 ||
+            sys(10, address, 4096, 0, 0, 0, 0) || sys(10, address, 4096, 1, 0, 0, 0) ||
+            bytes[0] != 0x29 || sys(10, address, 4096, 3, 0, 0, 0)) finish(61);
+        bytes[0] = 0x5a;
+        char byte;
+        if (sys(1, 4, address, 1, 0, 0, 0) != 1 || sys(3, 4, 0, 0, 0, 0, 0) ||
+            sys(0, 5, (word)&byte, 1, 0, 0, 0) || bytes[0] != 0x5a) finish(62);
+        finish(0);
+    }
+    int ready[2], release[2];
+    if (argc != 1 || sys(22, (word)ready, 0, 0, 0, 0, 0) ||
+        sys(22, (word)release, 0, 0, 0, 0, 0) || ready[0] != 3 || ready[1] != 4 ||
+        release[0] != 5 || release[1] != 6) finish(63);
+    long children[3];
+    for (unsigned i = 0; i < 3; ++i) {
+        long pid = sys(57, 0, 0, 0, 0, 0, 0);
+        if (pid < 0) finish(64);
+        if (!pid) {
+            if (sys(3, ready[0], 0, 0, 0, 0, 0) || sys(3, release[1], 0, 0, 0, 0, 0)) finish(64);
+            const char *args[] = {"/myos/test.elf", "child", 0};
+            sys(59, (word)args[0], (word)args, 0, 0, 0, 0);
+            finish(65);
+        }
+        children[i] = pid;
+    }
+    if (sys(3, ready[1], 0, 0, 0, 0, 0) || sys(3, release[0], 0, 0, 0, 0, 0)) finish(66);
+    for (unsigned i = 0; i < 3; ++i) {
+        unsigned char byte;
+        if (sys(0, ready[0], (word)&byte, 1, 0, 0, 0) != 1 || byte != 0x5a || bytes[0] != 0x29)
+            finish(67);
+    }
+    if (sys(3, release[1], 0, 0, 0, 0, 0)) finish(68);
+    for (unsigned i = 0; i < 3; ++i) {
+        int status;
+        if (sys(61, children[i], (word)&status, 0, 0, 0, 0) != children[i] || status) finish(69);
+    }
+    finish(0);
 }
 
 __attribute__((noreturn)) void exec_oom(void) {

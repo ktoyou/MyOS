@@ -43,6 +43,7 @@ struct elf_image {
     const struct elf_segment *segments;
     const char *interp;
     u64 bias, entry, phdr, first, end;
+    bool live_pages;
 };
 
 struct stack_arguments {
@@ -93,14 +94,15 @@ static const char *interp_path(const struct elf_header *e, const struct elf_segm
     return path;
 }
 
-static bool load_layout(struct elf_image *elf, const void *image, uptr size,
+static bool load_layout(struct elf_image *elf, const struct linux64_file *file,
                         bool interpreter, uptr stack_guard, u64 *mapped) {
-    const struct elf_header *e = image;
+    const struct elf_header *e = (const void *)file->bytes;
+    uptr size = file->size;
     if (!valid_header(e, size)) return false;
-    const struct elf_segment *segments = (const void *)((const u8 *)image + e->phoff);
+    const struct elf_segment *segments = (const void *)(file->bytes + e->phoff);
     u64 bias = e->type == ET_DYN ? (interpreter ? INTERP_BIAS : PROGRAM_BIAS) : 0;
     *elf = (struct elf_image){.header = e, .segments = segments, .bias = bias,
-                              .first = stack_guard};
+                              .first = stack_guard, .live_pages = file->live_pages};
     bool valid_entry = false;
     bool dynamic = false;
     const struct elf_segment *phdr = NULL;
@@ -158,18 +160,20 @@ static bool load_layout(struct elf_image *elf, const void *image, uptr size,
                       phdr->filesz == phdr_size && phdr->memsz == phdr_size));
 }
 
-static bool map_load(const u8 *image, const struct elf_segment *p, u64 bias) {
-    u64 address = bias + p->address;
+static bool map_load(const struct elf_image *elf, const struct elf_segment *p) {
+    u64 address = elf->bias + p->address;
     u64 file_end = address + p->filesz;
+    bool writable = (p->flags & PF_W) != 0, executable = (p->flags & PF_X) != 0;
     for (u64 page = floor_page(address); page < address + p->memsz; page += PMM_PAGE_SIZE) {
         u64 first = page > address ? page : address;
         u64 end = page + PMM_PAGE_SIZE;
         if (end > file_end) end = file_end;
         uptr count = end > first ? end - first : 0;
-        const u8 *source = count ? image + p->offset + (first - address) : NULL;
-        if (!paging64_user_load(page, source, first - page, count,
-                               (p->flags & PF_W) != 0, (p->flags & PF_X) != 0))
-            return false;
+        const u8 *source = count ? (const u8 *)elf->header + p->offset + (first - address) : NULL;
+        if (elf->live_pages && !writable && count == PMM_PAGE_SIZE &&
+            !((uptr)source & (PMM_PAGE_SIZE - 1))) {
+            if (!paging64_user_live_elf(page, source, executable)) return false;
+        } else if (!paging64_user_load(page, source, first - page, count, writable, executable)) return false;
     }
     return true;
 }
@@ -177,7 +181,7 @@ static bool map_load(const u8 *image, const struct elf_segment *p, u64 bias) {
 static bool map_image(const struct elf_image *elf) {
     for (unsigned i = 0; i < elf->header->phnum; ++i) {
         const struct elf_segment *p = &elf->segments[i];
-        if (p->type == PT_LOAD && p->memsz && !map_load((const u8 *)elf->header, p, elf->bias))
+        if (p->type == PT_LOAD && p->memsz && !map_load(elf, p))
             return false;
     }
     return true;
@@ -220,19 +224,19 @@ static uptr make_stack(const struct elf_image *main, u64 interp_bias, const u64 
     return stack;
 }
 
-static long prepare_image(const void *image, uptr size, const struct linux64_file_source *source,
+static long prepare_image(const struct linux64_file *file, const struct linux64_file_source *source,
                           const struct stack_arguments *args, uptr stack_size,
                           uptr *entry, uptr *stack, const struct linux64_userns *ns) {
     struct elf_image main, interpreter = {0};
     u64 mapped = 0;
     uptr bottom = LINUX64_STACK_TOP - stack_size, guard = LINUX64_STACK_FLOOR - PMM_PAGE_SIZE;
-    if (!load_layout(&main, image, size, false, guard, &mapped) ||
+    if (!load_layout(&main, file, false, guard, &mapped) ||
         !paging64_range_free(guard, LINUX64_STACK_TOP)) return -ENOEXEC;
     if (main.interp) {
         struct linux64_file interp;
         if (!source || !source->lookup || !source->lookup(source->context, main.interp, &interp))
             return -ENOENT;
-        if (!load_layout(&interpreter, interp.bytes, interp.size, true, guard, &mapped) ||
+        if (!load_layout(&interpreter, &interp, true, guard, &mapped) ||
             (main.first < interpreter.end && interpreter.first < main.end)) return -ELIBBAD;
     }
     u64 entropy[2];
@@ -307,7 +311,7 @@ long linux64_execve(struct linux64_frame *frame, uptr filename, uptr argv, uptr 
     if (!root) return -ENOMEM;
     paging64_switch_root(root);
     uptr entry, stack;
-    result = prepare_image(file.bytes, file.size, source, &args, EXEC_STACK_SIZE, &entry, &stack,
+    result = prepare_image(&file, source, &args, EXEC_STACK_SIZE, &entry, &stack,
                            linux64_current->process->userns);
     if (!result && linux64_commit_exec(frame, root, entry, stack, absolute, absolute_length)) return 0;
     paging64_switch_root(previous);
@@ -315,7 +319,7 @@ long linux64_execve(struct linux64_frame *frame, uptr filename, uptr argv, uptr 
     return result ? result : -ENOMEM;
 }
 
-bool linux64_run(const void *image, uptr size, const char *path, uptr path_length,
+bool linux64_run(const struct linux64_file *file, const char *path, uptr path_length,
                  const struct linux64_file_source *source) {
     if (!path || !path_length || path_length >= LINUX64_PATH_LIMIT || path[0] != '/' ||
         path[path_length]) return false;
@@ -325,7 +329,7 @@ bool linux64_run(const void *image, uptr size, const char *path, uptr path_lengt
         .offsets = &offset, .argc = 1, .count = 1,
     };
     uptr entry, stack;
-    if (prepare_image(image, size, source, &args, BOOT_STACK_SIZE, &entry, &stack, NULL) ||
+    if (prepare_image(file, source, &args, BOOT_STACK_SIZE, &entry, &stack, NULL) ||
         !linux64_enable_syscall()) return false;
     linux64_task_init();
     linux64_use_files(source, path, path_length);

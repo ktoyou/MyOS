@@ -85,6 +85,7 @@ struct linux_test_files {
     uptr count;
     const char *exec_path;
     struct linux64_file executable;
+    bool aligned;
 };
 
 struct linux_test_entry {
@@ -108,19 +109,26 @@ static bool test_path_equal(const char *path, const char *expected) {
     return *path == *expected;
 }
 
+static const u8 *test_payload(const u8 *start, const u8 *end, uptr size, bool aligned) {
+    uptr available = (uptr)(end - start);
+    uptr padding = aligned ? -(uptr)start & (PMM_PAGE_SIZE - 1) : 0;
+    if (padding > available || size > available - padding) return NULL;
+    return start + padding;
+}
+
 static bool linux_test_next(struct linux_test_files *files, const char **path,
                             struct linux64_file *file) {
     uptr remaining = (uptr)(files->end - files->cursor);
     if (remaining < sizeof(struct linux_test_entry)) return false;
     const struct linux_test_entry *entry = (const void *)files->cursor;
     remaining -= sizeof(*entry);
-    if (entry->path_size < 2 || entry->path_size > remaining ||
-        entry->file_size > remaining - entry->path_size) return false;
+    if (entry->path_size < 2 || entry->path_size > remaining) return false;
     *path = (const char *)(entry + 1);
     if (!valid_test_path(*path, entry->path_size)) return false;
-    *file = (struct linux64_file){
-        .bytes = (const u8 *)*path + entry->path_size, .size = entry->file_size,
-    };
+    const u8 *bytes = test_payload((const u8 *)*path + entry->path_size, files->end,
+                                   entry->file_size, files->aligned);
+    if (!bytes) return false;
+    *file = (struct linux64_file){.bytes = bytes, .size = entry->file_size, .live_pages = files->aligned};
     files->cursor = file->bytes + file->size;
     return true;
 }
@@ -166,16 +174,19 @@ static void linux_test_boot(uptr root_phys, uptr root_bytes) {
     /* Заголовок, путь запуска, основной ELF и записи дополнительных файлов. */
     if (!root_phys || root_bytes < 32) return;
     const u64 *header = pmm64_pointer(root_phys);
-    if (header[0] != 0x3536584c534f594dull || header[3] > root_bytes - 32 ||
-        header[1] > root_bytes - 32 - header[3] || header[2] > 1024)
+    bool aligned = header[0] == 0x3636584c534f594dull; /* MYOSLX66 */
+    if ((!aligned && header[0] != 0x3536584c534f594dull) || header[3] > root_bytes - 32 ||
+        header[2] > 1024)
         return;
     const char *path = (const void *)(header + 4);
     if (!valid_test_path(path, header[3])) return;
-    const u8 *image = (const u8 *)path + header[3];
+    const u8 *end = (const u8 *)header + root_bytes;
+    const u8 *image = test_payload((const u8 *)path + header[3], end, header[1], aligned);
+    if (!image) return;
     test_files = (struct linux_test_files){
-        .cursor = image + header[1], .end = (const u8 *)header + root_bytes,
+        .cursor = image + header[1], .end = end, .aligned = aligned,
         .count = header[2], .exec_path = path,
-        .executable = {.bytes = image, .size = header[1], .inode = 1},
+        .executable = {.bytes = image, .size = header[1], .inode = 1, .live_pages = aligned},
     };
     struct linux_test_files scan = test_files;
     for (uptr i = 0; i < scan.count; ++i) {
@@ -186,7 +197,7 @@ static void linux_test_boot(uptr root_phys, uptr root_bytes) {
     const struct linux64_file_source source = {
         .lookup = linux_test_lookup, .context = &test_files, .directory = linux_test_directory,
     };
-    linux64_run(image, header[1], path, header[3] - 1, &source);
+    linux64_run(&test_files.executable, path, header[3] - 1, &source);
 }
 #endif
 

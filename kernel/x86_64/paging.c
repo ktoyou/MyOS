@@ -7,6 +7,7 @@
 #define MMAP_PENDING  (1ull << 10)
 #define FILE_BACKED   (1ull << 11)
 /* Эти биты доступны ПО в листе x86-64 и не входят в физический адрес. */
+#define LIVE_ELF      (1ull << 55)
 #define ZERO_LAZY     (1ull << 56)
 #define MMAP_NO_WRITE (1ull << 57)
 #define MMAP_SHARED_FRAME (1ull << 58)
@@ -17,6 +18,7 @@
 #define EFER_NXE      (1u << 11)
 
 extern const u8 _start[], __text_end[], __rodata_end[], __kernel_end[];
+static uptr live_first, live_end;
 
 static bool nx_supported(void) {
     u32 eax = 0x80000000u, ebx, ecx, edx;
@@ -84,7 +86,8 @@ static bool map_ram(uptr root, const struct boot_info *boot) {
                 (fb_start < fb_end && page < fb_end && fb_start < page + PMM_PAGE_SIZE))
                 continue;
             /* Прямое отображение не должно давать запись в код и rodata. */
-            bool readonly = page >= (uptr)_start && page < (uptr)__rodata_end;
+            bool readonly = (page >= (uptr)_start && page < (uptr)__rodata_end) ||
+                            (page >= live_first && page < live_end);
             if (!map_page(root, X64_DIRECT_BASE + page, page,
                           NO_EXECUTE | (readonly ? 0 : WRITE))) return false;
         }
@@ -96,6 +99,11 @@ bool paging64_init(const struct boot_info *boot) {
     uptr previous;
     __asm__ volatile("mov %%cr3,%0" : "=r"(previous));
     if (!nx_supported()) return false;
+    if (boot->root_phys && boot->root_phys < BOOT_MEMORY_LIMIT &&
+        boot->root_bytes <= BOOT_MEMORY_LIMIT - boot->root_phys) {
+        live_first = boot->root_phys;
+        live_end = live_first + boot->root_bytes;
+    }
     uptr root = pmm64_alloc();
     if (!root ||
         !map_identity(root, (uptr)_start, (uptr)__text_end, 0) ||
@@ -217,7 +225,7 @@ bool paging64_zero_fault(uptr address, u64 error) {
 
 static void release_mapping(uptr root, u64 value) {
     uptr physical = value & ADDRESS_MASK;
-    if (!physical) return;
+    if (!physical || (value & LIVE_ELF)) return;
     if (!(value & MMAP_SHARED_FRAME) && !pmm64_has_aliases(physical))
         set_alias_write(root, physical, true);
     pmm64_free(physical);
@@ -229,9 +237,9 @@ static void copy_page(uptr target, uptr source) {
     for (unsigned i = 0; i < PMM_PAGE_SIZE / sizeof(*to); ++i) to[i] = from[i];
 }
 
-static bool private_alias(u64 entry) {
+static bool needs_private_copy(u64 entry) {
     return !(entry & MMAP_SHARED_FRAME) && (entry & ADDRESS_MASK) &&
-           pmm64_has_aliases(entry & ADDRESS_MASK);
+           ((entry & LIVE_ELF) || pmm64_has_aliases(entry & ADDRESS_MASK));
 }
 
 static void drop_lower_table(uptr root, uptr physical, unsigned level, unsigned entries) {
@@ -263,7 +271,7 @@ static bool clone_lower_table(uptr target, uptr source, unsigned level, unsigned
             if (!child) return false;
             to[i] = child | (entry & ~ADDRESS_MASK);
             if (!clone_lower_table(child, physical, level - 1, 512)) return false;
-        } else if ((entry & USER) && physical) {
+        } else if ((entry & USER) && physical && !(entry & LIVE_ELF)) {
             if ((entry & WRITE) && !(entry & MMAP_SHARED_FRAME)) {
                 uptr copy = pmm64_alloc();
                 if (!copy) return false;
@@ -429,7 +437,7 @@ enum paging64_protect_result paging64_protect(uptr start, uptr end, bool accessi
     if (writable) {
         for (uptr address = start; address < end; address = next) {
             const u64 *leaf = find_leaf_span(root, address, &next);
-            if (!leaf || !private_alias(*leaf)) continue;
+            if (!leaf || !needs_private_copy(*leaf)) continue;
             uptr physical = pmm64_alloc();
             if (!physical) goto fail_copies;
             *(uptr *)pmm64_pointer(physical) = copies;
@@ -453,23 +461,23 @@ enum paging64_protect_result paging64_protect(uptr start, uptr end, bool accessi
                     (accessible ? PRESENT : 0) | (writable ? WRITE : 0) |
                     (executable ? 0 : NO_EXECUTE);
         if (*leaf & MMAP_PENDING) value |= MMAP_OWNED;
-        if (writable && private_alias(*leaf)) {
+        if (writable && needs_private_copy(*leaf)) {
             u64 old = *leaf;
             uptr copy = copies;
             copies = *(uptr *)pmm64_pointer(copy);
             copy_page(copy, physical);
-            *leaf = (value & ~ADDRESS_MASK) | copy;
+            *leaf = (value & ~(ADDRESS_MASK | LIVE_ELF)) | copy;
             invalidate(address);
             release_mapping(root, old);
             continue;
         }
         if (value == *leaf) continue;
-        bool shared_frame = (*leaf & MMAP_SHARED_FRAME) != 0;
-        if (!shared_frame && !writable) set_alias_write(root, physical, false);
+        bool fixed_alias = (*leaf & (MMAP_SHARED_FRAME | LIVE_ELF)) != 0;
+        if (!fixed_alias && !writable) set_alias_write(root, physical, false);
         *leaf = value;
         invalidate(address);
         /* Старое исполняемое отображение уже недоступно через TLB. */
-        if (!shared_frame && writable) set_alias_write(root, physical, true);
+        if (!fixed_alias && writable) set_alias_write(root, physical, true);
     }
     return PAGING64_PROTECT_OK;
 
@@ -611,6 +619,23 @@ bool paging64_user_code(uptr address, const u8 *code, uptr length) {
 bool paging64_user_load(uptr address, const u8 *source, uptr offset, uptr length,
                         bool writable, bool executable) {
     return map_user_page(address, source, offset, length, writable, executable) != NULL;
+}
+
+bool paging64_user_live_elf(uptr address, const u8 *source, bool executable) {
+    uptr direct = (uptr)source;
+    if (address < 0x400000ul || address >= X64_USER_TOP || direct < X64_DIRECT_BASE ||
+        ((address | direct) & (PMM_PAGE_SIZE - 1))) return false;
+    uptr physical = direct - X64_DIRECT_BASE;
+    if (physical < live_first || physical >= live_end || live_end - physical < PMM_PAGE_SIZE)
+        return false;
+    uptr root = paging64_active_root();
+    const u64 *alias = find_leaf(root, direct);
+    if (!alias || (*alias & (ADDRESS_MASK | PRESENT | WRITE | USER | NO_EXECUTE)) !=
+                  (physical | PRESENT | NO_EXECUTE)) return false;
+    if (!map_page(root, address, physical, USER | FILE_BACKED | LIVE_ELF |
+                  (executable ? 0 : NO_EXECUTE))) return false;
+    invalidate(address);
+    return true;
 }
 
 static u8 *user_pointer(uptr address, u64 required) {
