@@ -82,8 +82,9 @@ Boot-info v4 содержит адрес карты памяти, RSDP и выд
 
 В Ubuntu/WSL кроме обычных зависимостей нужны `gnu-efi` и `python3-pil`.
 Для тестов также нужны `ovmf`, `qemu-system-x86`, `dosfstools`, `mtools`.
-Сборка EFI использует x86-64 GCC, GNU ld и objcopy; ядро по-прежнему собирается
-как i386. EFI-приложение получается в `build/uefi/BOOTX64.EFI`.
+Для EFI-приложения и цели `kernel-x64` нужны GCC с поддержкой x86-64,
+GNU ld и objcopy. EFI-приложение получается в `build/uefi/BOOTX64.EFI`.
+Штатное ядро MyOS по этим целям загрузочных образов собирается для i386.
 
 - `make uefi-loader` — только EFI-приложение.
 - `make uefi-x64-smoke` — переход после `ExitBootServices` в тестовый код
