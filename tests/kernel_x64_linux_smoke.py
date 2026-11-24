@@ -153,7 +153,7 @@ def check_socket(build):
     assert (host.returncode, host.stdout, host.stderr) == (0, (marker + '\n').encode(), b''), host
     serial = check_guest('socket', probe.read_bytes(), 'Linux x86-64 exit status=0x00')
     assert marker in serial, serial
-    print('OVMF: AF_UNIX seqpacket, SO_PASSCRED and descriptor cleanup: PASS', flush=True)
+    print('OVMF: AF_UNIX seqpacket, SO_PASSCRED, shutdown and descriptor cleanup: PASS', flush=True)
 
 
 def check_fork(build):

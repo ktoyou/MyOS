@@ -25,6 +25,7 @@ enum {
     AF_UNIX = 1, SOCK_SEQPACKET = 5, SOCK_NONBLOCK = 0x800, SOCK_CLOEXEC = 0x80000,
     SOL_SOCKET = 1, SO_TYPE = 3, SO_PASSCRED = 16,
     MSG_PEEK = 2, MSG_CTRUNC = 8, MSG_TRUNC = 0x20, MSG_NOSIGNAL = 0x4000,
+    SHUT_RD = 0, SHUT_WR = 1, SHUT_RDWR = 2,
 };
 
 static long call(word number, word a0, word a1, word a2, word a3, word a4) {
@@ -50,6 +51,10 @@ static long option(int fd, int key, int *value, unsigned *length) {
 
 static long close_fd(int fd) {
     return call(3, fd, 0, 0, 0, 0);
+}
+
+static long shutdown(int fd, int how) {
+    return call(48, fd, how, 0, 0, 0);
 }
 
 static long send(int fd, const struct msghdr *msg) {
@@ -121,9 +126,43 @@ static long check_close(int left, int right) {
     struct iovec tx = {&byte, 1}, rx = {&received, 1};
     struct msghdr out = {.iov = &tx, .iov_count = 1}, in = {.iov = &rx, .iov_count = 1};
     if (send(left, &out) != 1 || send(right, &out) != 1 || close_fd(right) ||
+        shutdown(left, SHUT_RDWR) ||
         receive(left, &in, 0) != -104 || receive(left, &in, 0) != 1 || received != 'q' ||
         receive(left, &in, 0) != 0 || send(left, &out) != -32 || close_fd(left)) return 8;
     return 0;
+}
+
+static long check_shutdown(void) {
+    char byte = 's', received = 0;
+    struct credentials cred;
+    struct iovec tx = {&byte, 1}, rx = {&received, 1};
+    struct msghdr out = {.iov = &tx, .iov_count = 1};
+    struct msghdr in = {.iov = &rx, .iov_count = 1, .control = &cred};
+    const int enabled = 1;
+    if (shutdown(-1, 3) != -9 || shutdown(1, 3) != -88) return 22;
+    for (int how = SHUT_RD; how <= SHUT_WR; ++how) {
+        int ends[2];
+        if (pair(ends) || shutdown(ends[0], -1) != -22 || shutdown(ends[1], 3) != -22 ||
+            passcred(ends[1], &enabled, sizeof(enabled)) || send(ends[0], &out) != 1) return 23;
+        int initiator = how == SHUT_RD ? ends[1] : ends[0];
+        if (shutdown(initiator, how) || shutdown(initiator, how) ||
+            send(ends[0], &out) != -32) return 24;
+        in.control_length = sizeof(cred);
+        if (receive(ends[1], &in, MSG_PEEK) != 1 || received != 's' ||
+            in.control_length != sizeof(cred) || cred.pid != call(39, 0, 0, 0, 0, 0) ||
+            call(0, ends[1], (word)&received, 1, 0, 0) != 1) return 25;
+        in.control_length = sizeof(cred);
+        if (receive(ends[1], &in, 0) || in.control_length ||
+            send(ends[1], &out) != 1 || call(0, ends[0], (word)&received, 1, 0, 0) != 1 ||
+            close_fd(ends[0]) || close_fd(ends[1])) return 26;
+    }
+    int ends[2];
+    if (pair(ends) || send(ends[0], &out) != 1 || send(ends[1], &out) != 1 ||
+        shutdown(ends[0], SHUT_RDWR) || call(72, ends[0], 1, 0, 0, 0) != 1) return 27;
+    for (unsigned i = 0; i < 2; ++i)
+        if (send(ends[i], &out) != -32 || call(0, ends[i], (word)&received, 1, 0, 0) != 1 ||
+            call(0, ends[i], (word)&received, 1, 0, 0)) return 28;
+    return close_fd(ends[0]) || close_fd(ends[1]) ? 29 : 0;
 }
 
 static long check_fd_limit(void) {
@@ -158,6 +197,7 @@ static long check(void) {
     long status = check_options(ends[1]);
     if (!status) status = check_packets(ends[0], ends[1]);
     if (!status) status = check_close(ends[0], ends[1]);
+    if (!status) status = check_shutdown();
     return status ? status : check_fd_limit();
 }
 
