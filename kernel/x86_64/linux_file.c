@@ -22,7 +22,7 @@ enum {
 
 enum file_kind {
     FILE_REGULAR, FILE_SOCKET, FILE_PIPE, FILE_PROC_DIR, FILE_PROC_MAP, FILE_NULL, FILE_SERIAL,
-    FILE_NAMESPACE, FILE_NS_LINK, FILE_DIRECTORY,
+    FILE_NAMESPACE, FILE_PROC_LINK, FILE_DIRECTORY,
 };
 static const struct linux64_file null_file = {.inode = 1};
 
@@ -345,6 +345,7 @@ static enum linux64_proc_node proc_path(const char *path) {
     if (path_equal(path, "self/gid_map", false)) return USERNS_GID_MAP;
     if (path_equal(path, "self/setgroups", false)) return USERNS_SETGROUPS;
     if (path_equal(path, "self/ns/user", false)) return PROC_USER_NS;
+    if (path_equal(path, "self/exe", false)) return PROC_EXE;
     return USERNS_NONE;
 }
 
@@ -354,6 +355,10 @@ bool linux64_special_node(const char *path, struct linux64_file *file) {
         return true;
     }
     enum linux64_proc_node proc = proc_path(path);
+    if (proc == PROC_EXE) {
+        const char *exe = linux64_current->process->executable_path;
+        return files.lookup && files.lookup(files.context, exe, file);
+    }
     if (proc) {
         *file = (struct linux64_file){
             .mode = proc >= PROC_ROOT ? LINUX64_S_IFDIR | 0555 : 0, .inode = proc,
@@ -365,10 +370,6 @@ bool linux64_special_node(const char *path, struct linux64_file *file) {
         if (!path_equal(path, dirs[i], false)) continue;
         *file = (struct linux64_file){.mode = LINUX64_S_IFDIR | 0555, .inode = (1ull << 31) + i};
         return true;
-    }
-    if (path_equal(path, "/proc/self/exe", false)) {
-        const char *exe = linux64_current->process->executable_path;
-        return files.lookup && files.lookup(files.context, exe, file);
     }
     i32 fd;
     if (memfd_proc_path(path, &fd) <= 0) return false;
@@ -602,13 +603,20 @@ static long lookup(i32 dirfd, uptr address, u32 flags, struct linux64_file *file
         return 0;
     }
     enum linux64_proc_node proc = proc_path(absolute);
+    if ((proc == PROC_USER_NS || proc == PROC_EXE) && (flags & AT_SYMLINK_NOFOLLOW)) {
+        u64 pid = (u32)linux64_current->process->pid;
+        *file = (struct linux64_file){.inode = 2 * pid + (proc == PROC_EXE)};
+        *kind = FILE_PROC_LINK;
+        return 0;
+    }
     if (proc == PROC_USER_NS) {
         const struct linux64_process *process = linux64_current->process;
-        bool nofollow = (flags & AT_SYMLINK_NOFOLLOW) != 0;
-        *file = (struct linux64_file){
-            .inode = nofollow ? (u32)process->pid : linux64_userns_inode(process->userns),
-        };
-        *kind = nofollow ? FILE_NS_LINK : FILE_NAMESPACE;
+        *file = (struct linux64_file){.inode = linux64_userns_inode(process->userns)};
+        *kind = FILE_NAMESPACE;
+        return 0;
+    }
+    if (proc == PROC_EXE) {
+        *kind = FILE_REGULAR;
         return 0;
     }
     if (proc) {
@@ -640,7 +648,7 @@ static long linux_readlink(i32 dirfd, uptr path_address, uptr destination, i32 s
     enum linux64_proc_node proc = proc_path(absolute);
     if (proc == PROC_USER_NS)
         return linux64_userns_readlink(linux64_current->process->userns, destination, (uptr)size);
-    if (!path_equal(absolute, "/proc/self/exe", false)) return -EINVAL;
+    if (proc != PROC_EXE) return -EINVAL;
     uptr length = linux64_current->process->executable_path_length;
     if (!length) return -ENOENT;
     if (length > (uptr)size) length = (uptr)size;
@@ -675,6 +683,7 @@ static long linux_open(i32 dirfd, uptr address, u32 flags) {
         return result;
     }
     enum linux64_proc_node proc = proc_path(absolute);
+    if (proc == PROC_EXE && (flags & O_NOFOLLOW)) return -ELOOP;
     if (proc == PROC_USER_NS) {
         if (flags & O_DIRECTORY) return -ENOTDIR;
         if (flags & O_NOFOLLOW) return -ELOOP;
@@ -690,7 +699,7 @@ static long linux_open(i32 dirfd, uptr address, u32 flags) {
         linux64_userns_retain(ns);
         return result;
     }
-    if (proc) {
+    if (proc && proc != PROC_EXE) {
         if (flags & ~(O_ACCMODE | O_DIRECTORY | O_CLOEXEC | O_LARGEFILE | O_NONBLOCK |
                       O_NOFOLLOW | O_TRUNC)) return -EINVAL;
         bool directory = proc >= PROC_ROOT;
@@ -856,7 +865,7 @@ static long file_stat(const struct linux64_file *file, const struct memfd *memfd
         rdev = 0x501;
     } else if (kind == FILE_NAMESPACE) {
         device = 7;
-    } else if (kind == FILE_NS_LINK) {
+    } else if (kind == FILE_PROC_LINK) {
         mode = 0120777;
         device = 8;
     } else if (kind == FILE_DIRECTORY) {
@@ -869,7 +878,7 @@ static long file_stat(const struct linux64_file *file, const struct memfd *memfd
     }
     const struct linux64_userns *ns = linux64_current->process->userns;
     bool owned = kind == FILE_SOCKET || kind == FILE_PIPE || kind == FILE_PROC_MAP ||
-                 kind == FILE_NS_LINK || memfd;
+                 kind == FILE_PROC_LINK || memfd;
     const struct linux_stat stat = {
         .dev = device, .ino = file->inode, .nlink = links, .mode = mode,
         .uid = linux64_visible_id(ns, false, kind == FILE_DIRECTORY ? file->uid : owned ? LINUX64_UID : 0),

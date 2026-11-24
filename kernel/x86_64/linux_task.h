@@ -39,7 +39,7 @@ struct linux64_userns;
 
 enum linux64_proc_node {
     USERNS_NONE, USERNS_UID_MAP, USERNS_GID_MAP, USERNS_SETGROUPS,
-    PROC_USER_NS, PROC_ROOT, PROC_TASKS,
+    PROC_USER_NS, PROC_EXE, PROC_ROOT, PROC_TASKS,
 };
 
 struct linux64_caps {

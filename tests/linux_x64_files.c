@@ -253,6 +253,9 @@ static long check_directories(void) {
     if (call(4, (word)"/proc", (word)info, 0, 0) ||
         call(4, (word)"/proc/.", (word)opened, 0, 0) || info[0] != opened[0] || info[1] != opened[1])
         return 56;
+    if (call(6, (word)"/proc/self/./exe", (word)opened, 0, 0) ||
+        (opened[3] & 0170000) != 0120000 ||
+        call(2, (word)"/proc/self/exe", 0x20000, 0, 0) != -40) return 58;
     long root_fd = call(2, (word)"/", 0x10000, 0, 0);
     long null = call(257, root_fd, (word)"./dev//null", 0, 0);
     if (root_fd < 0 || null < 0 || call(0, null, 0, 1, 0) ||
