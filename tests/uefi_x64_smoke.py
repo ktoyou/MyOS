@@ -5,16 +5,17 @@ import sys
 import tempfile
 
 from disk_install_smoke import VM, run, uefi_firmware
+from hardware_smoke import clean
 
 sys.path.insert(0, str(pathlib.Path('tools').resolve()))
 from make_uefi import ESP_START, ESP_SECTORS, ROOT_START, esp
 
 
-def test_disk(image, payload):
+def test_disk(image, payload, kernel_end):
     disk_id = 0x23456789
     root_sectors = 131072
-    efi, _ = esp(payload, 0x100000 + len(payload) + 256,
-                 disk_id=disk_id, root_sectors=root_sectors, arch='x86_64')
+    efi, _ = esp(payload, kernel_end, disk_id=disk_id,
+                 root_sectors=root_sectors, arch='x86_64')
     mbr = bytearray(512)
     struct.pack_into('<I', mbr, 440, disk_id)
     struct.pack_into('<B3xB3xII', mbr, 446, 0, 0x83, ROOT_START, root_sectors)
@@ -27,24 +28,32 @@ def test_disk(image, payload):
         disk.truncate(512 * (ROOT_START + root_sectors))
 
 
+def boot_x64(directory, name, payload, kernel_end, markers):
+    image = directory / 'disk.img'
+    test_disk(image, payload, kernel_end)
+    args = uefi_firmware(directory, name) + [
+        '-drive', f'if=none,id=root,format=raw,file={image}',
+        '-device', 'nvme,drive=root,serial=UEFIX64,bootindex=1',
+    ]
+    vm = VM(name, args, binary='qemu-system-x86_64')
+    vm.boot_timeout = 45
+    try:
+        vm.wait('UEFI: leaving boot services, entering x86-64 kernel')
+        for marker in markers:
+            vm.wait(marker)
+        return clean(vm.log)
+    finally:
+        vm.stop()
+
+
 def main():
     with tempfile.TemporaryDirectory(prefix='myos-uefi-x64-') as temp:
         directory = pathlib.Path(temp)
-        payload = directory / 'kernel.bin'
-        run('nasm', '-f', 'bin', 'tests/uefi_x64_handoff.asm', '-o', payload)
-        image = directory / 'disk.img'
-        test_disk(image, payload.read_bytes())
-        args = uefi_firmware(directory, 'x64-handoff') + [
-            '-drive', f'if=none,id=root,format=raw,file={image}',
-            '-device', 'nvme,drive=root,serial=UEFIX64,bootindex=1',
-        ]
-        vm = VM('uefi-x64-handoff', args, binary='qemu-system-x86_64')
-        vm.boot_timeout = 45
-        try:
-            vm.wait('UEFI: leaving boot services, entering x86-64 kernel')
-            vm.wait('UEFI X64 HANDOFF PASS')
-        finally:
-            vm.stop()
+        binary = directory / 'kernel.bin'
+        run('nasm', '-f', 'bin', 'tests/uefi_x64_handoff.asm', '-o', binary)
+        payload = binary.read_bytes()
+        boot_x64(directory, 'uefi-x64-handoff', payload, 0x100000 + len(payload) + 256,
+                 ['UEFI X64 HANDOFF PASS'])
     print('OVMF x86-64 handoff, private paging and boot info: PASS')
 
 
