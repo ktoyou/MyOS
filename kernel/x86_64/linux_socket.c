@@ -9,7 +9,8 @@ enum {
     AF_UNIX = 1, SOCK_STREAM = 1, SOCK_SEQPACKET = 5, SOCK_MAX = 11, SOCK_TYPE_MASK = 0xf,
     SOCK_NONBLOCK = 0x800, SOCK_CLOEXEC = 0x80000,
     SHUT_RD = 0, SHUT_WR = 1, SHUT_RDWR = 2,
-    SOL_SOCKET = 1, SO_TYPE = 3, SO_PASSCRED = 16, SCM_RIGHTS = 1, SCM_CREDENTIALS = 2,
+    SOL_SOCKET = 1, SO_TYPE = 3, SO_PASSCRED = 16, SO_PEERCRED = 17,
+    SCM_RIGHTS = 1, SCM_CREDENTIALS = 2,
     MSG_OOB = 1, MSG_PEEK = 2, MSG_CTRUNC = 8, MSG_TRUNC = 0x20, MSG_DONTWAIT = 0x40,
     MSG_EOR = 0x80, MSG_NOSIGNAL = 0x4000, MSG_CMSG_CLOEXEC = 0x40000000,
     MAX_IOV = 64, MAX_QUEUED = 32, MAX_BACKLOG = 31, SCM_MAX_FD = 253,
@@ -67,10 +68,16 @@ struct packet {
 
 #define MAX_PACKET (PMM_PAGE_SIZE - sizeof(struct packet))
 
+struct peer_snapshot {
+    struct linux64_pid *pid;
+    u32 uid, gid;
+};
+
 struct linux64_socket {
     struct linux64_socket *peer;
     struct linux64_socket *accept_head, *accept_tail, *accept_next;
     struct packet *head, *tail;
+    struct peer_snapshot peer_credentials;
     u64 inode;
     unsigned queued, head_offset, backlog, pending;
     u8 type;
@@ -82,6 +89,16 @@ struct linux64_socket {
 static struct linux64_socket pairs[LINUX64_OPEN_FILE_COUNT][2];
 static struct linux64_socket *scm_mark_queue[sizeof(pairs) / sizeof(pairs[0][0])];
 static unsigned scm_mark_count;
+
+static struct peer_snapshot current_credentials(void) {
+    return (struct peer_snapshot){linux64_current->process->pid_identity, LINUX64_UID, LINUX64_GID};
+}
+
+static void store_credentials(struct linux64_socket *socket, struct peer_snapshot snapshot) {
+    linux64_pid_retain(snapshot.pid);
+    linux64_pid_release(socket->peer_credentials.pid);
+    socket->peer_credentials = snapshot;
+}
 
 static struct linux64_socket *free_pair(void) {
     for (unsigned i = 0; i < sizeof(pairs) / sizeof(*pairs); ++i)
@@ -111,6 +128,9 @@ long linux64_socket_pair(i32 domain, u32 type, i32 protocol, struct linux64_sock
     if (!pair) return -ENFILE;
     pair[0] = (struct linux64_socket){.peer = &pair[1], .type = type, .open = true};
     pair[1] = (struct linux64_socket){.peer = &pair[0], .type = type, .open = true};
+    struct peer_snapshot creator = current_credentials();
+    store_credentials(&pair[0], creator);
+    store_credentials(&pair[1], creator);
     ends[0] = &pair[0];
     ends[1] = &pair[1];
     return 0;
@@ -133,6 +153,7 @@ long linux64_socket_listen(struct linux64_socket *socket, u32 backlog) {
     if (!linux64_socket_is_stream(socket) || !socket->inode || socket->peer) return -EINVAL;
     socket->backlog = backlog > MAX_BACKLOG ? MAX_BACKLOG : backlog;
     socket->listening = true;
+    store_credentials(socket, current_credentials());
     return 0;
 }
 
@@ -160,6 +181,9 @@ long linux64_socket_connect(struct linux64_socket *socket, u64 inode) {
     struct linux64_socket *accepted = socket + 1;
     *accepted = (struct linux64_socket){.peer = socket, .type = SOCK_STREAM, .open = true,
                                        .passcred = listener->passcred};
+    /* accept может выполняться другой задачей, поэтому снимки берём здесь. */
+    store_credentials(socket, listener->peer_credentials);
+    store_credentials(accepted, current_credentials());
     for (unsigned i = 0; (accepted->name[i] = listener->name[i]); ++i) {}
     socket->peer = accepted;
     if (listener->accept_tail) listener->accept_tail->accept_next = accepted;
@@ -305,6 +329,7 @@ static void drop_packet(struct linux64_socket *socket) {
 
 static void close_endpoint(struct linux64_socket *socket) {
     socket->open = false;
+    store_credentials(socket, (struct peer_snapshot){0});
     const struct packet *unread = socket->head;
     if (unread && !unread->length) unread = unread->next;
     if (unread && socket->peer && socket->peer->open) socket->peer->reset = true;
@@ -359,7 +384,7 @@ u16 linux64_socket_poll(const struct linux64_socket *socket) {
 
 long linux64_socket_option(struct linux64_socket *socket, bool get, i32 level, i32 option,
                            uptr value, uptr length) {
-    if (level != SOL_SOCKET || (option != SO_PASSCRED && !(get && option == SO_TYPE)))
+    if (level != SOL_SOCKET || (option != SO_PASSCRED && !(get && (option == SO_TYPE || option == SO_PEERCRED))))
         return -ENOPROTOOPT;
     if (!get) {
         i32 enabled;
@@ -373,8 +398,22 @@ long linux64_socket_option(struct linux64_socket *socket, bool get, i32 level, i
     if (paging64_copy_from_user(&count, length, sizeof(count)) != sizeof(count)) return -EFAULT;
     if (count < 0) return -EINVAL;
     i32 result = option == SO_TYPE ? socket->type : socket->passcred;
-    if (count > (i32)sizeof(result)) count = sizeof(result);
-    if (paging64_copy_to_user(value, &result, (uptr)count) != (uptr)count ||
+    struct identity credentials = {.uid = (u32)-1, .gid = (u32)-1};
+    const void *data = &result;
+    i32 size = sizeof(result);
+    if (option == SO_PEERCRED) {
+        const struct peer_snapshot *peer = &socket->peer_credentials;
+        const struct linux64_process *process = linux64_current->process;
+        if (peer->pid) {
+            credentials.pid = linux64_pid_number(peer->pid, process->pid_ns);
+            credentials.uid = linux64_visible_id(process->userns, false, peer->uid);
+            credentials.gid = linux64_visible_id(process->userns, true, peer->gid);
+        }
+        data = &credentials;
+        size = sizeof(credentials);
+    }
+    if (count > size) count = size;
+    if (paging64_copy_to_user(value, data, (uptr)count) != (uptr)count ||
         paging64_copy_to_user(length, &count, sizeof(count)) != sizeof(count)) return -EFAULT;
     return 0;
 }

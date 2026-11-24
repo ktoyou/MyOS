@@ -27,11 +27,16 @@ __asm__(
     "1: ret\n"
 );
 
-static long call(word number, word a0, word a1, word a2, word a3) {
+static long call5(word number, word a0, word a1, word a2, word a3, word a4) {
     register word fourth __asm__("r10") = a3;
+    register word fifth __asm__("r8") = a4;
     __asm__ volatile("syscall" : "+a"(number)
-                     : "D"(a0), "S"(a1), "d"(a2), "r"(fourth) : "rcx", "r11", "memory");
+                     : "D"(a0), "S"(a1), "d"(a2), "r"(fourth), "r"(fifth) : "rcx", "r11", "memory");
     return (long)number;
+}
+
+static long call(word number, word a0, word a1, word a2, word a3) {
+    return call5(number, a0, a1, a2, a3, 0);
 }
 
 __attribute__((noreturn)) static void finish(int status) {
@@ -170,6 +175,11 @@ __attribute__((noreturn)) static void check_inner(word initial, int socket, int 
     word inode = namespace_inode();
     if (inode == initial || call(5, inherited, (word)stat, 0, 0) || stat[1] != initial ||
         receive(socket, &payload, 0) != 0 || payload != initial) finish(14);
+    struct { int pid; unsigned uid, gid; } peer;
+    unsigned length = sizeof(peer);
+    if (call5(55, socket, 1, 17, (word)&peer, (word)&length) || length != sizeof(peer) ||
+        peer.pid || peer.uid != (unsigned)call(107, 0, 0, 0, 0) ||
+        peer.gid != (unsigned)call(108, 0, 0, 0, 0)) finish(28);
     check_local_credentials();
     check_adoption();
     if (call(112, 0, 0, 0, 0) != 1 || call(111, 0, 0, 0, 0) != 1) finish(15);
