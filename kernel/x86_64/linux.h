@@ -19,6 +19,7 @@ void linux64_use_files(const struct linux64_file_source *source);
 const struct linux64_file *linux64_get_file(i32 fd);
 long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg3);
 long linux64_mmap(uptr address, uptr length, u32 protection, u32 flags, i32 fd, uptr offset);
+long linux64_mprotect(uptr address, uptr length, uptr protection);
 bool linux64_enable_syscall(void);
 void kernel64_serial_char(char ch);
 

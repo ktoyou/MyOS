@@ -17,6 +17,18 @@ static bool in_arena(uptr address, uptr size) {
     return address >= MAP_START && address < MAP_END && size <= MAP_END - address;
 }
 
+long linux64_mprotect(uptr address, uptr length, uptr protection) {
+    if (address & PAGE_MASK) return -EINVAL;
+    if (!length) return 0;
+    if (address >= X64_USER_TOP || length > X64_USER_TOP - address) return -ENOMEM;
+    if (protection & ~(uptr)(PROT_READ | PROT_WRITE | PROT_EXEC)) return -EINVAL;
+    bool writable = (protection & PROT_WRITE) != 0;
+    bool executable = (protection & PROT_EXEC) != 0;
+    if (writable && executable) return -EACCES;
+    uptr end = address + ((length + PAGE_MASK) & ~PAGE_MASK);
+    return paging64_protect(address, end, protection != 0, writable, executable) ? 0 : -ENOMEM;
+}
+
 long linux64_mmap(uptr address, uptr length, u32 protection, u32 flags, i32 fd, uptr offset) {
     if (!length || (offset & PAGE_MASK) || (long)offset < 0 ||
         (protection & ~(PROT_READ | PROT_WRITE | PROT_EXEC)) ||
