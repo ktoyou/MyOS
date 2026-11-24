@@ -1630,13 +1630,13 @@ $(X64_RING3_TESTS:.bin=.elf): $(X64BUILD)/kernel-ring3-%.elf: $(X64_CORE) $(X64B
 	$(LD) -m elf_x86_64 -T kernel/x86_64/linker.ld -nostdlib $(filter %.o,$^) -o $@
 $(X64BUILD)/early-linux.o: kernel/x86_64/early.c kernel/x86_64/linux.h $(X64_HEADERS) | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -DX64_TEST_LINUX -c $< -o $@
-$(X64BUILD)/linux_elf.o $(X64BUILD)/linux_syscall.o $(X64BUILD)/linux_file.o $(X64BUILD)/linux_mmap.o $(X64BUILD)/linux_random.o $(X64BUILD)/linux_time.o $(X64BUILD)/linux_signal.o $(X64BUILD)/linux_socket.o $(X64BUILD)/linux_pipe.o $(X64BUILD)/linux_userns.o $(X64BUILD)/linux_vfs.o $(X64BUILD)/linux_task.o: $(X64BUILD)/%.o: kernel/x86_64/%.c kernel/x86_64/linux.h kernel/x86_64/linux_task.h $(X64_HEADERS) | $(X64BUILD)
+$(X64BUILD)/linux_elf.o $(X64BUILD)/linux_syscall.o $(X64BUILD)/linux_file.o $(X64BUILD)/linux_mmap.o $(X64BUILD)/linux_random.o $(X64BUILD)/linux_time.o $(X64BUILD)/linux_signal.o $(X64BUILD)/linux_socket.o $(X64BUILD)/linux_pipe.o $(X64BUILD)/linux_userns.o $(X64BUILD)/linux_pidns.o $(X64BUILD)/linux_vfs.o $(X64BUILD)/linux_task.o: $(X64BUILD)/%.o: kernel/x86_64/%.c kernel/x86_64/linux.h kernel/x86_64/linux_task.h $(X64_HEADERS) | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
 $(X64BUILD)/linux_syscall.o: X64CFLAGS += -I$(BUILD)
 $(X64BUILD)/linux_syscall.o: $(BUILD)/build_info.h
 $(X64BUILD)/linux-entry.o: kernel/x86_64/linux_syscall.asm | $(X64BUILD)
 	$(NASM) -f elf64 $< -o $@
-$(X64BUILD)/kernel-linux.elf: $(X64_CORE) $(X64BUILD)/early-linux.o $(X64BUILD)/linux_elf.o $(X64BUILD)/linux_syscall.o $(X64BUILD)/linux_file.o $(X64BUILD)/linux_mmap.o $(X64BUILD)/linux_random.o $(X64BUILD)/linux_time.o $(X64BUILD)/linux_signal.o $(X64BUILD)/linux_socket.o $(X64BUILD)/linux_pipe.o $(X64BUILD)/linux_userns.o $(X64BUILD)/linux_vfs.o $(X64BUILD)/linux_task.o $(X64BUILD)/linux-entry.o kernel/x86_64/linker.ld
+$(X64BUILD)/kernel-linux.elf: $(X64_CORE) $(X64BUILD)/early-linux.o $(X64BUILD)/linux_elf.o $(X64BUILD)/linux_syscall.o $(X64BUILD)/linux_file.o $(X64BUILD)/linux_mmap.o $(X64BUILD)/linux_random.o $(X64BUILD)/linux_time.o $(X64BUILD)/linux_signal.o $(X64BUILD)/linux_socket.o $(X64BUILD)/linux_pipe.o $(X64BUILD)/linux_userns.o $(X64BUILD)/linux_pidns.o $(X64BUILD)/linux_vfs.o $(X64BUILD)/linux_task.o $(X64BUILD)/linux-entry.o kernel/x86_64/linker.ld
 	$(LD) -m elf_x86_64 -T kernel/x86_64/linker.ld -nostdlib $(filter %.o,$^) -o $@
 $(X64BUILD)/linux-probe.o: tests/linux_x64_probe.S | $(X64BUILD)
 	$(CC) -m64 -c $< -o $@
@@ -1682,6 +1682,10 @@ $(X64BUILD)/linux-userns.o: tests/linux_x64_userns.c | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
 $(X64BUILD)/linux-userns.elf: $(X64BUILD)/linux-userns.o
 	$(LD) -m elf_x86_64 -static -no-pie $< -o $@
+$(X64BUILD)/linux-pidns.o: tests/linux_x64_pidns.c | $(X64BUILD)
+	$(CC) $(X64CFLAGS) -c $< -o $@
+$(X64BUILD)/linux-pidns.elf: $(X64BUILD)/linux-pidns.o
+	$(LD) -m elf_x86_64 -static -no-pie $< -o $@
 $(X64BUILD)/linux-vfork.o: tests/linux_x64_vfork.c | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
 $(X64BUILD)/linux-vfork.elf: $(X64BUILD)/linux-vfork.o
@@ -1708,7 +1712,7 @@ kernel-x64-paging-smoke: $(X64_PAGING_TESTS)
 kernel-x64-ring3-smoke: $(X64_RING3_TESTS)
 	python3 tests/kernel_x64_smoke.py --ring3
 .PHONY: kernel-x64-linux-smoke
-kernel-x64-linux-smoke: $(X64BUILD)/kernel-linux.bin $(X64BUILD)/linux-probe.elf $(X64BUILD)/linux-bad-stack.elf $(X64BUILD)/linux-pie.elf $(X64BUILD)/linux-files.elf $(X64BUILD)/linux-mmap.elf $(X64BUILD)/linux-socket.elf $(X64BUILD)/linux-pipe.elf $(X64BUILD)/linux-poll.elf $(X64BUILD)/linux-fork.elf $(X64BUILD)/linux-pthread.elf $(X64BUILD)/linux-userns.elf $(X64BUILD)/linux-vfork.elf $(X64BUILD)/linux-exec.elf $(X64BUILD)/linux-exec-target.elf
+kernel-x64-linux-smoke: $(X64BUILD)/kernel-linux.bin $(X64BUILD)/linux-probe.elf $(X64BUILD)/linux-bad-stack.elf $(X64BUILD)/linux-pie.elf $(X64BUILD)/linux-files.elf $(X64BUILD)/linux-mmap.elf $(X64BUILD)/linux-socket.elf $(X64BUILD)/linux-pipe.elf $(X64BUILD)/linux-poll.elf $(X64BUILD)/linux-fork.elf $(X64BUILD)/linux-pthread.elf $(X64BUILD)/linux-userns.elf $(X64BUILD)/linux-pidns.elf $(X64BUILD)/linux-vfork.elf $(X64BUILD)/linux-exec.elf $(X64BUILD)/linux-exec-target.elf
 	python3 tests/kernel_x64_linux_smoke.py
 
 uefi-smoke: $(HWBUILD)/kernel.bin $(BUILD)/myfs $(BUILD)/ld.so $(BUILD)/user/libc.so $(addprefix $(BUILD)/user/,sh cat stat poweroff sync)

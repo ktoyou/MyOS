@@ -36,10 +36,12 @@ struct linux64_fd_slot {
 };
 
 struct linux64_userns;
+struct linux64_pidns;
+struct linux64_pid;
 
 enum linux64_proc_node {
     USERNS_NONE, USERNS_UID_MAP, USERNS_GID_MAP, USERNS_SETGROUPS,
-    PROC_USER_NS, PROC_EXE, PROC_ROOT, PROC_TASKS,
+    PROC_USER_NS, PROC_PID_NS, PROC_EXE, PROC_ROOT, PROC_TASKS,
 };
 
 struct linux64_caps {
@@ -79,7 +81,7 @@ struct linux64_wait {
     i32 kind;
     i32 filter;
     u32 options;
-    bool signal_info;
+    bool signal_info, current_group;
 };
 
 struct linux64_process {
@@ -87,10 +89,13 @@ struct linux64_process {
     struct linux64_sigaction actions[LINUX64_SIGNAL_COUNT];
     char executable_path[LINUX64_PATH_LIMIT];
     uptr executable_path_length;
+    u64 pid_ns_link_inode;
     i32 pid, ppid, sid, pgid, exit_status;
     unsigned threads;
     u32 umask;
     struct linux64_userns *userns;
+    struct linux64_pidns *pid_ns;
+    struct linux64_pid *pid_identity, *group_identity;
 };
 
 struct linux64_futex_wait {
@@ -130,7 +135,7 @@ struct linux64_task {
     struct linux64_futex_wait futex;
     struct linux64_poll_wait poll;
     uptr child_tid, clear_child_tid;
-    i32 tid, vfork_child;
+    i32 tid, visible_tid, vfork_child;
     u16 ds_selector, es_selector, fs_selector, gs_selector;
     enum linux64_task_state state;
     bool finish_wait, no_new_privs;
@@ -139,6 +144,22 @@ struct linux64_task {
 
 extern struct linux64_task *linux64_current;
 
+struct linux64_pidns *linux64_pidns_init(void);
+long linux64_pidns_create(struct linux64_pidns *parent, struct linux64_userns *owner,
+                         struct linux64_pidns **result);
+void linux64_pidns_retain(struct linux64_pidns *ns);
+void linux64_pidns_release(struct linux64_pidns *ns);
+u64 linux64_pidns_inode(const struct linux64_pidns *ns);
+long linux64_pidns_readlink(const struct linux64_pidns *ns, uptr destination, uptr size);
+i32 linux64_pidns_reaper(const struct linux64_pidns *ns);
+void linux64_pidns_set_reaper(struct linux64_pidns *ns, i32 pid);
+bool linux64_pidns_contains(const struct linux64_pidns *ns, const struct linux64_pidns *member);
+struct linux64_pid *linux64_pid_create(struct linux64_pidns *ns);
+struct linux64_pid *linux64_pid_init(void);
+void linux64_pid_retain(struct linux64_pid *pid);
+void linux64_pid_release(struct linux64_pid *pid);
+i32 linux64_pid_number(const struct linux64_pid *pid, const struct linux64_pidns *ns);
+long linux64_pid_allocate(struct linux64_pidns *ns, i32 global, struct linux64_pid *pid);
 long linux64_userns_create(struct linux64_userns *parent, struct linux64_userns **result);
 void linux64_userns_retain(struct linux64_userns *ns);
 void linux64_userns_release(struct linux64_userns *ns);

@@ -51,6 +51,7 @@ static struct memfd {
 } memfds[OPEN_FILE_COUNT];
 static u64 next_memfd_inode = 1;
 static u64 next_special_inode = 1;
+static u64 next_pid_ns_link_inode = 1ull << 33;
 
 static struct file_handle {
     struct linux64_file file;
@@ -58,6 +59,7 @@ static struct file_handle {
     struct linux64_socket *socket;
     struct linux64_pipe *pipe;
     struct linux64_userns *proc_ns;
+    struct linux64_pidns *proc_pid_ns;
     enum linux64_proc_node proc_node;
     bool proc_admin;
     enum file_kind device;
@@ -206,11 +208,15 @@ long linux64_ppoll(uptr address, u32 count, uptr timeout, uptr sigmask, uptr sig
     return poll_wait(address, count, deadline, immediate, &end, sigmask ? &mask : NULL);
 }
 
+static bool namespace_node(enum linux64_proc_node proc) {
+    return proc == PROC_USER_NS || proc == PROC_PID_NS;
+}
+
 static enum file_kind kind_of(const struct file_handle *file) {
     if (file->directory_path) return FILE_DIRECTORY;
     if (file->device) return file->device;
     if (file->serial) return FILE_SERIAL;
-    if (file->proc_node == PROC_USER_NS) return FILE_NAMESPACE;
+    if (namespace_node(file->proc_node)) return FILE_NAMESPACE;
     if (file->proc_node >= PROC_ROOT) return FILE_PROC_DIR;
     if (file->proc_node) return FILE_PROC_MAP;
     if (file->pipe) return FILE_PIPE;
@@ -245,6 +251,7 @@ static void release_file(struct file_handle *file) {
     if (file->socket) linux64_socket_close(file->socket);
     if (file->pipe) linux64_pipe_close(file->pipe, (file->flags & O_ACCMODE) == O_WRONLY);
     linux64_userns_release(file->proc_ns);
+    linux64_pidns_release(file->proc_pid_ns);
     if (file->directory_path) pmm64_free(file->directory_path);
     struct memfd *memfd = file->memfd;
     if (memfd && !--memfd->handles) {
@@ -440,6 +447,7 @@ static enum linux64_proc_node proc_path(const char *path) {
     if (path_equal(path, "self/gid_map", false)) return USERNS_GID_MAP;
     if (path_equal(path, "self/setgroups", false)) return USERNS_SETGROUPS;
     if (path_equal(path, "self/ns/user", false)) return PROC_USER_NS;
+    if (path_equal(path, "self/ns/pid", false)) return PROC_PID_NS;
     if (path_equal(path, "self/exe", false)) return PROC_EXE;
     return USERNS_NONE;
 }
@@ -815,15 +823,23 @@ static long lookup(i32 dirfd, uptr address, u32 flags, struct linux64_file *file
     *kind = device_node(absolute, file);
     if (*kind) return 0;
     enum linux64_proc_node proc = proc_path(absolute);
-    if ((proc == PROC_USER_NS || proc == PROC_EXE) && (flags & AT_SYMLINK_NOFOLLOW)) {
-        u64 pid = (u32)linux64_current->process->pid;
-        *file = (struct linux64_file){.inode = 2 * pid + (proc == PROC_EXE)};
+    if ((namespace_node(proc) || proc == PROC_EXE) && (flags & AT_SYMLINK_NOFOLLOW)) {
+        struct linux64_process *process = linux64_current->process;
+        u64 inode = 2 * (u64)(u32)process->pid + (proc == PROC_EXE);
+        if (proc == PROC_PID_NS) {
+            if (!process->pid_ns_link_inode) process->pid_ns_link_inode = next_pid_ns_link_inode++;
+            inode = process->pid_ns_link_inode;
+        }
+        *file = (struct linux64_file){.inode = inode};
         *kind = FILE_PROC_LINK;
         return 0;
     }
-    if (proc == PROC_USER_NS) {
+    if (namespace_node(proc)) {
         const struct linux64_process *process = linux64_current->process;
-        *file = (struct linux64_file){.inode = linux64_userns_inode(process->userns)};
+        *file = (struct linux64_file){
+            .inode = proc == PROC_PID_NS ? linux64_pidns_inode(process->pid_ns) :
+                                         linux64_userns_inode(process->userns),
+        };
         *kind = FILE_NAMESPACE;
         return 0;
     }
@@ -863,6 +879,8 @@ static long linux_readlink(i32 dirfd, uptr path_address, uptr destination, i32 s
     enum linux64_proc_node proc = proc_path(absolute);
     if (proc == PROC_USER_NS)
         return linux64_userns_readlink(linux64_current->process->userns, destination, (uptr)size);
+    if (proc == PROC_PID_NS)
+        return linux64_pidns_readlink(linux64_current->process->pid_ns, destination, (uptr)size);
     const u8 *target = file.bytes;
     uptr length = file.size;
     if (proc == PROC_EXE) {
@@ -913,19 +931,27 @@ static long linux_open(i32 dirfd, uptr address, u32 flags) {
     }
     enum linux64_proc_node proc = proc_path(absolute);
     if (proc == PROC_EXE && (flags & O_NOFOLLOW)) return -ELOOP;
-    if (proc == PROC_USER_NS) {
+    if (namespace_node(proc)) {
         if (flags & O_DIRECTORY) return -ENOTDIR;
         if (flags & O_NOFOLLOW) return -ELOOP;
         if (flags & (O_ACCMODE | O_TRUNC)) return -EPERM;
         if (flags & ~(O_CLOEXEC | O_LARGEFILE | O_NONBLOCK | O_NOCTTY)) return -EINVAL;
-        struct linux64_userns *ns = linux64_current->process->userns;
-        const struct linux64_file file = {.inode = linux64_userns_inode(ns)};
+        struct linux64_process *process = linux64_current->process;
+        const struct linux64_file file = {
+            .inode = proc == PROC_PID_NS ? linux64_pidns_inode(process->pid_ns) :
+                                         linux64_userns_inode(process->userns),
+        };
         result = new_handle(&file, NULL, (flags & ~O_NOCTTY) | O_LARGEFILE);
         if (result < 0) return result;
         struct file_handle *handle = file_at((i32)result);
         handle->proc_node = proc;
-        handle->proc_ns = ns;
-        linux64_userns_retain(ns);
+        if (proc == PROC_PID_NS) {
+            handle->proc_pid_ns = process->pid_ns;
+            linux64_pidns_retain(handle->proc_pid_ns);
+        } else {
+            handle->proc_ns = process->userns;
+            linux64_userns_retain(handle->proc_ns);
+        }
         return result;
     }
     if (proc && proc != PROC_EXE) {
@@ -1068,7 +1094,7 @@ static long linux_read(i32 fd, uptr buffer, uptr count, uptr offset, bool positi
     }
     if (!positioned) offset = file_at(fd)->offset;
     if (handle->proc_node) {
-        if (handle->proc_node == PROC_USER_NS) return positioned ? -ESPIPE : -EINVAL;
+        if (namespace_node(handle->proc_node)) return positioned ? -ESPIPE : -EINVAL;
         if (handle->proc_node >= PROC_ROOT) return -EISDIR;
         if ((handle->flags & O_ACCMODE) == O_WRONLY) return -EBADF;
         long copied = linux64_userns_read(handle->proc_ns, handle->proc_node, buffer, count, offset);
