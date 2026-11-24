@@ -4,10 +4,11 @@
 #define PIT_HZ 1193182ul
 #define PIT_COUNT 59659u
 #define NS_PER_SECOND 1000000000ul
+#define COARSE_CLOCK_STEP_NS 1000000ul
 
 enum {
     CLOCK_REALTIME = 0, CLOCK_MONOTONIC = 1, CLOCK_THREAD_CPUTIME_ID = 3,
-    CLOCK_MONOTONIC_RAW = 4, CLOCK_BOOTTIME = 7,
+    CLOCK_MONOTONIC_RAW = 4, CLOCK_MONOTONIC_COARSE = 6, CLOCK_BOOTTIME = 7,
 };
 
 static u64 tsc_hz, tsc_start, last_elapsed;
@@ -184,6 +185,10 @@ long linux64_clock_gettime(i32 clock, uptr address) {
         if (!linux64_task_cpu_ns(&nanos)) return -5;
         seconds = (long)(nanos / NS_PER_SECOND);
         nanos %= NS_PER_SECOND;
+        break;
+    case CLOCK_MONOTONIC_COARSE:
+        if (!linux64_clock_sample(false, &seconds, &nanos)) return -5;
+        nanos -= nanos % COARSE_CLOCK_STEP_NS;
         break;
     default:
         return -22;
