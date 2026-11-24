@@ -1,4 +1,4 @@
-#include "linux.h"
+#include "linux_task.h"
 #include "paging.h"
 #include "segments.h"
 
@@ -212,6 +212,7 @@ bool linux64_run(const void *image, uptr size, const char *path, uptr path_lengt
     if (!map_image(&main) || (main.interp && !map_image(&interpreter))) return false;
     uptr stack = make_stack(&main, interpreter.bias, entropy, path, path_length);
     if (!stack || !linux64_enable_syscall()) return false;
+    linux64_task_init();
     linux64_use_files(source, path, path_length);
     linux64_reset_signals();
     linux64_clock_init();

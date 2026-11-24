@@ -225,6 +225,9 @@ static void install_idt(void) {
             .offset_mid = (u16)(offset >> 16),
             .offset_high = (u32)(offset >> 32),
         };
+#ifdef X64_TEST_LINUX
+        if (vector == 3) idt[vector].flags |= 0x60; /* INT3 разрешён из ring 3. */
+#endif
     }
     const struct idt_pointer pointer = {sizeof(idt) - 1, (uptr)idt};
     __asm__ volatile("lidt %0" : : "m"(pointer) : "memory");
@@ -258,6 +261,9 @@ static bool valid_boot_map(const struct boot_info *boot, u32 entry_magic) {
 
 __attribute__((noreturn)) void kernel64_exception(u64 vector, u64 error, u64 rip,
                                                  u64 cs, uptr frame, uptr interrupted_sp) {
+#ifdef X64_TEST_LINUX
+    if ((cs & 3u) == 3) linux64_task_exception(vector);
+#endif
     uptr cr2 = 0;
     if (vector == 14) __asm__ volatile("mov %%cr2,%0" : "=r"(cr2));
     serial_puts("x86-64 exception vector=");

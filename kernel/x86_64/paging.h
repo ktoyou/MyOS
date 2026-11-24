@@ -6,6 +6,10 @@
 #define X64_USER_TOP 0x0000800000000000ul
 
 bool paging64_init(const struct boot_info *boot);
+uptr paging64_active_root(void);
+void paging64_switch_root(uptr root);
+uptr paging64_fork_root(void);
+void paging64_drop_root(uptr root);
 void *paging64_user_page(uptr address);
 bool paging64_user_code(uptr address, const u8 *code, uptr length);
 bool paging64_user_load(uptr address, const u8 *source, uptr offset, uptr length,
