@@ -1,4 +1,4 @@
-#include "linux.h"
+#include "linux_task.h"
 #include "paging.h"
 
 enum {
@@ -57,14 +57,14 @@ struct linux64_socket {
 };
 
 /* Один конец может оставаться открытым после закрытия его пары. */
-static struct linux64_socket pairs[LINUX64_FD_COUNT][2];
+static struct linux64_socket pairs[LINUX64_TASK_COUNT * LINUX64_FD_COUNT][2];
 
 long linux64_socket_pair(i32 domain, u32 type, i32 protocol, struct linux64_socket *ends[2]) {
     if (type & ~(SOCK_TYPE_MASK | SOCK_CLOEXEC | SOCK_NONBLOCK)) return -EINVAL;
     if (domain != AF_UNIX) return -EAFNOSUPPORT;
     if ((type & SOCK_TYPE_MASK) != SOCK_SEQPACKET) return -ESOCKTNOSUPPORT;
     if (protocol != 0 && protocol != AF_UNIX) return -EPROTONOSUPPORT;
-    for (unsigned i = 0; i < LINUX64_FD_COUNT; ++i) {
+    for (unsigned i = 0; i < sizeof(pairs) / sizeof(*pairs); ++i) {
         struct linux64_socket *pair = pairs[i];
         if (pair[0].open || pair[1].open) continue;
         pair[0] = (struct linux64_socket){.peer = &pair[1], .open = true};
@@ -133,7 +133,7 @@ static long send_packet(struct linux64_socket *socket, const struct iovec *iov, 
     packet->physical = physical;
     packet->length = (u32)length;
     if (socket->passcred || peer->passcred)
-        packet->sender = (struct identity){LINUX64_PID, LINUX64_UID, LINUX64_GID};
+        packet->sender = (struct identity){linux64_current->pid, LINUX64_UID, LINUX64_GID};
     else
         packet->sender = (struct identity){0, 65534, 65534};
     uptr copied = 0;
@@ -175,7 +175,7 @@ static long receive_packet(struct linux64_socket *socket, const struct iovec *io
     const struct packet *packet = socket->head;
     if (!packet) {
         if (message) message->control_length = 0;
-        /* Текущий Linux ABI не может усыпить поток до записи из другого. */
+        /* Ожидание записи другого процесса ещё не связано с планировщиком. */
         return socket->peer->open ? -EAGAIN : 0;
     }
     uptr copied = 0;

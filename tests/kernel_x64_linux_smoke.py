@@ -155,6 +155,22 @@ def check_socket(build):
     print('OVMF: AF_UNIX seqpacket, SO_PASSCRED and descriptor cleanup: PASS', flush=True)
 
 
+def check_fork(build):
+    probe = (build / 'linux-fork.elf').resolve()
+    marker = 'Linux ELF64 fork probe'
+    host = subprocess.run([str(probe)], env={}, capture_output=True, timeout=5,
+                          preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_CORE, (0, 0)))
+    assert (host.returncode, host.stdout, host.stderr) == (0, (marker + '\n').encode(), b''), host
+    serial = check_guest('fork', probe.read_bytes(), 'Linux x86-64 exit status=0x00')
+    assert marker in serial, serial
+    symbols = subprocess.check_output(['nm', str(probe)], text=True)
+    entry = next(int(line.split()[0], 16) for line in symbols.splitlines() if line.endswith(' fork_oom'))
+    oom = bytearray(probe.read_bytes())
+    struct.pack_into('<Q', oom, 24, entry)
+    check_guest('fork-oom', oom, 'Linux x86-64 exit status=0x00')
+    print('OVMF: Linux fork, wait4, address spaces and shared file descriptions: PASS', flush=True)
+
+
 def main():
     build = pathlib.Path('build/x86_64')
     probe = build / 'linux-probe.elf'
@@ -194,6 +210,7 @@ def main():
     check_files(build)
     check_mmap(build)
     check_socket(build)
+    check_fork(build)
 
 
 if __name__ == '__main__':

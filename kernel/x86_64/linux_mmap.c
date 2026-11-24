@@ -1,11 +1,10 @@
-#include "linux.h"
+#include "linux_task.h"
 #include "paging.h"
 
 /* MAP_FIXED меняет только страницы отдельной области mmap. */
 #define MAP_START 0x1000000000ul
 #define MAP_END   0x00007fff00000000ul
 #define PAGE_MASK (PMM_PAGE_SIZE - 1ul)
-#define RESERVE_COUNT 256u
 
 enum {
     PROT_READ = 1, PROT_WRITE = 2, PROT_EXEC = 4,
@@ -14,25 +13,23 @@ enum {
     EBADF = 9, ENOMEM = 12, EACCES = 13, EEXIST = 17, EINVAL = 22, EOVERFLOW = 75,
 };
 
-struct reserve_range {
-    uptr start, end;
-};
-
 /* BSP держит подготовленный список отдельно, пока изменение PTE может завершиться ошибкой. */
-static struct reserve_range reserves[RESERVE_COUNT], staged[RESERVE_COUNT];
-static unsigned reserve_count, staged_count;
+static struct linux64_reserve_range staged[LINUX64_RESERVE_COUNT];
+static unsigned staged_count;
 
 static bool append_range(uptr start, uptr end) {
     if (staged_count && staged[staged_count - 1].end == start) {
         staged[staged_count - 1].end = end;
         return true;
     }
-    if (staged_count == RESERVE_COUNT) return false;
-    staged[staged_count++] = (struct reserve_range){start, end};
+    if (staged_count == LINUX64_RESERVE_COUNT) return false;
+    staged[staged_count++] = (struct linux64_reserve_range){start, end};
     return true;
 }
 
 static bool stage_range(uptr start, uptr end, bool reserve) {
+    const struct linux64_reserve_range *reserves = linux64_current->reserves;
+    unsigned reserve_count = linux64_current->reserve_count;
     staged_count = 0;
     for (unsigned i = 0; i < reserve_count && reserves[i].start < start; ++i) {
         uptr limit = reserves[i].end < start ? reserves[i].end : start;
@@ -48,18 +45,20 @@ static bool stage_range(uptr start, uptr end, bool reserve) {
 }
 
 static void commit_ranges(void) {
-    for (unsigned i = 0; i < staged_count; ++i) reserves[i] = staged[i];
-    reserve_count = staged_count;
+    for (unsigned i = 0; i < staged_count; ++i) linux64_current->reserves[i] = staged[i];
+    linux64_current->reserve_count = staged_count;
 }
 
 static uptr reserved_end(uptr address) {
-    for (unsigned i = 0; i < reserve_count && reserves[i].start <= address; ++i)
+    const struct linux64_reserve_range *reserves = linux64_current->reserves;
+    for (unsigned i = 0; i < linux64_current->reserve_count && reserves[i].start <= address; ++i)
         if (address < reserves[i].end) return reserves[i].end;
     return 0;
 }
 
 static uptr overlap_end(uptr start, uptr end) {
-    for (unsigned i = 0; i < reserve_count && reserves[i].start < end; ++i)
+    const struct linux64_reserve_range *reserves = linux64_current->reserves;
+    for (unsigned i = 0; i < linux64_current->reserve_count && reserves[i].start < end; ++i)
         if (start < reserves[i].end) return reserves[i].end;
     return 0;
 }

@@ -3,7 +3,7 @@ default rel
 
 section .text
 global linux64_syscall_entry
-extern linux64_syscall
+extern linux64_task_syscall
 extern linux64_invalid_return
 linux64_syscall_entry:
     ; SYSCALL не загружает RSP0. До смены стека нельзя делать push.
@@ -35,16 +35,12 @@ linux64_syscall_entry:
     push r10
     push r8
     push r9
-    ; Шестой аргумент Linux переходит из R9 в первый стековый аргумент C.
-    push r9
-    mov r9,r8
-    mov r8,r10
-    mov rcx,rdx
-    mov rdx,rsi
-    mov rsi,rdi
-    mov rdi,rax
-    call linux64_syscall
-    add rsp,8
+    push rax
+    ; Планировщик может заменить весь кадр перед возвратом в ring 3.
+    mov rdi,rsp
+    call linux64_task_syscall
+.restore_frame:
+    pop rax
     pop r9
     pop r8
     pop r10
@@ -63,6 +59,11 @@ linux64_syscall_entry:
 .bad_return:
     and rsp,-16
     call linux64_invalid_return
+
+global linux64_task_resume
+linux64_task_resume:
+    mov rsp,rdi
+    jmp linux64_syscall_entry.restore_frame
 
 section .bss
 alignb 16

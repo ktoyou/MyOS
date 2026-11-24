@@ -139,10 +139,14 @@ static void invalidate(uptr address) {
     __asm__ volatile("invlpg (%0)" : : "r"(address) : "memory");
 }
 
-static uptr active_root(void) {
+uptr paging64_active_root(void) {
     uptr root;
     __asm__ volatile("mov %%cr3,%0" : "=r"(root));
     return root & ADDRESS_MASK;
+}
+
+void paging64_switch_root(uptr root) {
+    __asm__ volatile("mov %0,%%cr3" : : "r"(root) : "memory");
 }
 
 bool paging64_range_free(uptr start, uptr end) {
@@ -150,7 +154,7 @@ bool paging64_range_free(uptr start, uptr end) {
 }
 
 uptr paging64_first_mapped(uptr start, uptr end) {
-    uptr root = active_root(), next;
+    uptr root = paging64_active_root(), next;
     for (uptr address = start; address < end; address = next) {
         const u64 *leaf = find_leaf_span(root, address, &next);
         if (leaf && *leaf) return address;
@@ -191,8 +195,80 @@ static void set_alias_write(uptr root, uptr physical, bool writable) {
 static void release_mapping(uptr root, u64 value) {
     uptr physical = value & ADDRESS_MASK;
     if (!physical) return;
-    if (!(value & MMAP_SHARED_FRAME)) set_alias_write(root, physical, true);
+    if (!(value & MMAP_SHARED_FRAME) && !pmm64_has_aliases(physical))
+        set_alias_write(root, physical, true);
     pmm64_free(physical);
+}
+
+static void copy_page(uptr target, uptr source) {
+    u64 *to = pmm64_pointer(target);
+    const u64 *from = pmm64_pointer(source);
+    for (unsigned i = 0; i < PMM_PAGE_SIZE / sizeof(*to); ++i) to[i] = from[i];
+}
+
+static bool private_alias(u64 entry) {
+    return !(entry & MMAP_SHARED_FRAME) && (entry & ADDRESS_MASK) &&
+           pmm64_has_aliases(entry & ADDRESS_MASK);
+}
+
+static void drop_lower_table(uptr root, uptr physical, unsigned level, unsigned entries) {
+    const u64 *table = pmm64_pointer(physical);
+    for (unsigned i = 0; i < entries; ++i) {
+        u64 entry = table[i];
+        if (level) {
+            if (entry & PRESENT) drop_lower_table(root, entry & ADDRESS_MASK, level - 1, 512);
+        } else if (entry & USER) {
+            release_mapping(root, entry);
+        }
+    }
+    pmm64_free(physical);
+}
+
+void paging64_drop_root(uptr root) {
+    drop_lower_table(paging64_active_root(), root, 3, 256);
+}
+
+static bool clone_lower_table(uptr target, uptr source, unsigned level, unsigned entries) {
+    u64 *to = pmm64_pointer(target);
+    const u64 *from = pmm64_pointer(source);
+    for (unsigned i = 0; i < entries; ++i) {
+        u64 entry = from[i];
+        uptr physical = entry & ADDRESS_MASK;
+        if (level) {
+            if (!(entry & PRESENT)) continue;
+            uptr child = pmm64_alloc();
+            if (!child) return false;
+            to[i] = child | (entry & ~ADDRESS_MASK);
+            if (!clone_lower_table(child, physical, level - 1, 512)) return false;
+        } else if ((entry & USER) && physical) {
+            if ((entry & WRITE) && !(entry & MMAP_SHARED_FRAME)) {
+                uptr copy = pmm64_alloc();
+                if (!copy) return false;
+                copy_page(copy, physical);
+                to[i] = copy | (entry & ~ADDRESS_MASK);
+            } else {
+                if (!pmm64_retain(physical)) return false;
+                to[i] = entry;
+            }
+        } else {
+            to[i] = entry;
+        }
+    }
+    return true;
+}
+
+uptr paging64_fork_root(void) {
+    uptr parent = paging64_active_root(), child = pmm64_alloc();
+    if (!child) return 0;
+    if (!clone_lower_table(child, parent, 3, 256)) {
+        paging64_drop_root(child);
+        return 0;
+    }
+    /* Прямое отображение общее, включая изменения защиты физических страниц. */
+    u64 *to = pmm64_pointer(child);
+    const u64 *from = pmm64_pointer(parent);
+    for (unsigned i = 256; i < 512; ++i) to[i] = from[i];
+    return child;
 }
 
 static void clear_mmap(uptr root, uptr start, uptr end, u64 marker) {
@@ -211,7 +287,7 @@ static void clear_mmap(uptr root, uptr start, uptr end, u64 marker) {
 }
 
 bool paging64_remove_mmap(uptr start, uptr end) {
-    uptr root = active_root(), next;
+    uptr root = paging64_active_root(), next;
     for (uptr address = start; address < end; address = next) {
         const u64 *leaf = find_leaf_span(root, address, &next);
         if (leaf && *leaf && !(*leaf & MMAP_OWNED)) return false;
@@ -226,7 +302,7 @@ enum paging64_protect_result paging64_protect(uptr start, uptr end, bool accessi
     if (start < 0x400000ul || end > X64_USER_TOP || start >= end ||
         ((start | end) & (PMM_PAGE_SIZE - 1))) return PAGING64_PROTECT_UNMAPPED;
     if (writable && executable) return PAGING64_PROTECT_DENIED;
-    uptr root = active_root(), next;
+    uptr root = paging64_active_root(), next;
     bool needs_backing = false;
     for (uptr address = start; address < end; address = next) {
         next = address + PMM_PAGE_SIZE;
@@ -254,6 +330,17 @@ enum paging64_protect_result paging64_protect(uptr start, uptr end, bool accessi
             return PAGING64_PROTECT_UNMAPPED;
         }
     }
+    uptr copies = 0;
+    if (writable) {
+        for (uptr address = start; address < end; address = next) {
+            const u64 *leaf = find_leaf_span(root, address, &next);
+            if (!leaf || !private_alias(*leaf)) continue;
+            uptr physical = pmm64_alloc();
+            if (!physical) goto fail_copies;
+            *(uptr *)pmm64_pointer(physical) = copies;
+            copies = physical;
+        }
+    }
     for (uptr address = start; address < end; address = next) {
         u64 *leaf = find_leaf_span(root, address, &next);
         if (!leaf) continue;
@@ -264,6 +351,16 @@ enum paging64_protect_result paging64_protect(uptr start, uptr end, bool accessi
                     (accessible ? PRESENT : 0) | (writable ? WRITE : 0) |
                     (executable ? 0 : NO_EXECUTE);
         if (*leaf & MMAP_PENDING) value |= MMAP_OWNED;
+        if (writable && private_alias(*leaf)) {
+            u64 old = *leaf;
+            uptr copy = copies;
+            copies = *(uptr *)pmm64_pointer(copy);
+            copy_page(copy, physical);
+            *leaf = (value & ~ADDRESS_MASK) | copy;
+            invalidate(address);
+            release_mapping(root, old);
+            continue;
+        }
         if (value == *leaf) continue;
         bool shared_frame = (*leaf & MMAP_SHARED_FRAME) != 0;
         if (!shared_frame && !writable) set_alias_write(root, physical, false);
@@ -273,6 +370,15 @@ enum paging64_protect_result paging64_protect(uptr start, uptr end, bool accessi
         if (!shared_frame && writable) set_alias_write(root, physical, true);
     }
     return PAGING64_PROTECT_OK;
+
+fail_copies:
+    while (copies) {
+        uptr physical = copies;
+        copies = *(uptr *)pmm64_pointer(physical);
+        pmm64_free(physical);
+    }
+    if (needs_backing) clear_mmap(root, start, end, MMAP_PENDING);
+    return PAGING64_PROTECT_UNMAPPED;
 }
 
 /* Страницы и таблицы резервируются до замены старых отображений. */
@@ -285,7 +391,7 @@ bool paging64_map_mmap(uptr start, uptr end, const struct paging64_mmap_file *fi
         (no_write && writable) || (shared_frames && executable) ||
         (file && (file->length > end - start || (file->length && !file->bytes && !file->frame))))
         return false;
-    uptr root = active_root(), physical_list = 0, prepared = start;
+    uptr root = paging64_active_root(), physical_list = 0, prepared = start;
     uptr retained = 0;
     const u64 owner = MMAP_OWNED | (no_write ? MMAP_NO_WRITE : 0) |
                       (shared_frames ? MMAP_SHARED_FRAME : 0);
@@ -362,7 +468,7 @@ static void *map_user_page(uptr address, const u8 *source, uptr offset, uptr len
         (address & (PMM_PAGE_SIZE - 1)) || (writable && executable) ||
         offset >= PMM_PAGE_SIZE || length > PMM_PAGE_SIZE - offset || (length && !source))
         return NULL;
-    uptr root = active_root();
+    uptr root = paging64_active_root();
     uptr page = pmm64_alloc();
     if (!page) return NULL;
     u8 *direct = pmm64_pointer(page);
@@ -407,7 +513,7 @@ bool paging64_user_load(uptr address, const u8 *source, uptr offset, uptr length
 
 static u8 *user_pointer(uptr address, u64 required) {
     if (address < 0x400000ul || address >= X64_USER_TOP) return NULL;
-    const u64 *table = pmm64_pointer(active_root());
+    const u64 *table = pmm64_pointer(paging64_active_root());
     for (int shift = 39; shift >= 12; shift -= 9) {
         u64 entry = table[(address >> shift) & 511u];
         if ((entry & required) != required) return NULL;
@@ -439,7 +545,7 @@ uptr paging64_copy_from_user(void *destination, uptr address, uptr length) {
 
 bool paging64_shared_futex_address(uptr address) {
     if (!paging64_user_read(address)) return false;
-    return (*find_leaf(active_root(), address) & (WRITE | FILE_BACKED)) != 0;
+    return (*find_leaf(paging64_active_root(), address) & (WRITE | FILE_BACKED)) != 0;
 }
 
 uptr paging64_copy_to_user(uptr address, const void *source, uptr length) {

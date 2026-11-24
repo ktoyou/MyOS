@@ -1,7 +1,6 @@
-#include "linux.h"
+#include "linux_task.h"
 #include "paging.h"
 
-#define SIGNAL_COUNT 64
 #define SIGKILL 9
 #define SIGSTOP 19
 #define UNBLOCKABLE_SIGNALS ((1ull << (SIGKILL - 1)) | (1ull << (SIGSTOP - 1)))
@@ -9,30 +8,23 @@
 
 enum { SIG_BLOCK = 0, SIG_UNBLOCK = 1, SIG_SETMASK = 2 };
 
-struct linux_sigaction {
-    u64 handler, flags, restorer, mask;
-};
-
-_Static_assert(sizeof(struct linux_sigaction) == 32, "Linux x86-64 sigaction size");
-
-static struct linux_sigaction actions[SIGNAL_COUNT];
-static u64 blocked_signals;
+_Static_assert(sizeof(struct linux64_sigaction) == 32, "Linux x86-64 sigaction size");
 
 void linux64_reset_signals(void) {
-    for (unsigned i = 0; i < SIGNAL_COUNT; ++i)
-        actions[i] = (struct linux_sigaction){0};
-    blocked_signals = 0;
+    for (unsigned i = 0; i < LINUX64_SIGNAL_COUNT; ++i)
+        linux64_current->actions[i] = (struct linux64_sigaction){0};
+    linux64_current->signal_mask = 0;
 }
 
 long linux64_rt_sigaction(i32 signal, uptr action, uptr previous, uptr sigset_size) {
-    struct linux_sigaction input;
+    struct linux64_sigaction input;
     if (sigset_size != sizeof(input.mask)) return -22;
     if (action && paging64_copy_from_user(&input, action, sizeof(input)) != sizeof(input))
         return -14;
-    if (signal < 1 || signal > SIGNAL_COUNT ||
+    if (signal < 1 || signal > (i32)LINUX64_SIGNAL_COUNT ||
         (action && (signal == SIGKILL || signal == SIGSTOP))) return -22;
-    struct linux_sigaction *slot = &actions[signal - 1];
-    const struct linux_sigaction old = *slot;
+    struct linux64_sigaction *slot = &linux64_current->actions[signal - 1];
+    const struct linux64_sigaction old = *slot;
     if (action) {
         input.flags &= SA_USER_FLAGS;
         input.mask &= ~UNBLOCKABLE_SIGNALS;
@@ -47,19 +39,19 @@ long linux64_rt_sigaction(i32 signal, uptr action, uptr previous, uptr sigset_si
 long linux64_rt_sigprocmask(i32 how, uptr set, uptr previous, uptr sigset_size) {
     u64 input;
     if (sigset_size != sizeof(input)) return -22;
-    const u64 old = blocked_signals;
+    const u64 old = linux64_current->signal_mask;
     if (set) {
         if (paging64_copy_from_user(&input, set, sizeof(input)) != sizeof(input)) return -14;
         input &= ~UNBLOCKABLE_SIGNALS;
         switch (how) {
         case SIG_BLOCK:
-            blocked_signals |= input;
+            linux64_current->signal_mask |= input;
             break;
         case SIG_UNBLOCK:
-            blocked_signals &= ~input;
+            linux64_current->signal_mask &= ~input;
             break;
         case SIG_SETMASK:
-            blocked_signals = input;
+            linux64_current->signal_mask = input;
             break;
         default:
             return -22;
