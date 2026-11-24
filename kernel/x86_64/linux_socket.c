@@ -183,10 +183,13 @@ static void receive_credentials(const struct packet *packet, struct msghdr *mess
     if (available < CRED_LENGTH) message->flags |= MSG_CTRUNC;
     if (available < __builtin_offsetof(struct credentials, sender)) return;
     uptr length = available < CRED_LENGTH ? available : CRED_LENGTH;
-    const struct credentials control = {
+    const struct linux64_userns *ns = linux64_current->process->userns;
+    struct credentials control = {
         .length = length, .level = SOL_SOCKET, .type = SCM_CREDENTIALS,
         .sender = packet->sender,
     };
+    control.sender.uid = linux64_visible_id(ns, false, control.sender.uid);
+    control.sender.gid = linux64_visible_id(ns, true, control.sender.gid);
     if (paging64_copy_to_user(message->control, &control, length) != length) return;
     message->control_length = available < sizeof(control) ? available : sizeof(control);
 }

@@ -184,7 +184,8 @@ static bool map_image(const struct elf_image *elf) {
 }
 
 static uptr make_stack(const struct elf_image *main, u64 interp_bias, const u64 entropy[2],
-                       const struct stack_arguments *args, uptr bottom) {
+                       const struct stack_arguments *args, uptr bottom,
+                       const struct linux64_userns *ns) {
     const uptr path_size = args->path_length + 1;
     const uptr execfn_address = LINUX64_STACK_TOP - path_size;
     const uptr strings_address = execfn_address - args->string_bytes;
@@ -197,10 +198,12 @@ static uptr make_stack(const struct elf_image *main, u64 interp_bias, const u64 
     for (unsigned i = args->argc; i < args->count; ++i)
         vectors[used++] = strings_address + args->offsets[i];
     vectors[used++] = 0;
+    u32 uid = linux64_visible_id(ns, false, LINUX64_UID);
+    u32 gid = linux64_visible_id(ns, true, LINUX64_GID);
     const u64 auxv[] = {
         3, main->phdr, 4, main->header->phentsize, 5, main->header->phnum, 6, PMM_PAGE_SIZE,
-        7, interp_bias, 9, main->entry, 11, LINUX64_UID, 12, LINUX64_UID,
-        13, LINUX64_GID, 14, LINUX64_GID, AT_RANDOM, random_address, 31, execfn_address, 0, 0,
+        7, interp_bias, 9, main->entry, 11, uid, 12, uid,
+        13, gid, 14, gid, AT_RANDOM, random_address, 31, execfn_address, 0, 0,
     };
     uptr vector_size = used * sizeof(*vectors);
     uptr stack = (random_address - sizeof(auxv) - vector_size) & ~15ul;
@@ -219,7 +222,7 @@ static uptr make_stack(const struct elf_image *main, u64 interp_bias, const u64 
 
 static long prepare_image(const void *image, uptr size, const struct linux64_file_source *source,
                           const struct stack_arguments *args, uptr stack_size,
-                          uptr *entry, uptr *stack) {
+                          uptr *entry, uptr *stack, const struct linux64_userns *ns) {
     struct elf_image main, interpreter = {0};
     u64 mapped = 0;
     uptr bottom = LINUX64_STACK_TOP - stack_size, guard = LINUX64_STACK_FLOOR - PMM_PAGE_SIZE;
@@ -241,7 +244,7 @@ static long prepare_image(const void *image, uptr size, const struct linux64_fil
     if (!map_image(&main) || (main.interp && !map_image(&interpreter))) return -ENOMEM;
     if (!paging64_reserve_stack(LINUX64_STACK_FLOOR, bottom)) return -ENOMEM;
     *entry = main.interp ? interpreter.entry : main.entry;
-    *stack = make_stack(&main, interpreter.bias, entropy, args, bottom);
+    *stack = make_stack(&main, interpreter.bias, entropy, args, bottom, ns);
     return *stack ? 0 : -ENOMEM;
 }
 
@@ -304,7 +307,8 @@ long linux64_execve(struct linux64_frame *frame, uptr filename, uptr argv, uptr 
     if (!root) return -ENOMEM;
     paging64_switch_root(root);
     uptr entry, stack;
-    result = prepare_image(file.bytes, file.size, source, &args, EXEC_STACK_SIZE, &entry, &stack);
+    result = prepare_image(file.bytes, file.size, source, &args, EXEC_STACK_SIZE, &entry, &stack,
+                           linux64_current->process->userns);
     if (!result && linux64_commit_exec(frame, root, entry, stack, absolute, absolute_length)) return 0;
     paging64_switch_root(previous);
     paging64_drop_root(root);
@@ -321,7 +325,7 @@ bool linux64_run(const void *image, uptr size, const char *path, uptr path_lengt
         .offsets = &offset, .argc = 1, .count = 1,
     };
     uptr entry, stack;
-    if (prepare_image(image, size, source, &args, BOOT_STACK_SIZE, &entry, &stack) ||
+    if (prepare_image(image, size, source, &args, BOOT_STACK_SIZE, &entry, &stack, NULL) ||
         !linux64_enable_syscall()) return false;
     linux64_task_init();
     linux64_use_files(source, path, path_length);

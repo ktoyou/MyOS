@@ -1,0 +1,145 @@
+typedef unsigned long word;
+
+#define NEWUSER 0x10000000
+#define CAP_V3 0x20080522
+
+static char stack[16384] __attribute__((aligned(16)));
+static const char uid_map[] = "/proc/self/uid_map";
+static const char gid_map[] = "/proc/self/gid_map";
+static const char setgroups[] = "/proc/self/setgroups";
+static unsigned host_uid, host_gid;
+static long backing;
+
+struct cap_header { unsigned version; int pid; };
+struct cap_data { unsigned effective, permitted, inheritable; };
+
+extern long fork_namespace(word child_stack);
+
+__asm__(
+    ".text\n"
+    "fork_namespace:\n"
+    "mov %rdi,%rsi\n"
+    "mov $0x10000011,%edi\n"
+    "xor %edx,%edx\n"
+    "xor %r10d,%r10d\n"
+    "xor %r8d,%r8d\n"
+    "mov $56,%eax\n"
+    "syscall\n"
+    "test %rax,%rax\n"
+    "jnz 1f\n"
+    "call namespace_child\n"
+    "ud2\n"
+    "1: ret\n"
+);
+
+static long call(word number, word a0, word a1, word a2, word a3) {
+    register word fourth __asm__("r10") = a3;
+    __asm__ volatile("syscall" : "+a"(number)
+                     : "D"(a0), "S"(a1), "d"(a2), "r"(fourth) : "rcx", "r11", "memory");
+    return (long)number;
+}
+
+static long open_file(const char *path, unsigned flags) {
+    return call(2, (word)path, flags, 0, 0);
+}
+
+static void finish(int status) __attribute__((noreturn));
+static void finish(int status) {
+    call(60, status, 0, 0, 0);
+    __builtin_unreachable();
+}
+
+static char *append_id(char *out, unsigned id) {
+    char digits[10];
+    unsigned count = 0;
+    do {
+        digits[count++] = (char)('0' + id % 10);
+        id /= 10;
+    } while (id);
+    while (count) *out++ = digits[--count];
+    return out;
+}
+
+static long write_map(const char *path, unsigned lower) {
+    char map[32] = {'0', ' '};
+    char *end = append_id(map + 2, lower);
+    *end++ = ' ';
+    *end++ = '1';
+    *end++ = '\n';
+    long fd = open_file(path, 1);
+    if (fd < 0) return fd;
+    long result = call(1, fd, (word)map, (word)(end - map), 0);
+    if (call(3, fd, 0, 0, 0)) return -9;
+    return result;
+}
+
+static int caps_empty(const struct cap_data data[2]) {
+    return !(data[0].effective | data[0].permitted | data[0].inheritable |
+             data[1].effective | data[1].permitted | data[1].inheritable);
+}
+
+__attribute__((noreturn)) void namespace_child(void) {
+    if (call(102, 0, 0, 0, 0) != 65534 || call(104, 0, 0, 0, 0) != 65534 ||
+        call(272, NEWUSER, 0, 0, 0) != -1) finish(1);
+    struct cap_header caps = {CAP_V3, 0};
+    struct cap_data initial[2], dropped[2] = {{0}, {0}};
+    if (call(125, (word)&caps, (word)initial, 0, 0) || caps_empty(initial)) finish(2);
+    if (call(21, (word)setgroups, 0, 0, 0) || write_map(gid_map, host_gid) != -1 ||
+        write_map(uid_map, host_uid == 1 ? 2 : 1) != -1) finish(3);
+    long fd = open_file(setgroups, 1);
+    if (fd < 0 || call(1, fd, 1, 4, 0) != -14 ||
+        call(1, fd, (word)"deny", 4, 0) != 4 || call(3, fd, 0, 0, 0)) finish(4);
+    if (write_map(gid_map, host_gid) < 0 || write_map(uid_map, host_uid) < 0 ||
+        write_map(uid_map, host_uid) != -1 ||
+        call(102, 0, 0, 0, 0) || call(104, 0, 0, 0, 0)) finish(5);
+    fd = open_file(setgroups, 1);
+    if (fd < 0 || call(1, fd, (word)"allow", 5, 0) != -1 ||
+        call(3, fd, 0, 0, 0)) finish(6);
+
+    struct {
+        word dev, inode, nlink;
+        unsigned mode, uid, gid, padding;
+        word rest[13];
+    } stat;
+    long proc = open_file("/proc/", 0x90000);
+    if (proc < 0 || call(262, proc, (word)"self/task/", (word)&stat, 0) ||
+        stat.nlink != 3 || (stat.mode & 0170000) != 0040000 || call(3, proc, 0, 0, 0) ||
+        call(5, backing, (word)&stat, 0, 0) || stat.uid || stat.gid) finish(7);
+    if (call(126, (word)&caps, (word)dropped, 0, 0) ||
+        call(126, (word)&caps, (word)initial, 0, 0) != -1 ||
+        call(125, (word)&caps, (word)dropped, 0, 0) || !caps_empty(dropped)) finish(8);
+
+    long previous = open_file(uid_map, 0);
+    if (previous < 0 || call(272, NEWUSER, 0, 0, 0) || call(102, 0, 0, 0, 0) != 65534) finish(9);
+    if (write_map(uid_map, 0) != -1) finish(17);
+    if (call(126, (word)&caps, (word)dropped, 0, 0) ||
+        write_map(gid_map, 0) != -1 || open_file(setgroups, 1) != -13) finish(18);
+    char contents[64];
+    long current = open_file(uid_map, 0);
+    if (current < 0 || call(0, previous, (word)contents, sizeof(contents), 0) <= 0 ||
+        call(0, current, (word)contents, sizeof(contents), 0) ||
+        call(3, previous, 0, 0, 0) || call(3, current, 0, 0, 0)) finish(10);
+    finish(0);
+}
+
+void _start(void) {
+    host_uid = (unsigned)call(102, 0, 0, 0, 0);
+    host_gid = (unsigned)call(104, 0, 0, 0, 0);
+    backing = call(319, (word)"userns-test", 0, 0, 0);
+    if (backing < 0 || !host_uid) finish(11);
+    struct cap_header caps = {CAP_V3, 0};
+    struct cap_data parent[2];
+    if (call(125, (word)&caps, (word)parent, 0, 0) || !caps_empty(parent)) finish(12);
+    long child = fork_namespace((word)(stack + sizeof(stack)));
+    if (child == -1) finish(77);
+    if (child < 0) finish(13);
+    int status;
+    if (call(61, child, (word)&status, 0, 0) != child || (status & 0x7f)) finish(14);
+    if (status) finish(status >> 8);
+    if (call(102, 0, 0, 0, 0) != host_uid || call(104, 0, 0, 0, 0) != host_gid ||
+        call(125, (word)&caps, (word)parent, 0, 0) || !caps_empty(parent) ||
+        call(3, backing, 0, 0, 0)) finish(15);
+    const char marker[] = "Linux ELF64 user namespace probe\n";
+    if (call(1, 1, (word)marker, sizeof(marker) - 1, 0) != sizeof(marker) - 1) finish(16);
+    finish(0);
+}

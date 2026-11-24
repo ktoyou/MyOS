@@ -35,6 +35,19 @@ struct linux64_fd_slot {
     bool cloexec;
 };
 
+struct linux64_userns;
+
+enum linux64_proc_node {
+    USERNS_NONE, USERNS_UID_MAP, USERNS_GID_MAP, USERNS_SETGROUPS, PROC_ROOT, PROC_TASKS,
+};
+
+struct linux64_caps {
+    u64 effective, permitted, inheritable;
+};
+
+#define LINUX64_CAP_SYS_ADMIN (1ull << 21)
+#define LINUX64_CAP_SETFCAP (1ull << 31)
+
 enum linux64_task_state {
     TASK_FREE, TASK_RUNNABLE, TASK_WAITING, TASK_VFORK_WAIT, TASK_PIPE_WAIT, TASK_FUTEX_WAIT,
     TASK_POLL_WAIT, TASK_DEAD,
@@ -62,6 +75,7 @@ struct linux64_process {
     uptr executable_path_length;
     i32 pid, ppid, sid, pgid, exit_status;
     unsigned threads;
+    struct linux64_userns *userns;
 };
 
 struct linux64_futex_wait {
@@ -87,6 +101,7 @@ struct linux64_task {
     struct linux64_frame frame;
     struct linux64_address_space *memory;
     struct linux64_process *process;
+    struct linux64_caps caps;
     u64 signal_mask, fs, gs;
     struct linux64_wait wait;
     struct linux64_pipe_io pipe_io;
@@ -102,6 +117,16 @@ struct linux64_task {
 
 extern struct linux64_task *linux64_current;
 
+long linux64_userns_create(struct linux64_userns *parent, struct linux64_userns **result);
+void linux64_userns_retain(struct linux64_userns *ns);
+void linux64_userns_release(struct linux64_userns *ns);
+u32 linux64_visible_id(const struct linux64_userns *ns, bool group, u32 id);
+void linux64_userns_caps(struct linux64_task *task);
+long linux64_capabilities(bool set, uptr header, uptr data);
+long linux64_userns_read(const struct linux64_userns *ns, enum linux64_proc_node file,
+                         uptr buffer, uptr count, uptr offset);
+long linux64_userns_write(struct linux64_userns *ns, enum linux64_proc_node file,
+                          uptr buffer, uptr count, uptr offset);
 void linux64_task_init(void);
 void linux64_task_syscall(struct linux64_frame *frame);
 void linux64_retain_files(struct linux64_process *process);

@@ -187,6 +187,24 @@ def check_pthread(build):
     print('OVMF: Linux pthread TLS, shared process state, futex and group exit: PASS', flush=True)
 
 
+def check_userns(build):
+    probe = (build / 'linux-userns.elf').resolve()
+    marker = 'Linux ELF64 user namespace probe'
+    def drop_root():
+        if os.geteuid() == 0:
+            os.setgroups([])
+            os.setgid(65534)
+            os.setuid(65534)
+    host = subprocess.run([str(probe)], env={}, capture_output=True, timeout=5, preexec_fn=drop_root)
+    if host.returncode == 77:
+        print('Linux: unprivileged user namespaces denied by host policy: SKIP', flush=True)
+    else:
+        assert (host.returncode, host.stdout, host.stderr) == (0, (marker + '\n').encode(), b''), host
+    serial = check_guest('userns', probe.read_bytes(), 'Linux x86-64 exit status=0x00')
+    assert marker in serial, serial
+    print('OVMF: Linux user namespace, ID mappings, scoped caps and nested unshare: PASS', flush=True)
+
+
 def check_fork(build):
     probe = (build / 'linux-fork.elf').resolve()
     marker = 'Linux ELF64 fork probe'
@@ -285,6 +303,7 @@ def main():
     check_poll(build)
     check_fork(build)
     check_pthread(build)
+    check_userns(build)
     check_vfork(build)
     check_exec(build)
 

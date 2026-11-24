@@ -7,6 +7,7 @@ enum {
     SIGCHLD = 17, CLONE_VM = 0x100, CLONE_FS = 0x200, CLONE_FILES = 0x400,
     CLONE_SIGHAND = 0x800, CLONE_VFORK = 0x4000, CLONE_THREAD = 0x10000,
     CLONE_SYSVSEM = 0x40000, CLONE_SETTLS = 0x80000, CLONE_PARENT_SETTID = 0x100000,
+    CLONE_NEWUSER = 0x10000000,
     CHILD_CLEARTID = 0x200000, CHILD_SETTID = 0x1000000,
     PTHREAD_FLAGS = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD |
                     CLONE_SYSVSEM | CLONE_SETTLS | CLONE_PARENT_SETTID | CHILD_CLEARTID,
@@ -123,8 +124,9 @@ static long clone_task(struct linux64_frame *frame, uptr flags, uptr stack, uptr
                        uptr child_tid, uptr tls) {
     bool thread = flags == PTHREAD_FLAGS;
     bool vfork = flags == (CLONE_VM | CLONE_VFORK | SIGCHLD);
+    bool new_user = flags == (CLONE_NEWUSER | SIGCHLD);
     bool shared = thread || vfork;
-    if ((!shared && (stack || (flags & ~(CHILD_CLEARTID | CHILD_SETTID)) != SIGCHLD)) ||
+    if ((!shared && !new_user && (stack || (flags & ~(CHILD_CLEARTID | CHILD_SETTID)) != SIGCHLD)) ||
         !xstate_supported) return -ENOSYS;
     if (stack >= X64_USER_TOP || (thread && (!stack || tls >= X64_USER_TOP - PMM_PAGE_SIZE)))
         return -EINVAL;
@@ -137,6 +139,17 @@ static long clone_task(struct linux64_frame *frame, uptr flags, uptr stack, uptr
     if (!process) return -EAGAIN;
     struct linux64_address_space *memory = shared ? parent->memory : fork_memory(parent->memory);
     if (!memory) return -ENOMEM;
+    struct linux64_userns *ns = parent->process->userns;
+    if (new_user) {
+        long result = linux64_userns_create(ns, &ns);
+        if (result) {
+            child->memory = memory;
+            release_memory(child);
+            return result;
+        }
+    } else if (!thread) {
+        linux64_userns_retain(ns);
+    }
     if (shared) ++memory->references;
     child->frame = *frame;
     child->frame.rax = 0;
@@ -149,12 +162,15 @@ static long clone_task(struct linux64_frame *frame, uptr flags, uptr stack, uptr
     child->finish_wait = false;
     child->vfork_child = 0;
     child->signal_mask = parent->signal_mask;
+    child->caps = parent->caps;
+    if (new_user) linux64_userns_caps(child);
     if (!thread) {
         *process = *parent->process;
         process->pid = child->tid;
         process->ppid = parent->process->pid;
         process->threads = 0;
         process->exit_status = 0;
+        process->userns = ns;
         linux64_retain_files(process);
     }
     ++process->threads;
@@ -200,7 +216,7 @@ static long wait_result(const struct linux64_wait *wait, i32 pid, i32 status) {
             info.signo = SIGCHLD;
             info.code = signal ? CLD_KILLED : CLD_EXITED;
             info.pid = pid;
-            info.uid = LINUX64_UID;
+            info.uid = linux64_visible_id(linux64_current->process->userns, false, LINUX64_UID);
             info.status = signal ? signal : status >> 8;
         }
         uptr header = __builtin_offsetof(struct wait_siginfo, padding);
@@ -316,6 +332,7 @@ bool linux64_commit_exec(struct linux64_frame *frame, uptr root, uptr entry, upt
     }
     task->child_tid = 0;
     task->clear_child_tid = 0;
+    task->caps = (struct linux64_caps){0};
     task->tid = process->pid;
     process->executable_path_length = path_length;
     for (uptr i = 0; i <= path_length; ++i) process->executable_path[i] = path[i];
@@ -410,6 +427,8 @@ static void finish_task(i32 wait_status, bool group) {
     if (process->threads) return;
     process->exit_status = wait_status;
     linux64_close_files(process);
+    linux64_userns_release(process->userns);
+    process->userns = NULL;
     if (process->pid == LINUX64_PID) halt_init((u32)process->exit_status >> 8);
     complete_vfork(process->pid);
     for (unsigned i = 1; i < LINUX64_TASK_COUNT; ++i) {
@@ -427,6 +446,20 @@ static long new_session(void) {
         if (processes[i].pid && processes[i].pgid == process->pid) return -EPERM;
     process->sid = process->pgid = process->pid;
     return process->sid;
+}
+
+static long unshare(uptr flags) {
+    if (!flags) return 0;
+    if (flags != CLONE_NEWUSER) return -ENOSYS;
+    struct linux64_process *process = linux64_current->process;
+    if (process->threads != 1) return -EINVAL;
+    struct linux64_userns *ns;
+    long result = linux64_userns_create(process->userns, &ns);
+    if (result) return result;
+    linux64_userns_release(process->userns);
+    process->userns = ns;
+    linux64_userns_caps(linux64_current);
+    return 0;
 }
 
 static struct linux64_task *pick_task(const struct linux64_task *current) {
@@ -567,6 +600,9 @@ void linux64_task_syscall(struct linux64_frame *frame) {
     case 247: /* waitid */
         frame->rax = (u64)waitid((i32)frame->rdi, (i32)frame->rsi, frame->rdx,
                                 (u32)frame->r10, frame->r8);
+        break;
+    case 272: /* unshare */
+        frame->rax = (u64)unshare((u32)frame->rdi);
         break;
     default:
         frame->rax = (u64)linux64_syscall(number, frame->rdi, frame->rsi, frame->rdx,

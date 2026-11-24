@@ -103,10 +103,12 @@ long linux64_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2,
     if (number == 54 || number == 55)
         return linux64_sockopt(number == 55, (i32)arg0, (i32)arg1, (i32)arg2, arg3, arg4);
     if (number == 63) return linux_uname(arg0);
-    if (number == 102 || number == 107) return LINUX64_UID; /* getuid, geteuid */
-    if (number == 104 || number == 108) return LINUX64_GID; /* getgid, getegid */
-    if (number == 118) return linux_getresid(LINUX64_UID, arg0, arg1, arg2); /* getresuid */
-    if (number == 120) return linux_getresid(LINUX64_GID, arg0, arg1, arg2); /* getresgid */
+    const struct linux64_userns *ns = linux64_current->process->userns;
+    if (number == 102 || number == 107) return linux64_visible_id(ns, false, LINUX64_UID);
+    if (number == 104 || number == 108) return linux64_visible_id(ns, true, LINUX64_GID);
+    if (number == 118) return linux_getresid(linux64_visible_id(ns, false, LINUX64_UID), arg0, arg1, arg2);
+    if (number == 120) return linux_getresid(linux64_visible_id(ns, true, LINUX64_GID), arg0, arg1, arg2);
+    if (number == 125 || number == 126) return linux64_capabilities(number == 126, arg0, arg1);
     if (number == 158) return linux_arch_prctl((i32)arg0, arg1);
     if (number == 202) return linux64_futex(arg0, (u32)arg1, (u32)arg2, arg3, (u32)arg5);
     if (number == 228) return linux64_clock_gettime((i32)arg0, arg1);
