@@ -1585,6 +1585,29 @@ uefi-loader:
 	python3 tools/make_uefi.py
 uefi-x64-smoke:
 	python3 tests/uefi_x64_smoke.py
+
+X64BUILD := $(BUILD)/x86_64
+X64CFLAGS := -m64 -mno-red-zone -mgeneral-regs-only -ffreestanding -fno-pie -fno-pic \
+             -fno-stack-protector -fno-builtin -nostdlib -nostdinc $(SIZE_FLAGS) -Wall -Wextra -std=gnu11
+
+$(X64BUILD):
+	mkdir -p $@
+$(X64BUILD)/entry.o: kernel/x86_64/entry.asm | $(X64BUILD)
+	$(NASM) -f elf64 $< -o $@
+$(X64BUILD)/early-0.o $(X64BUILD)/early-6.o $(X64BUILD)/early-13.o: $(X64BUILD)/early-%.o: kernel/x86_64/early.c kernel/bootinfo.h kernel/types.h | $(X64BUILD)
+	$(CC) $(X64CFLAGS) -DX64_TEST_EXCEPTION=$* -c $< -o $@
+$(X64BUILD)/kernel.elf: $(X64BUILD)/entry.o $(X64BUILD)/early-0.o kernel/x86_64/linker.ld
+	$(LD) -m elf_x86_64 -T kernel/x86_64/linker.ld -nostdlib $(filter %.o,$^) -o $@
+$(X64BUILD)/kernel-6.elf $(X64BUILD)/kernel-13.elf: $(X64BUILD)/kernel-%.elf: $(X64BUILD)/entry.o $(X64BUILD)/early-%.o kernel/x86_64/linker.ld
+	$(LD) -m elf_x86_64 -T kernel/x86_64/linker.ld -nostdlib $(filter %.o,$^) -o $@
+$(X64BUILD)/kernel.bin $(X64BUILD)/kernel-6.bin $(X64BUILD)/kernel-13.bin: %.bin: %.elf
+	$(OBJCOPY) -O binary $< $@
+
+.PHONY: kernel-x64 kernel-x64-smoke
+kernel-x64: $(X64BUILD)/kernel.bin
+kernel-x64-smoke: kernel-x64 $(X64BUILD)/kernel-6.bin $(X64BUILD)/kernel-13.bin
+	python3 tests/kernel_x64_smoke.py
+
 uefi-smoke: $(HWBUILD)/kernel.bin $(BUILD)/myfs $(BUILD)/ld.so $(BUILD)/user/libc.so $(addprefix $(BUILD)/user/,sh cat stat poweroff sync)
 	python3 tests/uefi_smoke.py
 uefi-installer-smoke: $(HWBUILD)/kernel.bin $(BUILD)/myfs $(BUILD)/ld.so $(BUILD)/user/libc.so $(BUILD)/user/installercheck $(addprefix $(BUILD)/user/,sh setup cat mkdir sync stat poweroff)
