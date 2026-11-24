@@ -440,16 +440,61 @@ __attribute__((noreturn)) void mprotect_relro_fault(void) {
     finish(20);
 }
 
+static word free_memory(void) {
+    word info[14];
+    return call(99, (word)info, 0, 0, 0, 0, 0) ? 0 : info[5];
+}
+
+__attribute__((noreturn)) void mprotect_lazy(void) {
+    const word size = 2 * 1024 * 1024, address = 0x3000000000ul;
+    long base = mmap(address, size, 0, PRIVATE_ANON | 0x100000, -1, 0);
+    word before = free_memory();
+    if (base != (long)address || !before || mprotect(base, size, 3)) finish(126);
+    word after = free_memory();
+    if (!after || after > before || before - after > 4 * PAGE) finish(126);
+    volatile unsigned char *data = (void *)base;
+    if (data[0] || free_memory() != after - PAGE ||
+        call(99, base + PAGE, 0, 0, 0, 0, 0) || free_memory() != after - 2 * PAGE)
+        finish(127);
+    if (mprotect(base + 2 * PAGE, PAGE, 1) ||
+        call(99, base + 2 * PAGE, 0, 0, 0, 0, 0) != -14 ||
+        free_memory() != after - 2 * PAGE) finish(127);
+    data[0] = 0x5a;
+    if (discard(base, PAGE) || free_memory() != after - PAGE || data[0]) finish(128);
+    long child = call(57, 0, 0, 0, 0, 0, 0);
+    if (!child) {
+        data[3 * PAGE] = 0x5a;
+        finish(0);
+    }
+    int status;
+    if (child < 0 || call(61, child, (word)&status, 0, 0, 0, 0) != child || status ||
+        free_memory() != after - 2 * PAGE || data[3 * PAGE] || munmap(base, size))
+        finish(129);
+    finish(0);
+}
+
 __attribute__((noreturn)) void mprotect_sparse_oom(void) {
-    const word size = 0x800000000ul;
-    long base = mmap(0, size, 0, 0x22, -1, 0);
-    if (base < 0 || mprotect(base, 0x1000, 3)) finish(28);
+    const word table_span = 2 * 1024 * 1024, address = 0x3000000000ul, pressure = 0x4000000000ul;
+    const word size = 3 * table_span, slack = table_span / 2, fixed = PRIVATE_ANON | 0x100000;
+    long base = mmap(address, size, 0, fixed, -1, 0);
+    if (base != (long)address || mprotect(base, PAGE, 3) ||
+        mmap(pressure, PAGE, 3, fixed, -1, 0) != (long)pressure) finish(28);
     volatile unsigned char *data = (void *)base;
     data[0] = 0x5a;
-    if (mprotect(base, size, 3) != -12 || data[0] != 0x5a ||
-        mmap(base + 0x1000, 0x1000, 3, 0x100022, -1, 0) != -17 ||
-        mprotect(base + 0x1000, 0x1000, 3) || data[0x1000] != 0 ||
-        munmap(base, size)) finish(29);
+    word available = free_memory();
+    if (available <= slack) finish(28);
+    word bulk_size = available - slack;
+    long bulk = mmap(0, bulk_size, 3, PRIVATE_ANON, -1, 0);
+    available = free_memory();
+    if (bulk < 0 || available <= PAGE || available > table_span ||
+        mmap(pressure + PAGE, available - PAGE, 3, fixed, -1, 0) != (long)(pressure + PAGE) ||
+        free_memory() != PAGE) finish(28);
+    /* Первая таблица уже есть. Из двух следующих помещается только одна. */
+    if (mprotect(base, size, 3) != -12 || free_memory() != PAGE || data[0] != 0x5a ||
+        call(99, base + PAGE, 0, 0, 0, 0, 0) != -14 ||
+        mmap(base + PAGE, PAGE, 3, fixed, -1, 0) != -17) finish(29);
+    if (munmap(pressure, available) || munmap(bulk, bulk_size) ||
+        mprotect(base + PAGE, PAGE, 3) || data[PAGE] || munmap(base, size)) finish(29);
     finish(0);
 }
 
