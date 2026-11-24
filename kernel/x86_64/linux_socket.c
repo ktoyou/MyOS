@@ -87,14 +87,15 @@ long linux64_socket_create(i32 domain, u32 type, i32 protocol, struct linux64_so
 }
 
 long linux64_socket_pair(i32 domain, u32 type, i32 protocol, struct linux64_socket *ends[2]) {
+    u32 base = type & SOCK_TYPE_MASK;
     if (type & ~(SOCK_TYPE_MASK | SOCK_CLOEXEC | SOCK_NONBLOCK)) return -EINVAL;
     if (domain != AF_UNIX) return -EAFNOSUPPORT;
-    if ((type & SOCK_TYPE_MASK) != SOCK_SEQPACKET) return -ESOCKTNOSUPPORT;
+    if (base != SOCK_STREAM && base != SOCK_SEQPACKET) return -ESOCKTNOSUPPORT;
     if (protocol != 0 && protocol != AF_UNIX) return -EPROTONOSUPPORT;
     struct linux64_socket *pair = free_pair();
     if (!pair) return -EMFILE;
-    pair[0] = (struct linux64_socket){.peer = &pair[1], .type = SOCK_SEQPACKET, .open = true};
-    pair[1] = (struct linux64_socket){.peer = &pair[0], .type = SOCK_SEQPACKET, .open = true};
+    pair[0] = (struct linux64_socket){.peer = &pair[1], .type = base, .open = true};
+    pair[1] = (struct linux64_socket){.peer = &pair[0], .type = base, .open = true};
     ends[0] = &pair[0];
     ends[1] = &pair[1];
     return 0;

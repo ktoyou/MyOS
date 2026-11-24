@@ -37,8 +37,12 @@ static long call(word number, word a0, word a1, word a2, word a3, word a4) {
     return (long)number;
 }
 
+static long pair_type(int *ends, word type) {
+    return call(53, AF_UNIX, type | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, (word)ends, 0);
+}
+
 static long pair(int *ends) {
-    return call(53, AF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, (word)ends, 0);
+    return pair_type(ends, SOCK_SEQPACKET);
 }
 
 static long passcred(int fd, const int *enabled, word length) {
@@ -360,23 +364,23 @@ static long check_shutdown(void) {
     return close_fd(ends[0]) || close_fd(ends[1]) ? 29 : 0;
 }
 
-static long check_fd_limit(void) {
+static long check_fd_limit(word type) {
     int ends[14][2], spare[2];
     for (unsigned i = 0; i < 14; ++i)
-        if (pair(ends[i])) return 9;
-    if (pair(spare) != -24) return 10;
+        if (pair_type(ends[i], type)) return 9;
+    if (pair_type(spare, type) != -24) return 10;
     long last = call(319, (word)"", 0, 0, 0, 0);
     if (last != 31 || close_fd(last)) return 11;
     for (unsigned i = 0; i < 14; ++i)
         if (close_fd(ends[i][0]) || close_fd(ends[i][1])) return 12;
-    if (pair(spare) || spare[0] != 3 || spare[1] != 4 ||
+    if (pair_type(spare, type) || spare[0] != 3 || spare[1] != 4 ||
         close_fd(spare[0]) || close_fd(spare[1])) return 13;
     int survivors[27];
     for (unsigned i = 0; i < 27; ++i) {
-        if (pair(spare) || close_fd(spare[1])) return 19;
+        if (pair_type(spare, type) || close_fd(spare[1])) return 19;
         survivors[i] = spare[0];
     }
-    if (pair(spare) || close_fd(spare[0]) || close_fd(spare[1])) return 20;
+    if (pair_type(spare, type) || close_fd(spare[0]) || close_fd(spare[1])) return 20;
     for (unsigned i = 0; i < 27; ++i)
         if (close_fd(survivors[i])) return 21;
     return 0;
@@ -440,9 +444,76 @@ static long check_seqpacket_send_wait(void) {
     return 0;
 }
 
+static long check_stream_pair_queue(int left, int right) {
+    static char block[2048];
+    long queued = 0;
+    while (queued < 16 * 1024 * 1024) {
+        long sent = call(1, left, (word)block, sizeof(block), 0, 0);
+        if (sent == -11) break;
+        if (sent <= 0) return 77;
+        queued += sent;
+    }
+    if (!queued || queued >= 16 * 1024 * 1024) return 77;
+    while (queued) {
+        long received = call(0, right, (word)block, sizeof(block), 0, 0);
+        if (received <= 0 || received > queued) return 78;
+        queued -= received;
+    }
+    return call(1, left, (word)"p", 1, 0, 0) != 1 ||
+           call(0, right, (word)block, 1, 0, 0) != 1 || block[0] != 'p' ? 79 : 0;
+}
+
+static long check_stream_pair(void) {
+    int ends[2];
+    for (unsigned i = 0; i < 40; ++i)
+        if (pair_type(0, SOCK_STREAM) != -14) return 71;
+    if (pair_type(ends, SOCK_STREAM) || ends[0] != 3 || ends[1] != 4) return 72;
+    for (unsigned i = 0; i < 2; ++i) {
+        int type = 0;
+        unsigned length = sizeof(type);
+        unsigned short family = 0;
+        unsigned name_length = sizeof(family);
+        if (option(ends[i], SO_TYPE, &type, &length) || type != SOCK_STREAM ||
+            length != sizeof(type) || call(72, ends[i], 1, 0, 0, 0) != 1 ||
+            call(72, ends[i], 3, 0, 0, 0) != 0x802 ||
+            call(51, ends[i], (word)&family, (word)&name_length, 0, 0) ||
+            family != AF_UNIX || name_length != sizeof(family)) return 73;
+        family = 0;
+        if (call(52, ends[i], (word)&family, (word)&name_length, 0, 0) ||
+            family != AF_UNIX || name_length != sizeof(family)) return 73;
+    }
+    char bytes[4];
+    if (call(0, ends[1], (word)bytes, 1, 0, 0) != -11 ||
+        call(1, ends[0], (word)"ab", 2, 0, 0) != 2 ||
+        call(1, ends[0], (word)"cd", 2, 0, 0) != 2 ||
+        call(0, ends[1], (word)bytes, 1, 0, 0) != 1 || bytes[0] != 'a' ||
+        call(0, ends[1], (word)bytes, sizeof(bytes), 0, 0) != 3 ||
+        bytes[0] != 'b' || bytes[1] != 'c' || bytes[2] != 'd') return 74;
+    long queue_status = check_stream_pair_queue(ends[0], ends[1]);
+    if (queue_status) return queue_status;
+    if (call(72, ends[0], 4, 0, 0, 0) || call(72, ends[1], 4, 0, 0, 0)) return 75;
+    long pid = call(57, 0, 0, 0, 0, 0);
+    if (!pid) {
+        int failed = close_fd(ends[0]) || call(0, ends[1], (word)bytes, 1, 0, 0) != 1 ||
+                     bytes[0] != 'q' || call(0, ends[1], (word)bytes, 1, 0, 0) ||
+                     call(1, ends[1], (word)"r", 1, 0, 0) != 1;
+        call(60, failed, 0, 0, 0, 0);
+        __builtin_trap();
+    }
+    int status;
+    long duplicate = call(32, ends[0], 0, 0, 0, 0);
+    if (pid < 0 || duplicate < 3 || close_fd(ends[1]) ||
+        call(1, ends[0], (word)"q", 1, 0, 0) != 1 || shutdown((int)duplicate, SHUT_WR) ||
+        close_fd((int)duplicate) || call(0, ends[0], (word)bytes, 1, 0, 0) != 1 ||
+        bytes[0] != 'r' || call(0, ends[0], (word)bytes, 1, 0, 0) ||
+        call(61, pid, (word)&status, 0, 0, 0) != pid || status || close_fd(ends[0])) return 76;
+    return 0;
+}
+
 static long check(void) {
     long status = check_stream();
     if (!status) status = check_stream_fd_limit();
+    if (!status) status = check_stream_pair();
     struct unix_address address = {AF_UNIX, "/tmp/myos-socket-0000000000"};
     unsigned pid = (unsigned)call(39, 0, 0, 0, 0, 0);
     for (unsigned i = sizeof("/tmp/myos-socket-0000000000") - 2; pid; --i, pid /= 10)
@@ -463,7 +534,8 @@ static long check(void) {
     if (!status) status = check_packets(ends[0], ends[1]);
     if (!status) status = check_close(ends[0], ends[1]);
     if (!status) status = check_shutdown();
-    return status ? status : check_fd_limit();
+    if (!status) status = check_fd_limit(SOCK_SEQPACKET);
+    return status ? status : check_fd_limit(SOCK_STREAM);
 }
 
 __attribute__((noreturn)) void _start(void) {
