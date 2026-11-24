@@ -329,8 +329,7 @@ bool linux64_run(const struct linux64_file *file, const char *path, uptr path_le
     };
     uptr entry, stack, data_bytes;
     if (prepare_image(file, source, &args, BOOT_STACK_SIZE, &entry, &stack, &data_bytes, NULL, false, (u64)-1) ||
-        !linux64_enable_syscall()) return false;
-    linux64_task_init(data_bytes);
+        !linux64_enable_syscall() || !linux64_task_init(data_bytes)) return false;
     linux64_use_files(source, path, path_length);
     linux64_reset_signals();
     linux64_clock_init();

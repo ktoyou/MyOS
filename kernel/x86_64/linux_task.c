@@ -28,7 +28,7 @@ static struct linux64_address_space address_spaces[LINUX64_PROCESS_COUNT];
 struct linux64_task *linux64_current = &tasks[0];
 static i32 next_pid = LINUX64_PID + 1;
 static u64 xfeatures;
-static bool xstate_supported;
+static u32 xstate_bytes, xstate_pages;
 
 extern __attribute__((noreturn)) void linux64_task_resume(struct linux64_frame *frame);
 
@@ -46,7 +46,42 @@ u16 linux64_task_count(void) {
     return count;
 }
 
-void linux64_task_init(uptr data_bytes) {
+static void init_xstate(void) {
+    uptr cr0, cr4;
+    __asm__ volatile("mov %%cr0,%0" : "=r"(cr0));
+    /* FXSAVE и SSE не должны зависеть от настроек, оставленных прошивкой. */
+    cr0 = (cr0 & ~((1ul << 2) | (1ul << 3))) | (1ul << 1) | (1ul << 5);
+    __asm__ volatile("mov %0,%%cr0" : : "r"(cr0) : "memory");
+    __asm__ volatile("mov %%cr4,%0" : "=r"(cr4));
+    cr4 |= (1ul << 9) | (1ul << 10);
+    __asm__ volatile("mov %0,%%cr4" : : "r"(cr4) : "memory");
+    if (!(cr4 & (1ul << 18))) {
+        xstate_bytes = 512;
+        return;
+    }
+    u32 low, high, eax = 0xd, size, ecx = 0, edx;
+    __asm__ volatile("xgetbv" : "=a"(low), "=d"(high) : "c"(0));
+    __asm__ volatile("cpuid" : "+a"(eax), "=b"(size), "+c"(ecx), "=d"(edx));
+    xfeatures = ((u64)high << 32) | low;
+    if (size >= 576 && size <= LINUX64_XSTATE_SIZE) xstate_bytes = size;
+}
+
+static bool allocate_xstate(struct linux64_task *task) {
+    task->xstate_physical = pmm64_alloc_contiguous(xstate_pages);
+    return task->xstate_physical != 0;
+}
+
+static void release_xstate(struct linux64_task *task) {
+    if (!task->xstate_physical) return;
+    for (u32 page = 0; page < xstate_pages; ++page)
+        pmm64_free(task->xstate_physical + (uptr)page * PMM_PAGE_SIZE);
+    task->xstate_physical = 0;
+}
+
+bool linux64_task_init(uptr data_bytes) {
+    init_xstate();
+    xstate_pages = (xstate_bytes + PMM_PAGE_SIZE - 1) / PMM_PAGE_SIZE;
+    if (!xstate_pages || !allocate_xstate(linux64_current)) return false;
     processes[0] = (struct linux64_process){
         .pid = LINUX64_PID, .sid = LINUX64_PID, .pgid = LINUX64_PID, .threads = 1,
         .pid_ns = linux64_pidns_init(), .pid_identity = linux64_pid_init(),
@@ -61,21 +96,7 @@ void linux64_task_init(uptr data_bytes) {
     linux64_current->memory->data_bytes = data_bytes;
     linux64_current->memory->references = 1;
     linux64_current->state = TASK_RUNNABLE;
-    xstate_supported = true;
-    uptr cr0, cr4;
-    __asm__ volatile("mov %%cr0,%0" : "=r"(cr0));
-    /* FXSAVE и SSE не должны зависеть от настроек, оставленных прошивкой. */
-    cr0 = (cr0 & ~((1ul << 2) | (1ul << 3))) | (1ul << 1) | (1ul << 5);
-    __asm__ volatile("mov %0,%%cr0" : : "r"(cr0) : "memory");
-    __asm__ volatile("mov %%cr4,%0" : "=r"(cr4));
-    cr4 |= (1ul << 9) | (1ul << 10);
-    __asm__ volatile("mov %0,%%cr4" : : "r"(cr4) : "memory");
-    if (!(cr4 & (1ul << 18))) return;
-    u32 low, high, eax = 0xd, size, ecx = 0, edx;
-    __asm__ volatile("xgetbv" : "=a"(low), "=d"(high) : "c"(0));
-    __asm__ volatile("cpuid" : "+a"(eax), "=b"(size), "+c"(ecx), "=d"(edx));
-    xfeatures = ((u64)high << 32) | low;
-    xstate_supported = size <= LINUX64_XSTATE_SIZE;
+    return true;
 }
 
 static void save_state(struct linux64_task *task) {
@@ -83,11 +104,11 @@ static void save_state(struct linux64_task *task) {
     task->gs = linux64_rdmsr(LINUX64_GS_BASE);
     __asm__ volatile("mov %%fs,%0; mov %%gs,%1" : "=r"(task->fs_selector), "=r"(task->gs_selector));
     __asm__ volatile("mov %%ds,%0; mov %%es,%1" : "=r"(task->ds_selector), "=r"(task->es_selector));
+    void *state = pmm64_pointer(task->xstate_physical);
     if (xfeatures) {
-        __asm__ volatile("xsave64 %0" : "=m"(task->xstate)
-                         : "a"((u32)xfeatures), "d"((u32)(xfeatures >> 32)) : "memory");
+        __asm__ volatile("xsave64 (%0)" :: "r"(state), "a"((u32)xfeatures), "d"((u32)(xfeatures >> 32)) : "memory");
     } else {
-        __asm__ volatile("fxsave64 %0" : "=m"(task->xstate) : : "memory");
+        __asm__ volatile("fxsave64 (%0)" :: "r"(state) : "memory");
     }
 }
 
@@ -98,11 +119,12 @@ static void restore_state(const struct linux64_task *task) {
                      "r"(task->gs_selector) : "memory");
     linux64_wrmsr(LINUX64_FS_BASE, task->fs);
     linux64_wrmsr(LINUX64_GS_BASE, task->gs);
+    const void *state = pmm64_pointer(task->xstate_physical);
     if (xfeatures) {
-        __asm__ volatile("xrstor64 %0" : : "m"(task->xstate),
+        __asm__ volatile("xrstor64 (%0)" :: "r"(state),
                          "a"((u32)xfeatures), "d"((u32)(xfeatures >> 32)) : "memory");
     } else {
-        __asm__ volatile("fxrstor64 %0" : : "m"(task->xstate) : "memory");
+        __asm__ volatile("fxrstor64 (%0)" :: "r"(state) : "memory");
     }
 }
 
@@ -164,9 +186,9 @@ static long clone_task(struct linux64_frame *frame, uptr flags, uptr stack, uptr
     bool shared = thread || vfork;
     if (new_pid && (flags & (CLONE_THREAD | CLONE_PARENT))) return -EINVAL;
     if (new_user && (flags & CLONE_FS)) return -EINVAL;
-    if ((!shared && !shared_fs && ((stack && !new_user && !new_pid) ||
-                     (flags & ~(CHILD_CLEARTID | CHILD_SETTID | CLONE_NEWUSER | CLONE_NEWPID)) != SIGCHLD)) ||
-        !xstate_supported) return -ENOSYS;
+    if (!shared && !shared_fs && ((stack && !new_user && !new_pid) ||
+        (flags & ~(CHILD_CLEARTID | CHILD_SETTID | CLONE_NEWUSER | CLONE_NEWPID)) != SIGCHLD))
+        return -ENOSYS;
     if (stack >= X64_USER_TOP || ((thread || fs_vfork) && (!stack || tls >= X64_USER_TOP - PMM_PAGE_SIZE)))
         return -EINVAL;
     unsigned slot = 1;
@@ -218,8 +240,9 @@ static long clone_task(struct linux64_frame *frame, uptr flags, uptr stack, uptr
             return -ENOMEM;
         }
     }
-    long local = linux64_pid_allocate(pid_ns, next_pid, identity);
+    long local = allocate_xstate(child) ? linux64_pid_allocate(pid_ns, next_pid, identity) : -ENOMEM;
     if (local < 0) {
+        release_xstate(child);
         release_memory(child);
         linux64_pid_release(identity);
         if (!thread) {
@@ -406,7 +429,6 @@ static void complete_vfork(i32 child_pid) {
 /* Новый CR3 уже активен, поэтому последнее освобождение старого корня безопасно. */
 bool linux64_commit_exec(struct linux64_frame *frame, uptr root, uptr entry, uptr stack, uptr data_bytes,
                         const char *path, uptr path_length) {
-    if (!xstate_supported) return false;
     struct linux64_task *task = linux64_current;
     struct linux64_process *process = task->process;
     struct linux64_address_space *old = task->memory;
@@ -436,13 +458,14 @@ bool linux64_commit_exec(struct linux64_frame *frame, uptr root, uptr entry, upt
     task->fs = task->gs = 0;
     task->fs_selector = task->gs_selector = 0;
     task->ds_selector = task->es_selector = 0x1b;
-    for (uptr i = 0; i < sizeof(task->xstate); ++i) task->xstate[i] = 0;
+    u8 *state = pmm64_pointer(task->xstate_physical);
+    for (u32 i = 0; i < xstate_bytes; ++i) state[i] = 0;
     if (!xfeatures) {
         /* FXRSTOR принимает начальные x87 control word и MXCSR явно. */
-        task->xstate[0] = 0x7f;
-        task->xstate[1] = 0x03;
-        task->xstate[24] = 0x80;
-        task->xstate[25] = 0x1f;
+        state[0] = 0x7f;
+        state[1] = 0x03;
+        state[24] = 0x80;
+        state[25] = 0x1f;
     }
     restore_state(task);
     *frame = (struct linux64_frame){.rip = entry, .cs = 0x23, .rflags = 2, .rsp = stack, .ss = 0x1b};
@@ -541,6 +564,7 @@ static void stop_task(struct linux64_task *task) {
     linux64_socket_wait_finish(task);
     linux64_eventfd_wait_finish(task);
     linux64_epoll_wait_finish(task);
+    release_xstate(task);
     task->state = TASK_DEAD;
     --task->process->threads;
 }

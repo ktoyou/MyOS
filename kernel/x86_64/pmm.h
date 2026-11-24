@@ -16,6 +16,7 @@ struct boot_region {
 struct gop64_framebuffer;
 bool pmm64_init(const struct boot_info *boot, const struct gop64_framebuffer *fb);
 uptr pmm64_alloc(void);
+uptr pmm64_alloc_contiguous(u32 count);
 bool pmm64_retain(uptr physical);
 bool pmm64_has_aliases(uptr physical);
 bool pmm64_free(uptr physical);
