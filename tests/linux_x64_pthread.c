@@ -3,6 +3,7 @@ typedef unsigned long word;
 static char stack[16384] __attribute__((aligned(16)));
 static const word tls = 0x123456789abcdef0ul;
 static volatile unsigned ready, clear_tid, leader_tid;
+static volatile unsigned timed_word;
 static volatile int parent_tid, result;
 static long pid, pipe_write, inherited_no_new_privs;
 
@@ -45,6 +46,19 @@ static long futex(volatile unsigned *address, unsigned op, unsigned value, unsig
     return call(202, (word)address, op, value, 0, 0, bits);
 }
 
+struct timespec {
+    long seconds, nanos;
+};
+
+static long futex_timed(volatile unsigned *address, unsigned op, unsigned value, unsigned bits,
+                        const struct timespec *timeout) {
+    return call(202, (word)address, op, value, (word)timeout, 0, bits);
+}
+
+static long clock_time(unsigned clock, struct timespec *time) {
+    return call(228, clock, (word)time, 0, 0, 0, 0);
+}
+
 static __attribute__((noreturn)) void finish(word number, long status) {
     simple(number, status);
     __builtin_trap();
@@ -53,6 +67,13 @@ static __attribute__((noreturn)) void finish(word number, long status) {
 static int mode;
 
 __attribute__((noreturn)) void worker(void) {
+    if (mode == 3) {
+        const struct timespec delay = {0, 25000000};
+        result = futex_timed(&timed_word, 0x80, 0, 0, &delay) == -110 ? 0 : 21;
+        timed_word = 1;
+        futex(&timed_word, 0x8a, 1, 2);
+        finish(60, 0);
+    }
     while (mode == 2) futex(&ready, 0x80, 0, 0);
     if (mode) {
         while (leader_tid) futex(&leader_tid, 0x109, 1, -1);
@@ -86,8 +107,9 @@ static int check_thread(void) {
     parent_tid = 0;
     long child = clone_thread((word)(stack + sizeof(stack)), &parent_tid, &clear_tid, &tls);
     if (child <= 0 || parent_tid != child || simple(186, 0) != pid) return 6;
+    const struct timespec distant = {__LONG_MAX__, 999999999};
     if (futex(&ready, 0x80, 1, 0) != -11 || futex(&ready, 0x89, 0, 0) != -22 ||
-        futex(&ready, 0x89, 0, 1)) return 7;
+        futex_timed(&ready, 0x89, 0, 1, &distant)) return 7;
     while (clear_tid) {
         long error = futex(&clear_tid, 0x109, 1, -1);
         if (error && error != -11) return 8;
@@ -101,6 +123,55 @@ static int check_thread(void) {
         call(14, 2, 0, (word)&mask, 8, 0, 0) || mask & (1ul << (12 - 1))) return 9;
     if (call(61, child, 0, 1, 0, 0, 0) != -10) return 10;
     return 0;
+}
+
+static int check_timeout(void) {
+    const struct timespec past = {0, 0};
+    const struct timespec bad_seconds = {-1, 0}, bad_nanos = {0, 1000000000};
+    if (futex_timed(&timed_word, 0x89, 0, 1, &past) != -110 ||
+        futex_timed(&timed_word, 0x189, 0, 1, &past) != -110 ||
+        futex_timed(&timed_word, 0x89, 1, 1, &past) != -11 ||
+        futex_timed(&timed_word, 0x89, 0, 0, &past) != -22 ||
+        futex_timed(&timed_word, 0x89, 0, 1, &bad_seconds) != -22 ||
+        futex_timed(&timed_word, 0x80, 0, 0, &bad_nanos) != -22 ||
+        futex_timed(&timed_word, 0x89, 0, 1, (const struct timespec *)1) != -14) return 19;
+
+    const unsigned operations[] = {0x80, 0x89, 0x189};
+    for (unsigned i = 0; i < sizeof(operations) / sizeof(operations[0]); ++i) {
+        struct timespec before, after, timeout = {0, 20000000};
+        unsigned op = operations[i];
+        if (clock_time(1, &before)) return 20;
+        if (op != 0x80) {
+            if (clock_time(op == 0x189 ? 0 : 1, &timeout)) return 20;
+            timeout.nanos += 20000000;
+            if (timeout.nanos >= 1000000000) {
+                ++timeout.seconds;
+                timeout.nanos -= 1000000000;
+            }
+        }
+        if (futex_timed(&timed_word, op, 0, 1, &timeout) != -110 || clock_time(1, &after) ||
+            (after.seconds - before.seconds) * 1000000000 + after.nanos - before.nanos < 20000000)
+            return 20;
+    }
+    return 0;
+}
+
+static int check_timeout_from_other_thread(void) {
+    mode = 3;
+    clear_tid = 1;
+    result = 21;
+    struct timespec timeout;
+    if (clock_time(1, &timeout)) return 22;
+    timeout.seconds += 2;
+    if (clone_thread((word)(stack + sizeof(stack)), &parent_tid, &clear_tid, &tls) <= 0) return 22;
+    long woke = futex_timed(&timed_word, 0x89, 0, 2, &timeout);
+    if (woke && woke != -11) return 22;
+    while (clear_tid) {
+        long error = futex(&clear_tid, 0x109, 1, -1);
+        if (error && error != -11) return 22;
+    }
+    mode = 0;
+    return result;
 }
 
 static int check_process_exit(int test_mode) {
@@ -126,6 +197,9 @@ void _start(void) {
     char system[390];
     if (inherited_no_new_privs < 0 || inherited_no_new_privs > 1 || simple(63, (word)system) ||
         (system[0] == 'M' && inherited_no_new_privs)) finish(231, 17);
+    int timed = check_timeout();
+    if (!timed) timed = check_timeout_from_other_thread();
+    if (timed) finish(231, timed);
     for (int i = 0; i < 10; ++i) {
         int status = check_thread();
         if (status) finish(231, status);
