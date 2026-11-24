@@ -23,8 +23,8 @@ enum {
 };
 
 static struct linux64_task tasks[LINUX64_TASK_COUNT];
-static struct linux64_process processes[LINUX64_TASK_COUNT];
-static struct linux64_address_space address_spaces[LINUX64_TASK_COUNT];
+static struct linux64_process processes[LINUX64_PROCESS_COUNT];
+static struct linux64_address_space address_spaces[LINUX64_PROCESS_COUNT];
 struct linux64_task *linux64_current = &tasks[0];
 static i32 next_pid = LINUX64_PID + 1;
 static u64 xfeatures;
@@ -34,10 +34,11 @@ extern __attribute__((noreturn)) void linux64_task_resume(struct linux64_frame *
 
 _Static_assert(sizeof(struct linux64_frame) == 20 * sizeof(u64), "Linux syscall frame size");
 _Static_assert(__builtin_offsetof(struct linux64_frame, rip) == 15 * sizeof(u64), "Linux IRET frame");
+_Static_assert(LINUX64_PROCESS_COUNT <= LINUX64_TASK_COUNT, "Linux process/task capacity");
 
 u16 linux64_task_count(void) {
     u16 count = 0;
-    for (unsigned i = 0; i < LINUX64_TASK_COUNT; ++i) {
+    for (unsigned i = 0; i < LINUX64_PROCESS_COUNT; ++i) {
         const struct linux64_process *process = &processes[i];
         /* Завершённый процесс учитывается, пока родитель не забрал его статус. */
         if (process->pid) count += process->threads ? process->threads : 1;
@@ -104,7 +105,7 @@ static void restore_state(const struct linux64_task *task) {
 }
 
 static struct linux64_address_space *unused_memory(void) {
-    for (unsigned i = 0; i < LINUX64_TASK_COUNT; ++i)
+    for (unsigned i = 0; i < LINUX64_PROCESS_COUNT; ++i)
         if (!address_spaces[i].references) return &address_spaces[i];
     return NULL;
 }
@@ -131,14 +132,14 @@ static void release_memory(struct linux64_task *task) {
 }
 
 static struct linux64_process *unused_process(void) {
-    for (unsigned i = 1; i < LINUX64_TASK_COUNT; ++i)
+    for (unsigned i = 1; i < LINUX64_PROCESS_COUNT; ++i)
         if (!processes[i].pid) return &processes[i];
     return NULL;
 }
 
 const struct linux64_process *linux64_process_by_pid(i32 pid) {
     if (!pid) return NULL;
-    for (unsigned i = 0; i < LINUX64_TASK_COUNT; ++i)
+    for (unsigned i = 0; i < LINUX64_PROCESS_COUNT; ++i)
         if (processes[i].pid == pid) return &processes[i];
     return NULL;
 }
@@ -324,7 +325,7 @@ static long wait_error(const struct linux64_wait *wait, i32 error) {
 static long wait_child(struct linux64_wait wait) {
     struct linux64_task *parent = linux64_current;
     bool found = false;
-    for (unsigned i = 1; i < LINUX64_TASK_COUNT; ++i) {
+    for (unsigned i = 1; i < LINUX64_PROCESS_COUNT; ++i) {
         struct linux64_process *child = &processes[i];
         if (!wait_matches(parent->process, child, &wait)) continue;
         found = true;
@@ -372,7 +373,7 @@ static long waitid(i32 kind, i32 id, uptr address, u32 options, uptr usage) {
 }
 
 static void publish_child_exit(struct linux64_process *child) {
-    for (unsigned i = 0; i < LINUX64_TASK_COUNT; ++i) {
+    for (unsigned i = 0; i < LINUX64_PROCESS_COUNT; ++i) {
         struct linux64_process *parent = &processes[i];
         if (parent->pid != child->ppid) continue;
         const struct linux64_sigaction *action = &parent->actions[SIGCHLD - 1];
@@ -555,7 +556,7 @@ static void shutdown_pid_namespace(struct linux64_task *reaper) {
         release_memory(victim);
         victim->state = TASK_FREE;
     }
-    for (unsigned i = 1; i < LINUX64_TASK_COUNT; ++i) {
+    for (unsigned i = 1; i < LINUX64_PROCESS_COUNT; ++i) {
         struct linux64_process *victim = &processes[i];
         if (victim == reaper->process || !victim->pid ||
             !linux64_pidns_contains(ns, victim->pid_ns)) continue;
@@ -593,7 +594,7 @@ static void finish_task(i32 wait_status, bool group) {
     if (process->pid == namespace_init) {
         shutdown_pid_namespace(task);
     } else {
-        for (unsigned i = 1; i < LINUX64_TASK_COUNT; ++i) {
+        for (unsigned i = 1; i < LINUX64_PROCESS_COUNT; ++i) {
             struct linux64_process *orphan = &processes[i];
             if (!orphan->pid || orphan->ppid != process->pid) continue;
             orphan->ppid = namespace_init;
@@ -605,7 +606,7 @@ static void finish_task(i32 wait_status, bool group) {
 
 static long new_session(void) {
     struct linux64_process *process = linux64_current->process;
-    for (unsigned i = 0; i < LINUX64_TASK_COUNT; ++i)
+    for (unsigned i = 0; i < LINUX64_PROCESS_COUNT; ++i)
         if (processes[i].pid && processes[i].pgid == process->pid) return -EPERM;
     process->sid = process->pgid = process->pid;
     linux64_pid_retain(process->pid_identity);

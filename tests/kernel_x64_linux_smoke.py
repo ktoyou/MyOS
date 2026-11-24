@@ -221,7 +221,7 @@ def check_pthread(build):
     assert (host.returncode, host.stdout, host.stderr) == (0, (marker + '\n').encode(), b''), host
     serial = check_guest('pthread', probe.read_bytes(), 'Linux x86-64 exit status=0x00')
     assert marker in serial, serial
-    print('OVMF: Linux pthread TLS, shared process state, futex and group exit: PASS', flush=True)
+    print('OVMF: Linux pthread TLS, futex, exit and task/process capacity: PASS', flush=True)
 
 
 def drop_root():

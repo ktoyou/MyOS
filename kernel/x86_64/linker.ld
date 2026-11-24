@@ -18,5 +18,8 @@ SECTIONS {
     __kernel_end = .;
     ASSERT(_start == 0x100000, "x86-64 entry must match the UEFI load address")
     ASSERT(__kernel_end <= 0x1000000, "x86-64 image exceeds the UEFI kernel arena")
+    /* Пользовательский ELF в Linux ABI может начинаться с 0x400000. */
+    ASSERT(!DEFINED(linux64_syscall) || __kernel_end <= 0x400000,
+           "x86-64 Linux kernel overlaps the user ELF arena")
     /DISCARD/ : { *(.comment) *(.eh_frame*) *(.note*) }
 }
