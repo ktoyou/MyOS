@@ -284,6 +284,38 @@ def check_vfork(build):
     print('OVMF: Linux vfork, shared address space and waitid: PASS', flush=True)
 
 
+def check_shared_fs(build):
+    probe = (build / 'linux-shared-fs.elf').read_bytes()
+    elf = bytearray((build / 'linux-pie.elf').read_bytes())
+    header = next(p for p in program_headers(elf) if struct.unpack_from('<I', elf, p)[0] == 3)
+    path = b'/lib/test-ld.so\0'
+    offset = struct.unpack_from('<Q', elf, header + 8)[0]
+    elf[offset:offset + len(path)] = path
+    struct.pack_into('<QQ', elf, header + 32, len(path), len(path))
+
+    loader = bytearray((build / 'linux-interp.elf').read_bytes())
+    entry = struct.unpack_from('<Q', loader, 24)[0]
+    for p in program_headers(loader):
+        kind, _, offset, address, _, size = struct.unpack_from('<II4Q', loader, p)
+        if kind == 1 and address <= entry < address + size:
+            pos = offset + entry - address
+            # mov eax,60; mov edi,42; syscall
+            loader[pos:pos + 12] = b'\xb8\x3c\0\0\0\xbf\x2a\0\0\0\x0f\x05'
+            break
+    else:
+        raise AssertionError('ELF interpreter entry has no file bytes')
+
+    files = {'/sandbox/sub/probe': elf, '/outside.elf': elf}
+    for suffix, extra in (
+        ('missing', {'/lib/test-ld.so': loader, '/loader-missing': b'1'}),
+        ('present', {'/lib/test-ld.so': b'not an ELF', '/sandbox/lib/test-ld.so': loader}),
+    ):
+        serial = check_guest('shared-fs-' + suffix, probe, 'Linux x86-64 exit status=0x00',
+                             files={**files, **extra})
+        assert 'Linux ELF64 shared filesystem probe' in serial, serial
+    print('OVMF: shared filesystem, chroot, Unix paths and rooted ELF interpreter: PASS', flush=True)
+
+
 def check_exec(build):
     probe = (build / 'linux-exec.elf').resolve()
     target = build / 'linux-exec-target.elf'
@@ -357,6 +389,7 @@ def main():
     check_pthread(build)
     check_userns(build)
     check_pidns(build)
+    check_shared_fs(build)
     check_vfork(build)
     check_exec(build)
     check_shared_elf(build)

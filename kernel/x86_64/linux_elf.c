@@ -226,7 +226,7 @@ static uptr make_stack(const struct elf_image *main, u64 interp_bias, const u64 
 
 static long prepare_image(const struct linux64_file *file, const struct linux64_file_source *source,
                           const struct stack_arguments *args, uptr stack_size,
-                          uptr *entry, uptr *stack, const struct linux64_userns *ns) {
+                          uptr *entry, uptr *stack, const struct linux64_userns *ns, bool rooted) {
     struct elf_image main, interpreter = {0};
     u64 mapped = 0;
     uptr bottom = LINUX64_STACK_TOP - stack_size, guard = LINUX64_STACK_FLOOR - PMM_PAGE_SIZE;
@@ -234,8 +234,12 @@ static long prepare_image(const struct linux64_file *file, const struct linux64_
         !paging64_range_free(guard, LINUX64_STACK_TOP)) return -ENOEXEC;
     if (main.interp) {
         struct linux64_file interp;
-        if (!source || !source->lookup || !source->lookup(source->context, main.interp, &interp))
+        if (rooted) {
+            long result = linux64_vfs_walk(NULL, main.interp, &interp, NULL, true);
+            if (result) return result;
+        } else if (!source || !source->lookup || !source->lookup(source->context, main.interp, &interp)) {
             return -ENOENT;
+        }
         if (!load_layout(&interpreter, &interp, true, guard, &mapped) ||
             (main.first < interpreter.end && interpreter.first < main.end)) return -ELIBBAD;
     }
@@ -273,26 +277,15 @@ long linux64_execve(struct linux64_frame *frame, uptr filename, uptr argv, uptr 
     char *path = exec_args.path;
     long length = linux64_user_string(filename, path, LINUX64_PATH_LIMIT);
     if (length <= 0) return length ? length : -ENOENT;
-    const char *absolute = path;
-    uptr absolute_length = (uptr)length;
-    if (path[0] != '/') {
-        const char *relative = path;
-        while (relative[0] == '.' && relative[1] == '/') {
-            relative += 2;
-            while (*relative == '/') ++relative;
-        }
-        absolute_length = (uptr)length - (uptr)(relative - path) + 1;
-        if (absolute_length >= LINUX64_PATH_LIMIT) return -ENAMETOOLONG;
-        exec_args.absolute[0] = '/';
-        for (uptr i = 1; i <= absolute_length; ++i) exec_args.absolute[i] = relative[i - 1];
-        absolute = exec_args.absolute;
-    }
     const struct linux64_file_source *source = linux64_file_source();
     struct linux64_file file;
-    if (!source->lookup || !source->lookup(source->context, absolute, &file)) return -ENOENT;
+    long result = linux64_vfs_walk(NULL, path, &file, exec_args.absolute, true);
+    if (result) return result;
+    uptr absolute_length = 0;
+    while (exec_args.absolute[absolute_length]) ++absolute_length;
 
     exec_args.used = exec_args.count = 0;
-    long result = stage_vector(argv);
+    result = stage_vector(argv);
     if (result) return result;
     if (!exec_args.count) {
         exec_args.offsets[0] = 0;
@@ -312,8 +305,9 @@ long linux64_execve(struct linux64_frame *frame, uptr filename, uptr argv, uptr 
     paging64_switch_root(root);
     uptr entry, stack;
     result = prepare_image(&file, source, &args, EXEC_STACK_SIZE, &entry, &stack,
-                           linux64_current->process->userns);
-    if (!result && linux64_commit_exec(frame, root, entry, stack, absolute, absolute_length)) return 0;
+                           linux64_current->process->userns, true);
+    if (!result && linux64_commit_exec(frame, root, entry, stack, exec_args.absolute, absolute_length))
+        return 0;
     paging64_switch_root(previous);
     paging64_drop_root(root);
     return result ? result : -ENOMEM;
@@ -329,7 +323,7 @@ bool linux64_run(const struct linux64_file *file, const char *path, uptr path_le
         .offsets = &offset, .argc = 1, .count = 1,
     };
     uptr entry, stack;
-    if (prepare_image(file, source, &args, BOOT_STACK_SIZE, &entry, &stack, NULL) ||
+    if (prepare_image(file, source, &args, BOOT_STACK_SIZE, &entry, &stack, NULL, false) ||
         !linux64_enable_syscall()) return false;
     linux64_task_init();
     linux64_use_files(source, path, path_length);

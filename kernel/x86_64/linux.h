@@ -28,7 +28,7 @@ struct linux64_file {
     uptr size;
     u64 inode;
     u32 mode, uid, gid;
-    bool writable_directory, live_pages;
+    bool writable_directory, live_pages, private_directory;
 };
 
 struct linux64_file_source {
