@@ -23,9 +23,10 @@ enum {
 
 enum file_kind {
     FILE_REGULAR, FILE_SOCKET, FILE_PIPE, FILE_PROC_DIR, FILE_PROC_MAP, FILE_NULL, FILE_SERIAL,
-    FILE_NAMESPACE, FILE_PROC_LINK, FILE_DIRECTORY, FILE_SYMLINK, FILE_NAMED_SOCKET,
+    FILE_NAMESPACE, FILE_PROC_LINK, FILE_DIRECTORY, FILE_SYMLINK, FILE_NAMED_SOCKET, FILE_URANDOM,
 };
 static const struct linux64_file null_file = {.inode = 1};
+static const struct linux64_file urandom_file = {.inode = 2};
 
 /* Linux x86-64 передаёт 144 байта; у i386 другая раскладка stat. */
 struct linux_stat {
@@ -57,7 +58,7 @@ static struct file_handle {
     struct linux64_userns *proc_ns;
     enum linux64_proc_node proc_node;
     bool proc_admin;
-    bool null_device;
+    enum file_kind device;
     bool serial;
     uptr directory_path;
     uptr offset;
@@ -131,7 +132,7 @@ long linux64_poll(uptr address, u32 count, i32 timeout) {
 
 static enum file_kind kind_of(const struct file_handle *file) {
     if (file->directory_path) return FILE_DIRECTORY;
-    if (file->null_device) return FILE_NULL;
+    if (file->device) return file->device;
     if (file->serial) return FILE_SERIAL;
     if (file->proc_node == PROC_USER_NS) return FILE_NAMESPACE;
     if (file->proc_node >= PROC_ROOT) return FILE_PROC_DIR;
@@ -226,7 +227,7 @@ void linux64_use_files(const struct linux64_file_source *source, const char *pat
     process->executable_path_length = path_length;
     for (uptr i = 0; i <= path_length; ++i) process->executable_path[i] = path[i];
     /* При первой загрузке таблица и пул открытых файлов ещё пусты. */
-    open_files[0] = (struct file_handle){.file = null_file, .null_device = true, .references = 1};
+    open_files[0] = (struct file_handle){.file = null_file, .device = FILE_NULL, .references = 1};
     for (unsigned fd = 1; fd <= 2; ++fd)
         open_files[fd] = (struct file_handle){
             .file.inode = 1, .serial = true, .flags = O_WRONLY, .references = 1,
@@ -339,6 +340,18 @@ static bool path_equal(const char *actual, const char *expected, bool directory)
     return !*actual;
 }
 
+static enum file_kind device_node(const char *path, struct linux64_file *file) {
+    if (path_equal(path, "/dev/null", false)) {
+        *file = null_file;
+        return FILE_NULL;
+    }
+    if (path_equal(path, "/dev/urandom", false)) {
+        *file = urandom_file;
+        return FILE_URANDOM;
+    }
+    return FILE_REGULAR;
+}
+
 static enum linux64_proc_node proc_path(const char *path) {
     if (*path == '/') {
         if (path_equal(path, "/proc", true)) return PROC_ROOT;
@@ -356,10 +369,7 @@ static enum linux64_proc_node proc_path(const char *path) {
 }
 
 bool linux64_special_node(const char *path, struct linux64_file *file) {
-    if (path_equal(path, "/dev/null", false)) {
-        *file = null_file;
-        return true;
-    }
+    if (device_node(path, file)) return true;
     enum linux64_proc_node proc = proc_path(path);
     if (proc == PROC_EXE) {
         const char *exe = linux64_current->process->executable_path;
@@ -726,11 +736,8 @@ static long lookup(i32 dirfd, uptr address, u32 flags, struct linux64_file *file
     if (result) return result;
     absolute = path;
     *memfd = NULL;
-    if (path_equal(absolute, "/dev/null", false)) {
-        *file = null_file;
-        *kind = FILE_NULL;
-        return 0;
-    }
+    *kind = device_node(absolute, file);
+    if (*kind) return 0;
     enum linux64_proc_node proc = proc_path(absolute);
     if ((proc == PROC_USER_NS || proc == PROC_EXE) && (flags & AT_SYMLINK_NOFOLLOW)) {
         u64 pid = (u32)linux64_current->process->pid;
@@ -817,14 +824,15 @@ static long linux_open(i32 dirfd, uptr address, u32 flags) {
         if (flags & O_DIRECTORY) return -ENOTDIR;
         return exclusive ? -EEXIST : -ENXIO;
     }
-    if (path_equal(absolute, "/dev/null", false)) {
+    enum file_kind device = device_node(absolute, &file);
+    if (device) {
         if (flags & O_DIRECTORY) return -ENOTDIR;
-        if ((flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL)) return -EEXIST;
+        if (exclusive) return -EEXIST;
         if (flags & ~(O_ACCMODE | O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC | O_APPEND |
                       O_NONBLOCK | O_LARGEFILE | O_NOFOLLOW | O_CLOEXEC)) return -EINVAL;
         u32 status = flags & ~(O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC);
-        result = new_handle(&null_file, NULL, status | O_LARGEFILE);
-        if (result >= 0) file_at((i32)result)->null_device = true;
+        result = new_handle(&file, NULL, status | O_LARGEFILE);
+        if (result >= 0) file_at((i32)result)->device = device;
         return result;
     }
     enum linux64_proc_node proc = proc_path(absolute);
@@ -939,10 +947,14 @@ static long linux_unlink(i32 dirfd, uptr address, u32 flags) {
     return result ? result : linux64_vfs_unlink(&files, absolute);
 }
 
-static long null_io(const struct file_handle *file, bool write, uptr buffer, uptr count) {
+static long device_io(const struct file_handle *file, bool write, uptr buffer, uptr count) {
     if ((file->flags & O_ACCMODE) == (write ? 0u : O_WRONLY)) return -EBADF;
     /* VFS проверяет диапазон даже у устройства, которое не обращается к буферу. */
     if (buffer >= X64_USER_TOP || count > X64_USER_TOP - buffer) return -EFAULT;
+    if (file->device == FILE_URANDOM) {
+        /* Запись требует пула энтропии, которого у источника RDRAND нет. */
+        return write ? -ENOSYS : linux64_getrandom(buffer, count, 0);
+    }
     if (count > 0x7ffff000u) count = 0x7ffff000u;
     return write ? (long)count : 0;
 }
@@ -966,7 +978,7 @@ static long linux_read(i32 fd, uptr buffer, uptr count, uptr offset, bool positi
     if (!open_file(fd)) return -EBADF;
     struct file_handle *handle = file_at(fd);
     if (handle->directory_path) return -EISDIR;
-    if (handle->null_device) return null_io(handle, false, buffer, count);
+    if (handle->device) return device_io(handle, false, buffer, count);
     if (handle->serial) return positioned ? -ESPIPE : -EBADF;
     if (handle->pipe) {
         if (positioned) return -ESPIPE;
@@ -1028,10 +1040,10 @@ static long file_stat(const struct linux64_file *file, const struct memfd *memfd
         links = 2 + (file->inode == PROC_TASKS ? linux64_current->process->threads : 0);
     } else if (kind == FILE_PROC_MAP) {
         mode = 0100644;
-    } else if (kind == FILE_NULL) {
+    } else if (kind == FILE_NULL || kind == FILE_URANDOM) {
         mode = 0020666;
         device = 5;
-        rdev = 0x103;
+        rdev = kind == FILE_NULL ? 0x103 : 0x109;
     } else if (kind == FILE_SERIAL) {
         mode = 0020600;
         device = 6;
@@ -1078,7 +1090,7 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
     case 1: /* write */
         if (!open_file(fd)) return -EBADF;
         if (file_at(fd)->serial) return serial_write(arg1, arg2);
-        if (file_at(fd)->null_device) return null_io(file_at(fd), true, arg1, arg2);
+        if (file_at(fd)->device) return device_io(file_at(fd), true, arg1, arg2);
         if (file_at(fd)->proc_node) {
             struct file_handle *handle = file_at(fd);
             if (!(handle->flags & O_ACCMODE)) return -EBADF;
@@ -1109,7 +1121,7 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
         return file_stat(&file, memfd, kind_of(file_at(fd)), arg1);
     case 8: /* lseek */
         if (!open_file(fd)) return -EBADF;
-        if (file_at(fd)->null_device) return (u32)arg2 <= 4 ? 0 : -EINVAL;
+        if (file_at(fd)->device) return (u32)arg2 <= 4 ? 0 : -EINVAL;
         return kind_of(file_at(fd)) != FILE_REGULAR ? -ESPIPE : -ENOSYS;
     case 17: /* pread64 */
         if ((long)arg3 < 0) return -EINVAL;
@@ -1118,12 +1130,12 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
         if ((long)arg3 < 0) return -EINVAL;
         if (!open_file(fd)) return -EBADF;
         if (file_at(fd)->serial || file_at(fd)->socket) return -ESPIPE;
-        return file_at(fd)->null_device ? null_io(file_at(fd), true, arg1, arg2) : -ENOSYS;
+        return file_at(fd)->device ? device_io(file_at(fd), true, arg1, arg2) : -ENOSYS;
     case 21: /* access */
         if ((u32)arg1 & ~7u) return -EINVAL;
         result = lookup(AT_FDCWD, arg0, 0, &file, &memfd, &kind);
         if (result) return result;
-        if (kind == FILE_NULL) return (arg1 & 1u) ? -EACCES : 0;
+        if (kind == FILE_NULL || kind == FILE_URANDOM) return (arg1 & 1u) ? -EACCES : 0;
         if (kind == FILE_NAMESPACE) {
             if (arg1 & 1u) return -EACCES;
             return (arg1 & 2u) ? -EPERM : 0;
