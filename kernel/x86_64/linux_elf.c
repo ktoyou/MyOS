@@ -191,7 +191,7 @@ bool linux64_run(const void *image, uptr size, const struct linux64_file_source 
         !paging64_range_free(STACK_GUARD, STACK_TOP)) return false;
     if (main.interp) {
         struct linux64_file interp;
-        if (!source || !source->lookup(source->context, main.interp, &interp) ||
+        if (!source || !source->lookup || !source->lookup(source->context, main.interp, &interp) ||
             !load_layout(&interpreter, interp.bytes, interp.size, true, &mapped) ||
             (main.first < interpreter.end && interpreter.first < main.end)) return false;
     }

@@ -21,6 +21,8 @@ static long check_files(void) {
     if (call(17, fd, (word)cross, 1, 4) != 1 || cross[0] != 2 ||
         call(17, fd, (word)cross, 1, (word)-1) != -22 ||
         call(17, fd, (word)cross, 1, 0x100000) != 0) return 4;
+    if (call(0, fd, 0xffff800000000000ul, 0, 0) != -14 ||
+        call(17, fd, 0xffff800000000000ul, 1, 0x100000) != -14) return 13;
     if (call(0, fd, (word)cross, 4, 0) != 4 ||
         cross[0] != 0x7f || cross[1] != 'E' || cross[2] != 'L' || cross[3] != 'F') return 5;
     if (call(0, fd, (word)cross, 1, 0) != 1 || cross[0] != 2) return 6;

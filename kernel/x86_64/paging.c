@@ -138,7 +138,7 @@ bool paging64_range_free(uptr start, uptr end) {
 
 static void *map_user_page(uptr address, const u8 *source, uptr offset, uptr length,
                            bool writable, bool executable) {
-    if (address < 0x400000ul || address >= 0x0000800000000000ul ||
+    if (address < 0x400000ul || address >= X64_USER_TOP ||
         (address & (PMM_PAGE_SIZE - 1)) || (writable && executable) ||
         offset >= PMM_PAGE_SIZE || length > PMM_PAGE_SIZE - offset || (length && !source))
         return NULL;
@@ -186,7 +186,7 @@ bool paging64_user_load(uptr address, const u8 *source, uptr offset, uptr length
 }
 
 static u8 *user_pointer(uptr address, u64 required) {
-    if (address < 0x400000ul || address >= 0x0000800000000000ul) return NULL;
+    if (address < 0x400000ul || address >= X64_USER_TOP) return NULL;
     const u64 *table = pmm64_pointer(active_root());
     for (int shift = 39; shift >= 12; shift -= 9) {
         u64 entry = table[(address >> shift) & 511u];

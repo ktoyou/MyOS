@@ -3,6 +3,8 @@
 
 #include "pmm.h"
 
+#define X64_USER_TOP 0x0000800000000000ul
+
 bool paging64_init(const struct boot_info *boot);
 void *paging64_user_page(uptr address);
 bool paging64_user_code(uptr address, const u8 *code, uptr length);

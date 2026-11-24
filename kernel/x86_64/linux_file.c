@@ -115,6 +115,7 @@ static long linux_read(i32 fd, uptr buffer, uptr count, uptr offset, bool positi
     if (!open_file(fd)) return -EBADF;
     if (!positioned) offset = handles[fd].offset;
     if ((long)offset < 0) return -EINVAL;
+    if (buffer >= X64_USER_TOP || count > X64_USER_TOP - buffer) return -EFAULT;
     const struct linux64_file *file = &handles[fd].file;
     if (!count || offset >= file->size) return 0;
     if (count > 0x7ffff000u) count = 0x7ffff000u;
