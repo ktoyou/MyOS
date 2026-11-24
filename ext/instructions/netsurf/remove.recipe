@@ -1,0 +1,5 @@
+name netsurf
+workdir /
+rm /usr/share/applications/netsurf.desktop
+rm /ext/bin/netsurf
+rm -r /ext/share/netsurf

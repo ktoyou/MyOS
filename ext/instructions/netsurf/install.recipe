@@ -1,0 +1,7 @@
+name netsurf
+descr NetSurf 3.11 browser for MyOS
+workdir /
+mkdir /ext/bin
+mkdir /ext/share/netsurf
+mkdir /usr/share/applications
+tar xzvf /ext/instructions/netsurf/netsurf.tar.gz

@@ -683,6 +683,11 @@ install: $(UBINS) $(MLIBS) $(BUILD)/myfs $(BUILD)/ld.so $(BUILD)/user/libz.so $(
 	@$(MAKE) --no-print-directory install-permissions DISK=$(DISK)
 	@$(BUILD)/myfs $(DISK) mkdir /usr/share/wallpapers >/dev/null || exit 1
 	@for f in wallpapers/*.jpg; do $(BUILD)/myfs $(DISK) put $$f /usr/share/wallpapers/$$(basename $$f) >/dev/null || exit 1; done
+ifeq ($(WITH_NETSURF),1)
+	$(BUILD)/myfs $(DISK) put $(BUILD)/netsurf.tar.gz /ext/instructions/netsurf/netsurf.tar.gz
+	$(BUILD)/myfs $(DISK) put ext/instructions/netsurf/remove.recipe /ext/instructions/netsurf/uninstall.inst
+	$(BUILD)/myfs $(DISK) put ext/instructions/netsurf/install.recipe /ext/instructions/netsurf/setup.inst
+endif
 	@for f in apps/*.desktop; do $(BUILD)/myfs $(DISK) put $$f /usr/share/applications/$$(basename $$f) >/dev/null || exit 1; done
 	@for f in video_mode.h myos.h installer.h setup-copy.h build_jobs.h hwinfo.h scheduler.h kernelinfo.h sysinfo.h gfx.h win.h tls.h; do $(BUILD)/myfs $(DISK) put user/lib/$$f /include/$$f >/dev/null || exit 1; done
 	@for f in user/include/*.h; do $(BUILD)/myfs $(DISK) put $$f /include/$$(basename $$f) >/dev/null || exit 1; done
@@ -1597,6 +1602,8 @@ videopolicytest: videodrivertest | $(BUILD)
 	./$(BUILD)/uefi-video-test
 
 .PHONY: displaytest
+include ext/instructions/netsurf/cross.mk
+
 displaytest: | $(BUILD)
 	$(HOSTCC) -m32 -std=gnu11 -g -O1 -fno-builtin -ffunction-sections -fdata-sections -fsanitize=address,undefined tests/display_trial_test.c -Wl,--gc-sections -o $(BUILD)/display-trial-test
 	./$(BUILD)/display-trial-test

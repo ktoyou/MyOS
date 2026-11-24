@@ -1,0 +1,143 @@
+--- a/utils/config.h
++++ b/utils/config.h
+@@ -165,6 +165,16 @@
+      defined(__APPLE__))
+ #define HAVE_EXECINFO
+ #endif
++
++#define HAVE_STRCASESTR
++#undef HAVE_SCANDIR
++#undef HAVE_DIRFD
++#undef HAVE_UNLINKAT
++#undef HAVE_FSTATAT
++#undef HAVE_STRPTIME
++#undef HAVE_STRFTIME
++#undef HAVE_INETATON
++#undef HAVE_MMAP
+ 
+ /* This section toggles build options on and off.
+  * Simply undefine a symbol to turn the relevant feature off.
+--- a/content/handlers/javascript/duktape/duk_config.h
++++ b/content/handlers/javascript/duktape/duk_config.h
+@@ -3148,6 +3148,7 @@
+ #error no provider for DUK_USE_DATE_GET_LOCAL_TZOFFSET()
+ #endif
+ 
++#undef DUK_USE_DATE_PRS_STRPTIME
+ #if defined(DUK_USE_DATE_PARSE_STRING)
+ /* External provider already defined. */
+ #elif defined(DUK_USE_DATE_PRS_STRPTIME)
+--- a/frontends/framebuffer/gui.c
++++ b/frontends/framebuffer/gui.c
+@@ -18,7 +18,7 @@
+ 
+ #include <stdint.h>
+ #include <limits.h>
+-#include <getopt.h>
++#include <unistd.h>
+ #include <assert.h>
+ #include <string.h>
+ #include <stdbool.h>
+@@ -477,14 +477,13 @@
+ process_cmdline(int argc, char** argv)
+ {
+ 	int opt;
+-	int option_index;
+-	static struct option long_options[] = {
+-		{0, 0, 0,  0 }
+-	}; /* no long options */
++	extern void netsurf_myos_register(void);
++	 /* no long options */
+ 
+ 	NSLOG(netsurf, INFO, "argc %d, argv %p", argc, argv);
+ 
+-	nsfb_enumerate_surface_types(framebuffer_pick_default_fename, NULL);
++	netsurf_myos_register();
++	fename = "myos";
+ 
+ 	febpp = 32;
+ 
+@@ -504,8 +503,7 @@
+ 		feurl = NETSURF_HOMEPAGE;
+ 	}
+ 
+-	while((opt = getopt_long(argc, argv, "f:b:w:h:",
+-				 long_options, &option_index)) != -1) {
++	while((opt = getopt(argc, argv, "f:b:w:h:")) != -1) {
+ 		switch (opt) {
+ 		case 'f':
+ 			fename = optarg;
+--- a/utils/hashtable.c
++++ b/utils/hashtable.c
+@@ -156,7 +156,7 @@
+ 			}
+ 		} else {
+ 			slen++;
+-			if (slen > sizeof s) {
++			if (slen >= sizeof s) {
+ 				NSLOG(netsurf, INFO, "Overlength line\n");
+ 				slen = 0;
+ 			}
+@@ -362,35 +362,23 @@
+ /* exported interface documented in utils/hashtable.h */
+ nserror hash_add_file(struct hash_table *ht, const char *path)
+ {
+-	nserror res = NSERROR_OK;
+-	char s[LINE_BUFFER_SIZE]; /* line buffer */
+-	gzFile fp; /* compressed file handle */
+-
+-	if (path == NULL) {
+-		return NSERROR_BAD_PARAMETER;
+-	}
+-
+-	fp = gzopen(path, "r");
+-	if (!fp) {
+-		NSLOG(netsurf, INFO,
+-		      "Unable to open file \"%.100s\": %s", path,
+-		      strerror(errno));
+-
+-		return NSERROR_NOT_FOUND;
+-	}
+-
+-	while (gzgets(fp, s, sizeof s)) {
+-		int slen = strlen(s);
+-		s[--slen] = 0;  /* remove \n at end */
+-
+-		res = process_line(ht, (uint8_t *)s, slen);
+-		if (res != NSERROR_OK) {
+-			break;
+-		}
+-	}
+-
+-	gzclose(fp);
+-
++	if (path == NULL) return NSERROR_BAD_PARAMETER;
++	FILE *file = fopen(path, "rb");
++	if (file == NULL) return NSERROR_NOT_FOUND;
++	nserror res = NSERROR_INVALID;
++	if (fseek(file, 0, SEEK_END) == 0) {
++		long length = ftell(file);
++		if (length >= 0 && length <= 4 * 1024 * 1024 && fseek(file, 0, SEEK_SET) == 0) {
++			uint8_t *bytes = calloc((size_t)length + 2, 1);
++			if (!bytes) res = NSERROR_NOMEM;
++			else {
++				if (fread(bytes, 1, length, file) == (size_t)length)
++					res = hash_add_inline(ht, bytes, length);
++				free(bytes);
++			}
++		}
++	}
++	fclose(file);
+ 	return res;
+ }
+ 
+--- a/utils/utf8.h
++++ b/utils/utf8.h
+@@ -106,6 +106,7 @@
+  * \param o  Offset in the string to start at
+  * \return Offset of first byte of next legal character
+  */
++#define utf8_next netsurf_utf8_next
+ size_t utf8_next(const char *s, size_t l, size_t o);
+ 
+ 

@@ -1,0 +1,23 @@
+--- a/libdom/include/dom/html/html_document.h
++++ b/libdom/include/dom/html/html_document.h
+@@ -198,8 +198,8 @@
+ 
+ static inline dom_exception dom_html_document_open(dom_html_document *doc)
+ {
+-	return ((dom_html_document_vtable *) ((dom_node *) doc)->vtable)->
+-		open(doc);
++	return (((dom_html_document_vtable *) ((dom_node *) doc)->vtable)->
++		open)(doc);
+ }
+ #define dom_html_document_open(d) \
+ 		dom_html_document_open((dom_html_document *) (d))
+--- a/libparserutils/src/input/filter.c
++++ b/libparserutils/src/input/filter.c
+@@ -11,6 +11,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ 
++#define WITHOUT_ICONV_FILTER
+ #ifndef WITHOUT_ICONV_FILTER
+ #include <iconv.h>
+ #endif
