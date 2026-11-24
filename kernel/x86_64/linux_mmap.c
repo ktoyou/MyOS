@@ -132,17 +132,21 @@ long linux64_mmap(uptr address, uptr length, u32 protection, u32 flags, i32 fd, 
     if (shared && anonymous) return -EINVAL;
     bool reserve = anonymous && !protection;
     if (!reserve && length > BOOT_MEMORY_LIMIT) return -ENOMEM;
-    const u8 *source = NULL;
-    uptr file_bytes = 0;
+    struct linux64_fd_view view;
+    struct paging64_mmap_file mapping = {0};
+    bool no_write = false;
     if (!anonymous) {
-        const struct linux64_file *file = linux64_get_file(fd);
-        if (!file) return -EBADF;
+        if (!linux64_get_file(fd, &view)) return -EBADF;
         if (offset > 0x7ffffffffffffffful - length) return -EOVERFLOW;
-        if (offset < file->size) {
-            source = file->bytes + offset;
-            file_bytes = file->size - offset;
-            if (file_bytes > length) file_bytes = length;
+        no_write = shared && !view.writable;
+        if (offset < view.file.size) {
+            if (view.file.bytes) mapping.bytes = view.file.bytes + offset;
+            mapping.length = view.file.size - offset;
+            if (mapping.length > length) mapping.length = length;
         }
+        mapping.offset = offset;
+        mapping.frame = view.frame;
+        mapping.object = view.object;
     }
 
     if (flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) {
@@ -157,12 +161,15 @@ long linux64_mmap(uptr address, uptr length, u32 protection, u32 flags, i32 fd, 
             !paging64_range_free(address, address + length)) address = find_free(length);
         if (!address) return -ENOMEM;
     }
-    if (shared && writable) return -EACCES;
+    if ((no_write && writable) || (shared && mapping.frame && executable)) return -EACCES;
+    /* При росте объекта страницы за старым EOF потребовали бы новых PTE. */
+    if (shared && mapping.frame && view.may_grow &&
+        ((mapping.length + PAGE_MASK) & ~PAGE_MASK) < length) return -EINVAL;
     uptr end = address + length;
     if (!stage_range(address, end, reserve)) return -ENOMEM;
     if (reserve ? !paging64_remove_mmap(address, end)
-                : !paging64_map_mmap(address, end, source, file_bytes,
-                                     anonymous, protection != 0, writable, executable, shared))
+                : !paging64_map_mmap(address, end, anonymous ? NULL : &mapping,
+                                     protection != 0, writable, executable, shared, no_write))
         return -ENOMEM;
     commit_ranges();
     return (long)address;

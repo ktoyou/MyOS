@@ -8,6 +8,7 @@
 #define FILE_BACKED   (1ull << 11)
 /* Бит 57 доступен ПО в листе x86-64 и не входит в физический адрес. */
 #define MMAP_NO_WRITE (1ull << 57)
+#define MMAP_SHARED_FRAME (1ull << 58)
 #define NO_EXECUTE    (1ull << 63)
 #define ADDRESS_MASK  0x000ffffffffff000ull
 #define CR0_WP        (1ul << 16)
@@ -187,19 +188,23 @@ static void set_alias_write(uptr root, uptr physical, bool writable) {
     invalidate(direct);
 }
 
-static void clear_private(uptr root, uptr start, uptr end, u64 marker) {
+static void release_mapping(uptr root, u64 value) {
+    uptr physical = value & ADDRESS_MASK;
+    if (!physical) return;
+    if (!(value & MMAP_SHARED_FRAME)) set_alias_write(root, physical, true);
+    pmm64_free(physical);
+}
+
+static void clear_mmap(uptr root, uptr start, uptr end, u64 marker) {
     uptr next, last = 0;
     for (uptr address = start; address < end; address = next) {
         u64 *leaf = find_leaf_span(root, address, &next);
         if (!leaf || !(*leaf & marker)) continue;
         if (last && (last ^ address) >= 512 * PMM_PAGE_SIZE) prune_empty_tables(root, last);
-        uptr physical = *leaf & ADDRESS_MASK;
+        u64 old = *leaf;
         *leaf = 0;
         invalidate(address);
-        if (physical) {
-            set_alias_write(root, physical, true);
-            pmm64_free(physical);
-        }
+        release_mapping(root, old);
         last = address;
     }
     if (last) prune_empty_tables(root, last);
@@ -211,7 +216,7 @@ bool paging64_remove_mmap(uptr start, uptr end) {
         const u64 *leaf = find_leaf_span(root, address, &next);
         if (leaf && *leaf && !(*leaf & MMAP_OWNED)) return false;
     }
-    clear_private(root, start, end, MMAP_OWNED);
+    clear_mmap(root, start, end, MMAP_OWNED);
     return true;
 }
 
@@ -232,9 +237,11 @@ enum paging64_protect_result paging64_protect(uptr start, uptr end, bool accessi
             needs_backing = accessible;
             continue;
         }
-        if ((*leaf & ~MMAP_NO_WRITE) != MMAP_OWNED && !((*leaf & USER) && (*leaf & ADDRESS_MASK)))
+        if ((*leaf & ~(MMAP_NO_WRITE | MMAP_SHARED_FRAME)) != MMAP_OWNED &&
+            !((*leaf & USER) && (*leaf & ADDRESS_MASK)))
             return PAGING64_PROTECT_UNMAPPED;
         if (writable && (*leaf & MMAP_NO_WRITE)) return PAGING64_PROTECT_DENIED;
+        if (executable && (*leaf & MMAP_SHARED_FRAME)) return PAGING64_PROTECT_DENIED;
     }
     if (needs_backing) {
         for (uptr address = start; address < end; address += PMM_PAGE_SIZE) {
@@ -243,7 +250,7 @@ enum paging64_protect_result paging64_protect(uptr start, uptr end, bool accessi
             uptr physical = pmm64_alloc();
             if (physical && map_entry(root, address, physical | MMAP_PENDING | USER)) continue;
             if (physical) pmm64_free(physical);
-            clear_private(root, start, address, MMAP_PENDING);
+            clear_mmap(root, start, address, MMAP_PENDING);
             return PAGING64_PROTECT_UNMAPPED;
         }
     }
@@ -258,31 +265,41 @@ enum paging64_protect_result paging64_protect(uptr start, uptr end, bool accessi
                     (executable ? 0 : NO_EXECUTE);
         if (*leaf & MMAP_PENDING) value |= MMAP_OWNED;
         if (value == *leaf) continue;
-        if (!writable) set_alias_write(root, physical, false);
+        bool shared_frame = (*leaf & MMAP_SHARED_FRAME) != 0;
+        if (!shared_frame && !writable) set_alias_write(root, physical, false);
         *leaf = value;
         invalidate(address);
         /* Старое исполняемое отображение уже недоступно через TLB. */
-        if (writable) set_alias_write(root, physical, true);
+        if (!shared_frame && writable) set_alias_write(root, physical, true);
     }
     return PAGING64_PROTECT_OK;
 }
 
 /* Страницы и таблицы резервируются до замены старых отображений. */
-bool paging64_map_mmap(uptr start, uptr end, const u8 *source, uptr file_bytes,
-                       bool anonymous, bool accessible, bool writable, bool executable,
-                       bool immutable_shared) {
+bool paging64_map_mmap(uptr start, uptr end, const struct paging64_mmap_file *file,
+                       bool accessible, bool writable, bool executable,
+                       bool shared, bool no_write) {
+    bool shared_frames = shared && file && file->frame;
     if (start < 0x400000ul || end > X64_USER_TOP || start >= end ||
         ((start | end) & (PMM_PAGE_SIZE - 1)) || (writable && executable) ||
-        (immutable_shared && (anonymous || writable)) ||
-        (file_bytes && !source) || file_bytes > end - start) return false;
+        (no_write && writable) || (shared_frames && executable) ||
+        (file && (file->length > end - start || (file->length && !file->bytes && !file->frame))))
+        return false;
     uptr root = active_root(), physical_list = 0, prepared = start;
-    const u64 owner = MMAP_OWNED | (immutable_shared ? MMAP_NO_WRITE : 0);
+    uptr retained = 0;
+    const u64 owner = MMAP_OWNED | (no_write ? MMAP_NO_WRITE : 0) |
+                      (shared_frames ? MMAP_SHARED_FRAME : 0);
     for (uptr address = start; address < end; address += PMM_PAGE_SIZE) {
         const u64 *leaf = find_leaf(root, address);
         if (leaf && *leaf && !(*leaf & MMAP_OWNED)) return false;
     }
-    uptr backed = anonymous ? end - start : file_bytes;
+    uptr backed = file ? file->length : end - start;
     for (uptr offset = 0; offset < backed; offset += PMM_PAGE_SIZE) {
+        if (shared_frames) {
+            if (!pmm64_retain(file->frame(file->object, file->offset + offset))) goto fail;
+            retained += PMM_PAGE_SIZE;
+            continue;
+        }
         uptr physical = pmm64_alloc();
         if (!physical) goto fail;
         *(uptr *)pmm64_pointer(physical) = physical_list;
@@ -295,26 +312,32 @@ bool paging64_map_mmap(uptr start, uptr end, const u8 *source, uptr file_bytes,
 
     for (uptr address = start; address < end; address += PMM_PAGE_SIZE) {
         u64 *leaf = find_leaf(root, address);
-        uptr old = *leaf & ADDRESS_MASK;
+        u64 old = *leaf;
         *leaf = owner;
         invalidate(address);
-        if (old) {
-            set_alias_write(root, old, true);
-            pmm64_free(old);
-        }
+        release_mapping(root, old);
         uptr offset = address - start;
         if (offset >= backed) continue;
-        uptr physical = physical_list;
-        u8 *target = pmm64_pointer(physical);
-        physical_list = *(uptr *)target;
-        *(uptr *)target = 0;
-        if (offset < file_bytes) {
-            uptr count = file_bytes - offset;
-            if (count > PMM_PAGE_SIZE) count = PMM_PAGE_SIZE;
-            for (uptr i = 0; i < count; ++i) target[i] = source[offset + i];
+        uptr physical;
+        if (shared_frames) {
+            /* Прямой алиас остаётся RW+NX для объекта и всех его отображений. */
+            physical = file->frame(file->object, file->offset + offset);
+        } else {
+            physical = physical_list;
+            u8 *target = pmm64_pointer(physical);
+            physical_list = *(uptr *)target;
+            *(uptr *)target = 0;
+            if (file) {
+                const u8 *source = file->frame
+                    ? pmm64_pointer(file->frame(file->object, file->offset + offset))
+                    : file->bytes + offset;
+                uptr count = backed - offset;
+                if (count > PMM_PAGE_SIZE) count = PMM_PAGE_SIZE;
+                for (uptr i = 0; i < count; ++i) target[i] = source[i];
+            }
+            if (!writable) set_alias_write(root, physical, false);
         }
-        if (!writable) set_alias_write(root, physical, false);
-        *leaf = physical | owner | USER | (anonymous ? 0 : FILE_BACKED) |
+        *leaf = physical | owner | USER | (file ? FILE_BACKED : 0) |
                 (accessible ? PRESENT : 0) |
                 (writable ? WRITE : 0) | (executable ? 0 : NO_EXECUTE);
         invalidate(address);
@@ -322,12 +345,14 @@ bool paging64_map_mmap(uptr start, uptr end, const u8 *source, uptr file_bytes,
     return true;
 
 fail:
+    for (uptr offset = 0; offset < retained; offset += PMM_PAGE_SIZE)
+        pmm64_free(file->frame(file->object, file->offset + offset));
     while (physical_list) {
         uptr physical = physical_list;
         physical_list = *(uptr *)pmm64_pointer(physical);
         pmm64_free(physical);
     }
-    clear_private(root, start, prepared, MMAP_PENDING);
+    clear_mmap(root, start, prepared, MMAP_PENDING);
     return false;
 }
 

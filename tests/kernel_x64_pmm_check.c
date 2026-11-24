@@ -55,6 +55,12 @@ bool pmm64_check(const struct boot_info *boot) {
     volatile u64 *words = (void *)first;
     words[0] = 0x123456789abcdef0ull;
     words[PMM_PAGE_SIZE / sizeof(*words) - 1] = words[0];
+    if (pmm64_retain(0) || pmm64_retain(first + 1) || pmm64_has_aliases(first) ||
+        !pmm64_retain(first) || !pmm64_has_aliases(first) || !pmm64_free(first) ||
+        pmm64_has_aliases(first) || words[0] != 0x123456789abcdef0ull)
+        return false;
+    uptr third = pmm64_alloc();
+    if (!third || third == first || !pmm64_free(third)) return false;
     if (pmm64_free(0) || pmm64_free(first + 1) || pmm64_free((uptr)_start) ||
         pmm64_free(boot->arena_phys) || !pmm64_free(first) || pmm64_free(first) ||
         pmm64_alloc() != first || words[0] || words[PMM_PAGE_SIZE / sizeof(*words) - 1])
