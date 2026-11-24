@@ -4,8 +4,8 @@
 enum {
     EAGAIN = 11, ENOMEM = 12, EFAULT = 14, EINVAL = 22, EMFILE = 24, EPIPE = 32,
     EMSGSIZE = 90, EPROTONOSUPPORT = 93, ESOCKTNOSUPPORT = 94, EOPNOTSUPP = 95,
-    EAFNOSUPPORT = 97, ENOPROTOOPT = 92, ECONNRESET = 104,
-    AF_UNIX = 1, SOCK_SEQPACKET = 5, SOCK_TYPE_MASK = 0xf,
+    EAFNOSUPPORT = 97, ENOPROTOOPT = 92, ECONNRESET = 104, ENOTCONN = 107,
+    AF_UNIX = 1, SOCK_STREAM = 1, SOCK_SEQPACKET = 5, SOCK_MAX = 11, SOCK_TYPE_MASK = 0xf,
     SOCK_NONBLOCK = 0x800, SOCK_CLOEXEC = 0x80000,
     SHUT_RD = 0, SHUT_WR = 1, SHUT_RDWR = 2,
     SOL_SOCKET = 1, SO_TYPE = 3, SO_PASSCRED = 16, SCM_CREDENTIALS = 2,
@@ -54,27 +54,45 @@ struct linux64_socket {
     struct linux64_socket *peer;
     struct packet *head, *tail;
     unsigned queued;
+    u8 type;
     bool open, passcred, reset, read_shutdown, write_shutdown;
 };
 
 /* Один конец может оставаться открытым после закрытия его пары. */
 static struct linux64_socket pairs[LINUX64_TASK_COUNT * LINUX64_FD_COUNT][2];
 
+static struct linux64_socket *free_pair(void) {
+    for (unsigned i = 0; i < sizeof(pairs) / sizeof(*pairs); ++i)
+        if (!pairs[i][0].open && !pairs[i][1].open) return pairs[i];
+    return NULL;
+}
+
+long linux64_socket_create(i32 domain, u32 type, i32 protocol, struct linux64_socket **socket) {
+    u32 base = type & SOCK_TYPE_MASK;
+    if (type & ~(SOCK_TYPE_MASK | SOCK_CLOEXEC | SOCK_NONBLOCK)) return -EINVAL;
+    if (domain != AF_UNIX) return -EAFNOSUPPORT;
+    if (base >= SOCK_MAX) return -EINVAL;
+    if (protocol != 0 && protocol != AF_UNIX) return -EPROTONOSUPPORT;
+    if (base != SOCK_STREAM) return -ESOCKTNOSUPPORT;
+    struct linux64_socket *slot = free_pair();
+    if (!slot) return -EMFILE;
+    *slot = (struct linux64_socket){.type = SOCK_STREAM, .open = true};
+    *socket = slot;
+    return 0;
+}
+
 long linux64_socket_pair(i32 domain, u32 type, i32 protocol, struct linux64_socket *ends[2]) {
     if (type & ~(SOCK_TYPE_MASK | SOCK_CLOEXEC | SOCK_NONBLOCK)) return -EINVAL;
     if (domain != AF_UNIX) return -EAFNOSUPPORT;
     if ((type & SOCK_TYPE_MASK) != SOCK_SEQPACKET) return -ESOCKTNOSUPPORT;
     if (protocol != 0 && protocol != AF_UNIX) return -EPROTONOSUPPORT;
-    for (unsigned i = 0; i < sizeof(pairs) / sizeof(*pairs); ++i) {
-        struct linux64_socket *pair = pairs[i];
-        if (pair[0].open || pair[1].open) continue;
-        pair[0] = (struct linux64_socket){.peer = &pair[1], .open = true};
-        pair[1] = (struct linux64_socket){.peer = &pair[0], .open = true};
-        ends[0] = &pair[0];
-        ends[1] = &pair[1];
-        return 0;
-    }
-    return -EMFILE;
+    struct linux64_socket *pair = free_pair();
+    if (!pair) return -EMFILE;
+    pair[0] = (struct linux64_socket){.peer = &pair[1], .type = SOCK_SEQPACKET, .open = true};
+    pair[1] = (struct linux64_socket){.peer = &pair[0], .type = SOCK_SEQPACKET, .open = true};
+    ends[0] = &pair[0];
+    ends[1] = &pair[1];
+    return 0;
 }
 
 static void drop_packet(struct linux64_socket *socket) {
@@ -89,25 +107,31 @@ void linux64_socket_close(struct linux64_socket *socket) {
     socket->open = false;
     const struct packet *unread = socket->head;
     if (unread && !unread->length) unread = unread->next;
-    if (socket->peer->open && unread) socket->peer->reset = true;
+    if (unread && socket->peer && socket->peer->open) socket->peer->reset = true;
     while (socket->head) drop_packet(socket);
 }
 
 long linux64_socket_shutdown(struct linux64_socket *socket, i32 how) {
     if (how < SHUT_RD || how > SHUT_RDWR) return -EINVAL;
+    struct linux64_socket *peer = socket->peer;
     /* Закрытие направления останавливает новые записи, но сохраняет очередь. */
     if (how != SHUT_WR) {
         socket->read_shutdown = true;
-        if (socket->peer->open) socket->peer->write_shutdown = true;
+        if (peer && peer->open) peer->write_shutdown = true;
     }
     if (how != SHUT_RD) {
         socket->write_shutdown = true;
-        if (socket->peer->open) socket->peer->read_shutdown = true;
+        if (peer && peer->open) peer->read_shutdown = true;
     }
     return 0;
 }
 
 u16 linux64_socket_poll(const struct linux64_socket *socket) {
+    if (!socket->peer) {
+        u16 ready = LINUX64_POLLHUP | LINUX64_POLL_WRITE | LINUX64_POLLWRBAND;
+        if (socket->read_shutdown) ready |= LINUX64_POLLRDHUP | LINUX64_POLL_READ;
+        return ready;
+    }
     bool read_closed = socket->read_shutdown || !socket->peer->open;
     u16 ready = socket->reset ? LINUX64_POLLERR : 0;
     if (read_closed) ready |= LINUX64_POLLRDHUP;
@@ -132,7 +156,7 @@ long linux64_socket_option(struct linux64_socket *socket, bool get, i32 level, i
     i32 count;
     if (paging64_copy_from_user(&count, length, sizeof(count)) != sizeof(count)) return -EFAULT;
     if (count < 0) return -EINVAL;
-    i32 result = option == SO_TYPE ? SOCK_SEQPACKET : socket->passcred;
+    i32 result = option == SO_TYPE ? socket->type : socket->passcred;
     if (count > (i32)sizeof(result)) count = sizeof(result);
     if (paging64_copy_to_user(value, &result, (uptr)count) != (uptr)count ||
         paging64_copy_to_user(length, &count, sizeof(count)) != sizeof(count)) return -EFAULT;
@@ -145,6 +169,7 @@ static long send_packet(struct linux64_socket *socket, const struct iovec *iov, 
         return -ECONNRESET;
     }
     struct linux64_socket *peer = socket->peer;
+    if (!peer) return -ENOTCONN;
     if (!peer->open || socket->write_shutdown) return -EPIPE;
     uptr length = 0;
     for (uptr i = 0; i < count; ++i) {
@@ -196,6 +221,7 @@ static void receive_credentials(const struct packet *packet, struct msghdr *mess
 
 static long receive_packet(struct linux64_socket *socket, const struct iovec *iov, uptr count,
                            struct msghdr *message, u32 flags) {
+    if (!socket->peer) return -EINVAL;
     if (socket->reset) {
         socket->reset = false;
         return -ECONNRESET;
@@ -230,6 +256,7 @@ static long receive_packet(struct linux64_socket *socket, const struct iovec *io
 }
 
 long linux64_socket_io(struct linux64_socket *socket, bool receive, uptr buffer, uptr length) {
+    if (buffer >= X64_USER_TOP || length > X64_USER_TOP - buffer) return -EFAULT;
     const struct iovec iov = {buffer, length};
     if (!receive) return send_packet(socket, &iov, 1);
     return length ? receive_packet(socket, &iov, 1, NULL, 0) : 0;
