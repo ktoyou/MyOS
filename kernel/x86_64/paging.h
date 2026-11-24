@@ -4,5 +4,7 @@
 #include "pmm.h"
 
 bool paging64_init(const struct boot_info *boot);
+void *paging64_user_page(uptr address);
+bool paging64_user_code(uptr address, const u8 *code, uptr length);
 
 #endif

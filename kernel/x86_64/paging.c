@@ -2,6 +2,7 @@
 
 #define PRESENT       (1ull << 0)
 #define WRITE         (1ull << 1)
+#define USER          (1ull << 2)
 #define NO_EXECUTE    (1ull << 63)
 #define ADDRESS_MASK  0x000ffffffffff000ull
 #define CR0_WP        (1ul << 16)
@@ -21,19 +22,37 @@ static bool nx_supported(void) {
 
 static bool map_page(uptr root, uptr virtual, uptr physical, u64 flags) {
     u64 *table = pmm64_pointer(root);
+    u64 *entries[3];
+    uptr created[3] = {0, 0, 0};
+    unsigned depth = 0;
     for (int shift = 39; shift > 12; shift -= 9) {
         u64 *entry = &table[(virtual >> shift) & 511u];
+        entries[depth] = entry;
         if (!(*entry & PRESENT)) {
             uptr child = pmm64_alloc();
-            if (!child) return false;
+            if (!child) goto fail;
             *entry = child | WRITE | PRESENT;
+            created[depth] = child;
         }
         table = pmm64_pointer(*entry & ADDRESS_MASK);
+        ++depth;
     }
     u64 *leaf = &table[(virtual >> 12) & 511u];
-    if (*leaf & PRESENT) return false;
+    if (*leaf & PRESENT) goto fail;
     *leaf = physical | flags | PRESENT;
+    /* Верхние записи пропускают ring 3 только к листам с собственным флагом USER. */
+    if (flags & USER)
+        for (unsigned i = 0; i < depth; ++i) *entries[i] |= USER;
     return true;
+
+fail:
+    while (depth) {
+        --depth;
+        if (!created[depth]) continue;
+        *entries[depth] = 0;
+        pmm64_free(created[depth]);
+    }
+    return false;
 }
 
 static bool map_identity(uptr root, uptr start, uptr end, u64 flags) {
@@ -86,4 +105,61 @@ bool paging64_init(const struct boot_info *boot) {
     pmm64_use_direct_map();
     __asm__ volatile("mov %%cr3,%0" : "=r"(active));
     return active == root && active != previous;
+}
+
+static u64 *find_leaf(uptr root, uptr address) {
+    u64 *table = pmm64_pointer(root);
+    for (int shift = 39; shift > 12; shift -= 9) {
+        u64 entry = table[(address >> shift) & 511u];
+        if (!(entry & PRESENT)) return NULL;
+        table = pmm64_pointer(entry & ADDRESS_MASK);
+    }
+    return &table[(address >> 12) & 511u];
+}
+
+static void invalidate(uptr address) {
+    __asm__ volatile("invlpg (%0)" : : "r"(address) : "memory");
+}
+
+static void *map_user_page(uptr address, const u8 *code, uptr length) {
+    if (address < 0x400000ul || address >= 0x0000800000000000ul ||
+        (address & (PMM_PAGE_SIZE - 1)))
+        return NULL;
+    uptr root;
+    __asm__ volatile("mov %%cr3,%0" : "=r"(root));
+    root &= ADDRESS_MASK;
+    uptr page = pmm64_alloc();
+    if (!page) return NULL;
+    u8 *direct = pmm64_pointer(page);
+    u64 *alias = NULL;
+    if (code) {
+        alias = find_leaf(root, (uptr)direct);
+        if (!alias || !(*alias & WRITE)) {
+            pmm64_free(page);
+            return NULL;
+        }
+        for (uptr i = 0; i < length; ++i) direct[i] = code[i];
+        __asm__ volatile("" : : : "memory");
+        /* У исполняемой страницы не должно остаться записываемого псевдонима. */
+        *alias &= ~WRITE;
+        invalidate((uptr)direct);
+    }
+    if (!map_page(root, address, page, USER | (code ? 0 : WRITE | NO_EXECUTE))) {
+        if (alias) {
+            *alias |= WRITE;
+            invalidate((uptr)direct);
+        }
+        pmm64_free(page);
+        return NULL;
+    }
+    invalidate(address);
+    return direct;
+}
+
+void *paging64_user_page(uptr address) {
+    return map_user_page(address, NULL, 0);
+}
+
+bool paging64_user_code(uptr address, const u8 *code, uptr length) {
+    return code && length && length <= PMM_PAGE_SIZE && map_user_page(address, code, length);
 }

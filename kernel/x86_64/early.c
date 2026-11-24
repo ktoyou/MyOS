@@ -1,4 +1,5 @@
 #include "paging.h"
+#include "segments.h"
 
 #define COM1              0x3f8
 #define UEFI_ENTRY_MAGIC  0x55454649u
@@ -13,6 +14,9 @@
 
 #ifdef X64_TEST_PMM
 extern bool pmm64_check(const struct boot_info *boot);
+#endif
+#ifdef X64_TEST_RING3
+extern bool ring3_check(unsigned mode);
 #endif
 
 struct idt_gate {
@@ -162,7 +166,8 @@ static bool valid_boot_map(const struct boot_info *boot, u32 entry_magic) {
     return true;
 }
 
-__attribute__((noreturn)) void kernel64_exception(u64 vector, u64 error, u64 rip) {
+__attribute__((noreturn)) void kernel64_exception(u64 vector, u64 error, u64 rip,
+                                                 u64 cs, uptr frame, uptr interrupted_sp) {
     uptr cr2 = 0;
     if (vector == 14) __asm__ volatile("mov %%cr2,%0" : "=r"(cr2));
     serial_puts("x86-64 exception vector=");
@@ -174,6 +179,14 @@ __attribute__((noreturn)) void kernel64_exception(u64 vector, u64 error, u64 rip
     if (vector == 14) {
         serial_puts(" cr2=");
         serial_hex(cr2);
+    }
+    serial_puts(" cpl=");
+    serial_char((char)('0' + (cs & 3u)));
+    if ((cs & 3u) == 3) {
+        serial_puts(" user_rsp=");
+        serial_hex(interrupted_sp);
+        if (cs == 0x23 && segments64_on_entry_stack(frame) && ((const u64 *)frame)[6] == 0x1b)
+            serial_puts("\nx86-64 TSS entry stack active");
     }
     serial_puts("\nx86-64 exception halted\n");
     halt();
@@ -202,14 +215,18 @@ __attribute__((noreturn)) void kernel64_main(const struct boot_info *boot, u32 e
         halt();
     }
     serial_puts("MyOS x86-64: kernel CR3 active\n");
+    segments64_init();
 #if X64_TEST_EXCEPTION == 6
     __asm__ volatile("ud2");
 #elif X64_TEST_EXCEPTION == 13
-    /* Селектор за пределами временной GDT вызывает #GP с кодом ошибки. */
+    /* Системный дескриптор TSS недопустим в DS и даёт #GP с его селектором. */
     __asm__ volatile("mov $0x28, %%ax; mov %%ax, %%ds" : : : "ax", "memory");
 #endif
 #ifdef X64_TEST_PAGING
     check_paging(X64_TEST_PAGING, boot);
+#endif
+#ifdef X64_TEST_RING3
+    if (!ring3_check(X64_TEST_RING3)) serial_puts("x86-64 ring3 FAIL\n");
 #endif
 #endif
     halt();

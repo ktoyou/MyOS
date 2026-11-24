@@ -58,6 +58,28 @@ def check_paging():
     print('OVMF x86-64 paging live root: PASS', flush=True)
 
 
+def check_ring3():
+    cases = ((6, 0, None), (14, 5, 0x100000), (14, 0x15, 0x800ff8), (14, 7, 0x400000))
+    for mode, (vector, error, cr2) in enumerate(cases):
+        name = f'kernel-ring3-{mode}'
+        payload, kernel_end = image(name)
+        prefix = f'x86-64 exception vector={vector:#018x} error={error:#018x} rip='
+        markers = [prefix, 'x86-64 TSS entry stack active', 'x86-64 exception halted']
+        with tempfile.TemporaryDirectory(prefix='myos-ring3-x64-') as temp:
+            serial = boot_x64(pathlib.Path(temp), f'x64-{name}', payload, kernel_end, markers)
+        match = re.search(re.escape(prefix) + r'(0x[0-9a-f]{16})'
+                          r'(?: cr2=(0x[0-9a-f]{16}))? cpl=3 user_rsp=(0x[0-9a-f]{16})',
+                          serial)
+        assert match and 'x86-64 ring3 FAIL' not in serial, serial
+        assert (int(match[2], 16) if match[2] else None) == cr2, serial
+        assert int(match[3], 16) == (0x800ff8 if mode == 2 else 0x801000), serial
+        if mode == 2:
+            assert match[1] == match[2], serial
+        else:
+            assert 0x400000 <= int(match[1], 16) < 0x401000, serial
+        print(f'OVMF x86-64 ring3 {mode}: PASS', flush=True)
+
+
 def main():
     for suffix, vector, error in (('', None, None), ('-6', 6, 0), ('-13', 13, 0x28)):
         name = 'kernel' + suffix
@@ -84,5 +106,7 @@ if __name__ == '__main__':
         check_pmm()
     elif sys.argv[1:] == ['--paging']:
         check_paging()
+    elif sys.argv[1:] == ['--ring3']:
+        check_ring3()
     else:
         main()
