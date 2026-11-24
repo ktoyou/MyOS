@@ -12,11 +12,17 @@ struct pollfd {
 
 static unsigned char pages[8192] __attribute__((aligned(4096)));
 
-static long call(word number, word a0, word a1, word a2, word a3) {
+static long call5(word number, word a0, word a1, word a2, word a3, word a4) {
     register word fourth __asm__("r10") = a3;
+    register word fifth __asm__("r8") = a4;
     __asm__ volatile("syscall" : "+a"(number)
-                     : "D"(a0), "S"(a1), "d"(a2), "r"(fourth) : "rcx", "r11", "memory");
+                     : "D"(a0), "S"(a1), "d"(a2), "r"(fourth), "r"(fifth)
+                     : "rcx", "r11", "memory");
     return (long)number;
+}
+
+static long call(word number, word a0, word a1, word a2, word a3) {
+    return call5(number, a0, a1, a2, a3, 0);
 }
 
 static long poll(struct pollfd *fds, unsigned count, int timeout) {
@@ -117,11 +123,77 @@ static int check_blocking(void) {
     return 0;
 }
 
+static long ppoll(struct pollfd *fds, unsigned count, long *timeout, const word *mask) {
+    return call5(271, (word)fds, count, (word)timeout, (word)mask, sizeof(*mask));
+}
+
+static int check_ppoll(void) {
+    const word temporary = 1ul << 11, original = 1ul << 9;
+    word saved, old;
+    if (call(14, 2, (word)&original, (word)&saved, 8)) return 27;
+    long timeout[2] = {0, -1};
+    if (call5(271, 0, 0, (word)timeout, (word)&temporary, 0) != -22 ||
+        call5(271, 0, 0, 1, (word)&temporary, 0) != -14) return 28;
+    timeout[1] = 1000000000;
+    if (ppoll(0, 0, timeout, 0) != -22) return 28;
+    timeout[0] = -1;
+    timeout[1] = 0;
+    if (ppoll(0, 0, timeout, 0) != -22) return 28;
+    timeout[0] = 0;
+    if (call5(271, 0, 0, (word)timeout, (word)&temporary, 4) != -22 ||
+        call5(271, 0, 0, (word)timeout, 1, 8) != -14 ||
+        call5(271, 0, 0, (word)timeout, 0, 4) ||
+        ppoll(0, 1, timeout, &temporary) != -14) return 29;
+
+    word before[2], after[2];
+    timeout[1] = 1250000;
+    if (call(228, 1, (word)before, 0, 0) || ppoll(0, 0, timeout, &temporary) ||
+        timeout[0] || timeout[1] || call(228, 1, (word)after, 0, 0) ||
+        (after[0] - before[0]) * 1000000000ul + after[1] - before[1] < 1250000ul ||
+        call(14, 0, 0, (word)&old, 8) || old != original) return 30;
+
+    long *readonly_timeout = (void *)pages;
+    readonly_timeout[0] = 5;
+    readonly_timeout[1] = 0;
+    struct pollfd fd = {1, OUT, 0};
+    struct pollfd *readonly_fd = (void *)(pages + 128);
+    *readonly_fd = fd;
+    if (call(10, (word)pages, 4096, 1, 0) ||
+        ppoll(&fd, 1, readonly_timeout, &temporary) != 1 || fd.revents != OUT ||
+        readonly_timeout[0] != 5 || readonly_timeout[1] ||
+        ppoll(readonly_fd, 1, timeout, &temporary) != -14 ||
+        call(14, 0, 0, (word)&old, 8) || old != original ||
+        call(10, (word)pages, 4096, 3, 0)) return 31;
+    timeout[0] = 5;
+    if (ppoll(&fd, 1, timeout, &temporary) != 1 || timeout[0] < 0 || timeout[0] >= 5 ||
+        timeout[1] < 0 || timeout[1] >= 1000000000) return 32;
+    timeout[0] = 1ul << 40;
+    timeout[1] = 0;
+    if (ppoll(&fd, 1, timeout, &temporary) != 1 ||
+        timeout[0] < (1ul << 40) - 1 || timeout[0] > (1ul << 40)) return 32;
+
+    int ends[2], status;
+    if (call(22, (word)ends, 0, 0, 0)) return 33;
+    long child = call(57, 0, 0, 0, 0);
+    if (child < 0) return 33;
+    if (!child) {
+        if (poll(0, 0, 20) || call(1, ends[1], (word)"p", 1, 0) != 1) finish(34);
+        finish(0);
+    }
+    fd = (struct pollfd){ends[0], IN, 0};
+    if (ppoll(&fd, 1, 0, &temporary) != 1 || !(fd.revents & IN) ||
+        call(14, 0, 0, (word)&old, 8) || old != original ||
+        call(61, child, (word)&status, 0, 0) != child || status ||
+        close_fd(ends[0]) || close_fd(ends[1]) || call(14, 2, (word)&saved, 0, 8)) return 35;
+    return 0;
+}
+
 void _start(void) {
     int error = check_pipe();
     if (!error) error = check_socket();
     if (!error) error = check_copy();
     if (!error) error = check_blocking();
+    if (!error) error = check_ppoll();
     if (error) finish(error);
     static const char marker[] = "Linux ELF64 poll probe\n";
     if (call(1, 1, (word)marker, sizeof(marker) - 1, 0) != sizeof(marker) - 1) finish(26);

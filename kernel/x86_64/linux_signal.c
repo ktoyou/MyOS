@@ -36,13 +36,20 @@ long linux64_rt_sigaction(i32 signal, uptr action, uptr previous, uptr sigset_si
     return 0;
 }
 
+long linux64_read_signal_mask(uptr set, uptr sigset_size, u64 *mask) {
+    if (sigset_size != sizeof(*mask)) return -22;
+    if (paging64_copy_from_user(mask, set, sizeof(*mask)) != sizeof(*mask)) return -14;
+    *mask &= ~UNBLOCKABLE_SIGNALS;
+    return 0;
+}
+
 long linux64_rt_sigprocmask(i32 how, uptr set, uptr previous, uptr sigset_size) {
-    u64 input;
-    if (sigset_size != sizeof(input)) return -22;
+    if (sigset_size != sizeof(u64)) return -22;
     const u64 old = linux64_current->signal_mask;
     if (set) {
-        if (paging64_copy_from_user(&input, set, sizeof(input)) != sizeof(input)) return -14;
-        input &= ~UNBLOCKABLE_SIGNALS;
+        u64 input;
+        long result = linux64_read_signal_mask(set, sigset_size, &input);
+        if (result) return result;
         switch (how) {
         case SIG_BLOCK:
             linux64_current->signal_mask |= input;
