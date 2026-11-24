@@ -28,13 +28,22 @@ enum {
     SHUT_RD = 0, SHUT_WR = 1, SHUT_RDWR = 2,
 };
 
-static long call(word number, word a0, word a1, word a2, word a3, word a4) {
+static long call6(word number, word a0, word a1, word a2, word a3, word a4, word a5) {
     register word fourth __asm__("r10") = a3;
     register word fifth __asm__("r8") = a4;
+    register word sixth __asm__("r9") = a5;
     __asm__ volatile("syscall" : "+a"(number)
-                     : "D"(a0), "S"(a1), "d"(a2), "r"(fourth), "r"(fifth)
+                     : "D"(a0), "S"(a1), "d"(a2), "r"(fourth), "r"(fifth), "r"(sixth)
                      : "rcx", "r11", "memory");
     return (long)number;
+}
+
+static long call(word number, word a0, word a1, word a2, word a3, word a4) {
+    return call6(number, a0, a1, a2, a3, a4, 0);
+}
+
+static long send_bytes(int fd, const void *data, word size, word flags) {
+    return call(44, fd, (word)data, size, flags, 0);
 }
 
 static long pair_type(int *ends, word type) {
@@ -212,7 +221,7 @@ static long check_named(const struct unix_address *address) {
 
 static unsigned char transfer[384 * 1024];
 
-static long check_blocking_stream(const struct unix_address *address) {
+static long check_blocking_stream(const struct unix_address *address, int use_sendto) {
     long listener = stream(0);
     if (listener < 3 || named_call(49, listener, address) || call(50, listener, 4, 0, 0, 0)) return 54;
     long pid = call(57, 0, 0, 0, 0, 0);
@@ -220,7 +229,9 @@ static long check_blocking_stream(const struct unix_address *address) {
         long client = stream(0);
         if (client < 3 || close_fd(listener) || named_call(42, client, address)) goto child_fail;
         for (word i = 0; i < sizeof(transfer); ++i) transfer[i] = (unsigned char)i;
-        if (call(1, client, (word)transfer, sizeof(transfer), 0, 0) == sizeof(transfer) &&
+        long sent = use_sendto ? send_bytes(client, transfer, sizeof(transfer), MSG_NOSIGNAL)
+                              : call(1, client, (word)transfer, sizeof(transfer), 0, 0);
+        if (sent == sizeof(transfer) &&
             !shutdown(client, SHUT_WR) && !close_fd(client)) {
             call(60, 0, 0, 0, 0, 0);
         }
@@ -444,11 +455,12 @@ static long check_seqpacket_send_wait(void) {
     return 0;
 }
 
-static long check_stream_pair_queue(int left, int right) {
+static long check_stream_pair_queue(int left, int right, int use_sendto) {
     static char block[2048];
     long queued = 0;
     while (queued < 16 * 1024 * 1024) {
-        long sent = call(1, left, (word)block, sizeof(block), 0, 0);
+        long sent = use_sendto ? send_bytes(left, block, sizeof(block), MSG_DONTWAIT | MSG_NOSIGNAL)
+                              : call(1, left, (word)block, sizeof(block), 0, 0);
         if (sent == -11) break;
         if (sent <= 0) return 77;
         queued += sent;
@@ -489,7 +501,7 @@ static long check_stream_pair(void) {
         call(0, ends[1], (word)bytes, 1, 0, 0) != 1 || bytes[0] != 'a' ||
         call(0, ends[1], (word)bytes, sizeof(bytes), 0, 0) != 3 ||
         bytes[0] != 'b' || bytes[1] != 'c' || bytes[2] != 'd') return 74;
-    long queue_status = check_stream_pair_queue(ends[0], ends[1]);
+    long queue_status = check_stream_pair_queue(ends[0], ends[1], 0);
     if (queue_status) return queue_status;
     if (call(72, ends[0], 4, 0, 0, 0) || call(72, ends[1], 4, 0, 0, 0)) return 75;
     long pid = call(57, 0, 0, 0, 0, 0);
@@ -510,16 +522,48 @@ static long check_stream_pair(void) {
     return 0;
 }
 
+static long check_sendto(void) {
+    unsigned short address = AF_UNIX;
+    int ends[2];
+    if (send_bytes(-1, "C", 1, MSG_NOSIGNAL) != -9 ||
+        send_bytes(1, "C", 1, MSG_NOSIGNAL) != -88 ||
+        call(53, AF_UNIX, SOCK_STREAM, 0, (word)ends, 0)) return 80;
+    char byte;
+    if (send_bytes(ends[0], 0, 1, MSG_NOSIGNAL) != -14 ||
+        call6(44, ends[0], (word)"C", 1, MSG_NOSIGNAL, 1, sizeof(address)) != -14 ||
+        call6(44, ends[0], (word)"C", 1, MSG_NOSIGNAL, (word)&address, 129) != -22 ||
+        call6(44, ends[0], (word)"C", 1, MSG_NOSIGNAL, (word)&address, sizeof(address)) != -106 ||
+        send_bytes(ends[0], "C", 1, MSG_NOSIGNAL) != 1 ||
+        call(0, ends[1], (word)&byte, 1, 0, 0) != 1 || byte != 'C') return 81;
+    long result = check_stream_pair_queue(ends[0], ends[1], 1);
+    if (result) return result;
+    if (call(72, ends[0], 3, 0, 0, 0) != 2 || shutdown(ends[0], SHUT_WR) ||
+        send_bytes(ends[0], "C", 1, MSG_NOSIGNAL) != -32 ||
+        call(0, ends[1], (word)&byte, 1, 0, 0) || close_fd(ends[0]) || close_fd(ends[1])) return 82;
+    long unconnected = stream(0);
+    if (unconnected < 3 || send_bytes((int)unconnected, "C", 1, MSG_NOSIGNAL) != -107 ||
+        call6(44, unconnected, (word)"C", 1, MSG_NOSIGNAL, (word)&address, sizeof(address)) != -95 ||
+        close_fd(unconnected)) return 83;
+    if (pair(ends) ||
+        call6(44, ends[0], (word)"qr", 2, MSG_NOSIGNAL, (word)&address, sizeof(address)) != 2 ||
+        call(0, ends[1], (word)&byte, 1, 0, 0) != 1 || byte != 'q' ||
+        call(0, ends[1], (word)&byte, 1, 0, 0) != -11 ||
+        close_fd(ends[0]) || close_fd(ends[1])) return 84;
+    return 0;
+}
+
 static long check(void) {
     long status = check_stream();
     if (!status) status = check_stream_fd_limit();
     if (!status) status = check_stream_pair();
+    if (!status) status = check_sendto();
     struct unix_address address = {AF_UNIX, "/tmp/myos-socket-0000000000"};
     unsigned pid = (unsigned)call(39, 0, 0, 0, 0, 0);
     for (unsigned i = sizeof("/tmp/myos-socket-0000000000") - 2; pid; --i, pid /= 10)
         address.path[i] = (char)('0' + pid % 10);
     if (!status) status = check_named(&address);
-    if (!status) status = check_blocking_stream(&address);
+    if (!status) status = check_blocking_stream(&address, 0);
+    if (!status) status = check_blocking_stream(&address, 1);
     if (!status) status = check_listener_shutdown(&address);
     if (!status) status = check_seqpacket_receive_wait();
     if (!status) status = check_seqpacket_send_wait();

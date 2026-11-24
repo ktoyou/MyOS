@@ -660,8 +660,9 @@ static long socket_attempt(struct linux64_socket_wait *wait) {
 }
 
 static long socket_run(struct linux64_socket_wait wait) {
-    bool message = wait.operation == SOCKET_SENDMSG || wait.operation == SOCKET_RECVMSG;
-    wait.blocking = !(wait.file->flags & O_NONBLOCK) && !(message && (wait.flags & MSG_DONTWAIT));
+    bool per_call = wait.operation == SOCKET_WRITE || wait.operation == SOCKET_SENDMSG ||
+                    wait.operation == SOCKET_RECVMSG;
+    wait.blocking = !(wait.file->flags & O_NONBLOCK) && !(per_call && (wait.flags & MSG_DONTWAIT));
     long result = socket_attempt(&wait);
     if (result == -EAGAIN && wait.blocking) {
         ++wait.file->references;
@@ -669,6 +670,17 @@ static long socket_run(struct linux64_socket_wait wait) {
         linux64_current->state = TASK_SOCKET_WAIT;
     }
     return result;
+}
+
+long linux64_sendto(i32 fd, uptr buffer, uptr length, u32 flags, uptr address, i32 address_length) {
+    if (buffer >= X64_USER_TOP || length > X64_USER_TOP - buffer) return -EFAULT;
+    if (!open_file(fd)) return -EBADF;
+    struct file_handle *file = file_at(fd);
+    if (!file->socket) return -ENOTSOCK;
+    long result = linux64_socket_check_sendto(file->socket, flags, address, address_length);
+    if (result) return result;
+    return socket_run((struct linux64_socket_wait){.file = file, .operation = SOCKET_WRITE,
+                                                   .address = buffer, .length = length, .flags = flags});
 }
 
 bool linux64_socket_wait_ready(const struct linux64_task *task) {
