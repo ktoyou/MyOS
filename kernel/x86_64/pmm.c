@@ -8,6 +8,15 @@ extern const u8 _start[], __kernel_end[];
 static u64 available[BITMAP_WORDS];
 static u64 allocated[BITMAP_WORDS];
 static u32 next_page = PAGE_COUNT;
+static uptr physical_base;
+
+void *pmm64_pointer(uptr physical) {
+    return (void *)(physical_base + physical);
+}
+
+void pmm64_use_direct_map(void) {
+    physical_base = X64_DIRECT_BASE;
+}
 
 static u64 page_bit(u32 page) {
     return 1ull << (page % 64);
@@ -58,9 +67,8 @@ uptr pmm64_alloc(void) {
     allocated[page / 64] |= bit;
     next_page = find_available(page + 1);
 
-    /* Ранний CR3 тождественно отображает весь управляемый диапазон. */
     uptr physical = (uptr)page * PMM_PAGE_SIZE;
-    u64 *words = (void *)physical;
+    u64 *words = pmm64_pointer(physical);
     for (u32 i = 0; i < PMM_PAGE_SIZE / sizeof(*words); ++i) words[i] = 0;
     return physical;
 }
