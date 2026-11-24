@@ -1,5 +1,6 @@
 #include "linux_task.h"
 #include "paging.h"
+#include "build_info.h"
 
 #define EFER   0xc0000080u
 #define STAR   0xc0000081u
@@ -75,6 +76,17 @@ static long linux_write(uptr fd, uptr address, uptr size) {
     return (long)written;
 }
 
+static long linux_uname(uptr address) {
+    static const struct {
+        char sysname[65], nodename[65], release[65], version[65], machine[65], domainname[65];
+    } name = {
+        .sysname = "MyOS", .nodename = "myos", .release = MYOS_VERSION,
+        .version = "MyOS " MYOS_VERSION, .machine = "x86_64",
+    };
+    _Static_assert(sizeof(name) == 390, "Linux x86-64 uname size");
+    return paging64_copy_to_user(address, &name, sizeof(name)) == sizeof(name) ? 0 : -14;
+}
+
 __attribute__((noreturn)) void linux64_invalid_return(void) {
     linux64_task_exception(13);
     static const char message[] = "Linux x86-64 invalid syscall return\r\n";
@@ -93,6 +105,7 @@ long linux64_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2,
     if (number == 39 || number == 186) return linux64_current->pid; /* getpid, gettid */
     if (number == 54 || number == 55)
         return linux64_sockopt(number == 55, (i32)arg0, (i32)arg1, (i32)arg2, arg3, arg4);
+    if (number == 63) return linux_uname(arg0);
     if (number == 102 || number == 107) return LINUX64_UID; /* getuid, geteuid */
     if (number == 104 || number == 108) return LINUX64_GID; /* getgid, getegid */
     if (number == 158) return linux_arch_prctl((i32)arg0, arg1);

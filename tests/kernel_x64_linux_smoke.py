@@ -89,11 +89,12 @@ def check_files(build):
     probe = build / 'linux-files.elf'
     data = (build / 'linux-interp.elf').absolute()
     host = subprocess.run([str(probe.resolve())], env={}, capture_output=True, timeout=5)
-    assert (host.returncode, host.stdout, host.stderr) == (0, b'Linux ELF64 files probe\n', b''), host
+    assert (host.returncode, host.stdout, host.stderr) == (
+        0, b'Linux uname: Linux\nLinux ELF64 files probe\n', b''), host
     serial = check_guest('files', probe.read_bytes(), 'Linux x86-64 exit status=0x00',
                          files={data: data.read_bytes()})
-    assert 'Linux ELF64 files probe' in serial, serial
-    print('OVMF: Linux ELF64 file operations, rt_sigaction and signal masks: PASS', flush=True)
+    assert 'Linux uname: MyOS' in serial and 'Linux ELF64 files probe' in serial, serial
+    print('OVMF: Linux ELF64 file operations, signals and uname: PASS', flush=True)
 
 
 def check_mmap(build):
