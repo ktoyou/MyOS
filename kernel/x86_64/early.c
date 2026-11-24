@@ -1,8 +1,7 @@
-#include "../bootinfo.h"
+#include "pmm.h"
 
 #define COM1              0x3f8
 #define UEFI_ENTRY_MAGIC  0x55454649u
-#define BOOT_ARENA_LIMIT  0x40000000u
 #define BOOT_ARENA_SIZE   (32u * 4096)
 #define BOOT_MAP_OFFSET   (2u * 4096)
 #define BOOT_MAP_MAX      128u
@@ -12,10 +11,9 @@
 #define X64_TEST_EXCEPTION 0
 #endif
 
-struct boot_region {
-    u64 base, length;
-    u32 type, attributes;
-};
+#ifdef X64_TEST_PMM
+extern bool pmm64_check(const struct boot_info *boot);
+#endif
 
 struct idt_gate {
     u16 offset_low, selector;
@@ -94,18 +92,18 @@ static void install_idt(void) {
 static bool valid_boot_map(const struct boot_info *boot, u32 entry_magic) {
     uptr address = (uptr)boot;
     if (entry_magic != UEFI_ENTRY_MAGIC || address < 0x100000 ||
-        (address & 4095u) || address > BOOT_ARENA_LIMIT - BOOT_ARENA_SIZE)
+        (address & 4095u) || address > BOOT_MEMORY_LIMIT - BOOT_ARENA_SIZE)
         return false;
     if (boot->magic != BOOT_INFO_MAGIC || boot->version != 5 || boot->firmware != 1 ||
         boot->arena_phys != address || boot->arena_bytes != BOOT_ARENA_SIZE ||
         boot->map_phys != address + BOOT_MAP_OFFSET ||
-        !boot->map_count || boot->map_count > BOOT_MAP_MAX)
+        !boot->map_count || boot->map_count > BOOT_MAP_MAX || !boot_root_valid(boot))
         return false;
 
     const struct boot_region *map = (const void *)(uptr)boot->map_phys;
     for (u32 i = 0; i < boot->map_count; ++i) {
-        if (map[i].base >= BOOT_ARENA_LIMIT || !map[i].length ||
-            map[i].length > BOOT_ARENA_LIMIT - map[i].base ||
+        if (map[i].base >= BOOT_MEMORY_LIMIT || !map[i].length ||
+            map[i].length > BOOT_MEMORY_LIMIT - map[i].base ||
             ((map[i].base | map[i].length) & 4095u))
             return false;
         u64 end = map[i].base + map[i].length;
@@ -141,6 +139,16 @@ __attribute__((noreturn)) void kernel64_main(const struct boot_info *boot, u32 e
 #elif X64_TEST_EXCEPTION == 13
     /* Селектор за пределами временной GDT вызывает #GP с кодом ошибки. */
     __asm__ volatile("mov $0x28, %%ax; mov %%ax, %%ds" : : : "ax", "memory");
+#endif
+    if (!pmm64_init(boot)) {
+        serial_puts("MyOS x86-64: no free physical pages\n");
+        halt();
+    }
+    serial_puts("MyOS x86-64: physical pages ready\n");
+#ifdef X64_TEST_PMM
+    if (!pmm64_check(boot)) serial_puts("x86-64 PMM FAIL\n");
+    else if (boot->root_bytes) serial_puts("x86-64 PMM live PASS\n");
+    else serial_puts("x86-64 PMM disk PASS\n");
 #endif
     halt();
 }
