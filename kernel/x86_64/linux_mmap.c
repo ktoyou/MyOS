@@ -9,7 +9,8 @@
 enum {
     PROT_READ = 1, PROT_WRITE = 2, PROT_EXEC = 4,
     MAP_SHARED = 1, MAP_PRIVATE = 2, MAP_FIXED = 0x10, MAP_ANONYMOUS = 0x20, MAP_DENYWRITE = 0x800,
-    MAP_EXECUTABLE = 0x1000, MAP_NORESERVE = 0x4000, MAP_FIXED_NOREPLACE = 0x100000,
+    MAP_EXECUTABLE = 0x1000, MAP_NORESERVE = 0x4000, MAP_STACK = 0x20000,
+    MAP_FIXED_NOREPLACE = 0x100000,
     EBADF = 9, ENOMEM = 12, EACCES = 13, EEXIST = 17, EINVAL = 22, EOVERFLOW = 75,
 };
 
@@ -120,7 +121,7 @@ long linux64_mmap(uptr address, uptr length, u32 protection, u32 flags, i32 fd, 
         (protection & ~(PROT_READ | PROT_WRITE | PROT_EXEC)) ||
         (type != MAP_SHARED && type != MAP_PRIVATE) ||
         (flags & ~(MAP_SHARED | MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS | MAP_DENYWRITE |
-                   MAP_EXECUTABLE | MAP_NORESERVE | MAP_FIXED_NOREPLACE))) return -EINVAL;
+                   MAP_EXECUTABLE | MAP_NORESERVE | MAP_STACK | MAP_FIXED_NOREPLACE))) return -EINVAL;
     bool writable = (protection & PROT_WRITE) != 0;
     bool executable = (protection & PROT_EXEC) != 0;
     if (writable && executable) return -EACCES;
