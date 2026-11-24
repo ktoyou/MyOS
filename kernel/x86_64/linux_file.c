@@ -483,6 +483,10 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
         if (!open_file(fd)) return fd >= 0 && fd < STDIO_COUNT ? -ENOTSOCK : -EBADF;
         if (!file_at(fd)->socket) return -ENOTSOCK;
         return linux64_socket_message(file_at(fd)->socket, number == 47, arg1, (u32)arg2);
+    case 48: /* shutdown */
+        if (!open_file(fd)) return fd >= 0 && fd < STDIO_COUNT ? -ENOTSOCK : -EBADF;
+        if (!file_at(fd)->socket) return -ENOTSOCK;
+        return linux64_socket_shutdown(file_at(fd)->socket, (i32)arg1);
     case 53: /* socketpair */
         return linux_socketpair(fd, (u32)arg1, (i32)arg2, arg3);
     case 72: /* fcntl */

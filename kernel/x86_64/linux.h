@@ -35,6 +35,7 @@ long linux64_sockopt(bool get, i32 fd, i32 level, i32 option, uptr value, uptr l
 struct linux64_socket;
 long linux64_socket_pair(i32 domain, u32 type, i32 protocol, struct linux64_socket *ends[2]);
 void linux64_socket_close(struct linux64_socket *socket);
+long linux64_socket_shutdown(struct linux64_socket *socket, i32 how);
 long linux64_socket_option(struct linux64_socket *socket, bool get, i32 level, i32 option,
                            uptr value, uptr length);
 long linux64_socket_message(struct linux64_socket *socket, bool receive, uptr message, u32 flags);

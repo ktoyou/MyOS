@@ -7,6 +7,7 @@ enum {
     EAFNOSUPPORT = 97, ENOPROTOOPT = 92, ECONNRESET = 104,
     AF_UNIX = 1, SOCK_SEQPACKET = 5, SOCK_TYPE_MASK = 0xf,
     SOCK_NONBLOCK = 0x800, SOCK_CLOEXEC = 0x80000,
+    SHUT_RD = 0, SHUT_WR = 1, SHUT_RDWR = 2,
     SOL_SOCKET = 1, SO_TYPE = 3, SO_PASSCRED = 16, SCM_CREDENTIALS = 2,
     MSG_PEEK = 2, MSG_CTRUNC = 8, MSG_TRUNC = 0x20, MSG_DONTWAIT = 0x40,
     MSG_EOR = 0x80, MSG_NOSIGNAL = 0x4000, MSG_CMSG_CLOEXEC = 0x40000000,
@@ -53,7 +54,7 @@ struct linux64_socket {
     struct linux64_socket *peer;
     struct packet *head, *tail;
     unsigned queued;
-    bool open, passcred, reset;
+    bool open, passcred, reset, read_shutdown, write_shutdown;
 };
 
 /* Один конец может оставаться открытым после закрытия его пары. */
@@ -92,6 +93,20 @@ void linux64_socket_close(struct linux64_socket *socket) {
     while (socket->head) drop_packet(socket);
 }
 
+long linux64_socket_shutdown(struct linux64_socket *socket, i32 how) {
+    if (how < SHUT_RD || how > SHUT_RDWR) return -EINVAL;
+    /* Закрытие направления останавливает новые записи, но сохраняет очередь. */
+    if (how != SHUT_WR) {
+        socket->read_shutdown = true;
+        if (socket->peer->open) socket->peer->write_shutdown = true;
+    }
+    if (how != SHUT_RD) {
+        socket->write_shutdown = true;
+        if (socket->peer->open) socket->peer->read_shutdown = true;
+    }
+    return 0;
+}
+
 long linux64_socket_option(struct linux64_socket *socket, bool get, i32 level, i32 option,
                            uptr value, uptr length) {
     if (level != SOL_SOCKET || (option != SO_PASSCRED && !(get && option == SO_TYPE)))
@@ -120,7 +135,7 @@ static long send_packet(struct linux64_socket *socket, const struct iovec *iov, 
         return -ECONNRESET;
     }
     struct linux64_socket *peer = socket->peer;
-    if (!peer->open) return -EPIPE;
+    if (!peer->open || socket->write_shutdown) return -EPIPE;
     uptr length = 0;
     for (uptr i = 0; i < count; ++i) {
         if (iov[i].length > MAX_PACKET - length) return -EMSGSIZE;
@@ -176,7 +191,7 @@ static long receive_packet(struct linux64_socket *socket, const struct iovec *io
     if (!packet) {
         if (message) message->control_length = 0;
         /* Ожидание записи другого процесса ещё не связано с планировщиком. */
-        return socket->peer->open ? -EAGAIN : 0;
+        return socket->peer->open && !socket->read_shutdown ? -EAGAIN : 0;
     }
     uptr copied = 0;
     long result = 0;
