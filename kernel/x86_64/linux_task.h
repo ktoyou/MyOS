@@ -51,7 +51,7 @@ struct linux64_caps {
 
 enum linux64_task_state {
     TASK_FREE, TASK_RUNNABLE, TASK_WAITING, TASK_VFORK_WAIT, TASK_PIPE_WAIT, TASK_FUTEX_WAIT,
-    TASK_POLL_WAIT, TASK_DEAD,
+    TASK_POLL_WAIT, TASK_SOCKET_WAIT, TASK_DEAD,
 };
 
 struct linux64_pipe_io {
@@ -59,6 +59,19 @@ struct linux64_pipe_io {
     struct file_handle *file;
     uptr address, length, transferred;
     bool write, nonblock;
+};
+
+enum linux64_socket_operation { SOCKET_CONNECT, SOCKET_ACCEPT, SOCKET_READ, SOCKET_WRITE,
+                                SOCKET_SENDMSG, SOCKET_RECVMSG };
+
+struct linux64_socket_wait {
+    struct file_handle *file;
+    uptr address, length, transferred;
+    u64 inode;
+    u32 flags;
+    enum linux64_socket_operation operation;
+    bool blocking;
+    char path[LINUX64_UNIX_PATH_LIMIT + 2];
 };
 
 struct linux64_wait {
@@ -107,6 +120,7 @@ struct linux64_task {
     u64 signal_mask, fs, gs;
     struct linux64_wait wait;
     struct linux64_pipe_io pipe_io;
+    struct linux64_socket_wait socket_wait;
     struct linux64_futex_wait futex;
     struct linux64_poll_wait poll;
     uptr child_tid, clear_child_tid;
@@ -147,14 +161,19 @@ u16 linux64_pipe_poll(const struct linux64_pipe *pipe, bool writer);
 long linux64_poll(uptr address, u32 count, i32 timeout);
 bool linux64_poll_ready(struct linux64_task *task);
 long linux64_poll_resume(const struct linux64_task *task);
+bool linux64_socket_wait_ready(const struct linux64_task *task);
+void linux64_socket_wait_finish(struct linux64_task *task);
+long linux64_socket_wait_resume(void);
 const struct linux64_file_source *linux64_file_source(void);
 long linux64_vfs_walk(const struct linux64_file_source *source, const char *absolute,
                       struct linux64_file *file, char *resolved, bool follow_final);
 long linux64_vfs_mkdir(const struct linux64_file_source *source, const char *absolute, u32 mode);
 long linux64_vfs_symlink(const struct linux64_file_source *source, const char *absolute,
                          const char *target, uptr length);
+long linux64_vfs_socket(const struct linux64_file_source *source, const char *absolute, u32 mode,
+                        u64 *inode);
 long linux64_vfs_unlink(const struct linux64_file_source *source, const char *absolute);
-u32 linux64_directory_permissions(const struct linux64_file *file);
+u32 linux64_file_permissions(const struct linux64_file *file);
 bool linux64_special_node(const char *path, struct linux64_file *file);
 long linux64_user_string(uptr address, char *string, uptr limit);
 long linux64_execve(struct linux64_frame *frame, uptr filename, uptr argv, uptr envp);

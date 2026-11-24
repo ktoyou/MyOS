@@ -2,9 +2,10 @@
 #include "paging.h"
 
 enum {
-    EPERM = 1, ENOENT = 2, EIO = 5, EBADF = 9, ENOMEM = 12, EACCES = 13, EFAULT = 14,
+    EPERM = 1, ENOENT = 2, EIO = 5, EBADF = 9, EAGAIN = 11, ENOMEM = 12, EACCES = 13, EFAULT = 14,
     EBUSY = 16, EEXIST = 17, ENOTDIR = 20, EISDIR = 21, EINVAL = 22, EMFILE = 24, EFBIG = 27, EROFS = 30,
-    ENODEV = 19, ESPIPE = 29, ENAMETOOLONG = 36, ENOSYS = 38, ELOOP = 40, ENOTSOCK = 88,
+    ENODEV = 19, ENXIO = 6, ESPIPE = 29, ENAMETOOLONG = 36, ENOSYS = 38, ELOOP = 40, ENOTSOCK = 88,
+    EOPNOTSUPP = 95, EADDRINUSE = 98, ECONNREFUSED = 111, AF_UNIX = 1, MSG_DONTWAIT = 0x40,
     AT_FDCWD = -100, AT_SYMLINK_NOFOLLOW = 0x100, AT_REMOVEDIR = 0x200, AT_NO_AUTOMOUNT = 0x800,
     AT_EMPTY_PATH = 0x1000,
     O_ACCMODE = 3, O_WRONLY = 1, O_RDWR = 2, O_CREAT = 0x40, O_EXCL = 0x80,
@@ -22,7 +23,7 @@ enum {
 
 enum file_kind {
     FILE_REGULAR, FILE_SOCKET, FILE_PIPE, FILE_PROC_DIR, FILE_PROC_MAP, FILE_NULL, FILE_SERIAL,
-    FILE_NAMESPACE, FILE_PROC_LINK, FILE_DIRECTORY, FILE_SYMLINK,
+    FILE_NAMESPACE, FILE_PROC_LINK, FILE_DIRECTORY, FILE_SYMLINK, FILE_NAMED_SOCKET,
 };
 static const struct linux64_file null_file = {.inode = 1};
 
@@ -184,6 +185,11 @@ static void close_slot(struct linux64_fd_slot *slot) {
 void linux64_pipe_finish(struct linux64_task *task) {
     release_file(task->pipe_io.file);
     task->pipe_io.file = NULL;
+}
+
+void linux64_socket_wait_finish(struct linux64_task *task) {
+    release_file(task->socket_wait.file);
+    task->socket_wait.file = NULL;
 }
 
 static long pipe_io(struct file_handle *file, bool write, uptr address, uptr length) {
@@ -482,6 +488,107 @@ static long linux_socketpair(i32 domain, u32 type, i32 protocol, uptr address) {
     return -EFAULT;
 }
 
+static long socket_write(struct linux64_socket_wait *wait) {
+    while (wait->blocking) {
+        long result = linux64_socket_io(wait->file->socket, false,
+                                       wait->address + wait->transferred, wait->length - wait->transferred);
+        if (result == -EAGAIN) return result;
+        if (result <= 0) return wait->transferred ? (long)wait->transferred : result;
+        wait->transferred += (uptr)result;
+        if (wait->transferred == wait->length) return (long)wait->transferred;
+    }
+    return linux64_socket_io(wait->file->socket, false, wait->address, wait->length);
+}
+
+static long socket_attempt(struct linux64_socket_wait *wait) {
+    struct linux64_socket *socket = wait->file->socket;
+    switch (wait->operation) {
+    case SOCKET_CONNECT: {
+        struct linux64_file node;
+        long result = linux64_vfs_walk(&files, wait->path, &node, NULL, true);
+        if (result) return result;
+        if ((node.mode & LINUX64_S_IFMT) != LINUX64_S_IFSOCK) return -ECONNREFUSED;
+        if (!(linux64_file_permissions(&node) & 2u)) return -EACCES;
+        wait->inode = node.inode;
+        return linux64_socket_connect(socket, wait->inode);
+    }
+    case SOCKET_ACCEPT: {
+        if (free_fd(0) == FD_COUNT) return -EMFILE;
+        struct linux64_socket *accepted;
+        long result = linux64_socket_pending(socket, wait->blocking, &accepted);
+        if (result) return result;
+        long fd = new_socket_handle(accepted, wait->flags);
+        if (fd < 0) return fd;
+        linux64_socket_dequeue(socket);
+        if (wait->address) {
+            result = linux64_socket_name(accepted, true, wait->address, wait->length);
+            if (result) {
+                close_file((i32)fd);
+                return result;
+            }
+        }
+        return fd;
+    }
+    case SOCKET_READ:
+        return linux64_socket_io(socket, true, wait->address, wait->length);
+    case SOCKET_WRITE:
+        return socket_write(wait);
+    case SOCKET_SENDMSG:
+    case SOCKET_RECVMSG:
+        return linux64_socket_message(socket, wait->operation == SOCKET_RECVMSG, wait->address, wait->flags);
+    }
+    return -EINVAL;
+}
+
+static long socket_run(struct linux64_socket_wait wait) {
+    bool message = wait.operation == SOCKET_SENDMSG || wait.operation == SOCKET_RECVMSG;
+    wait.blocking = linux64_socket_is_stream(wait.file->socket) && !(wait.file->flags & O_NONBLOCK) &&
+                    !(message && (wait.flags & MSG_DONTWAIT));
+    long result = socket_attempt(&wait);
+    if (result == -EAGAIN && wait.blocking) {
+        ++wait.file->references;
+        linux64_current->socket_wait = wait;
+        linux64_current->state = TASK_SOCKET_WAIT;
+    }
+    return result;
+}
+
+bool linux64_socket_wait_ready(const struct linux64_task *task) {
+    const struct linux64_socket_wait *wait = &task->socket_wait;
+    const struct linux64_socket *socket = wait->file->socket;
+    if (wait->operation == SOCKET_CONNECT) return linux64_socket_connect_ready(socket, wait->inode);
+    if (wait->operation == SOCKET_ACCEPT) return linux64_socket_accept_ready(socket);
+    return linux64_socket_io_ready(socket, wait->operation == SOCKET_READ || wait->operation == SOCKET_RECVMSG);
+}
+
+long linux64_socket_wait_resume(void) {
+    long result = socket_attempt(&linux64_current->socket_wait);
+    if (result == -EAGAIN) linux64_current->state = TASK_SOCKET_WAIT;
+    return result;
+}
+
+static long socket_path(struct file_handle *file, bool bind, uptr address, u32 length) {
+    struct linux64_sockaddr name = {0};
+    if (length <= 2 || length > 2 + sizeof(name.path) - 1) return -EINVAL;
+    if (paging64_copy_from_user(&name, address, length) != length) return -EFAULT;
+    if (name.family != AF_UNIX) return -EINVAL;
+    if (!name.path[0]) return -EOPNOTSUPP;
+    char path[sizeof(name.path) + 1];
+    for (unsigned i = 0; (path[i + 1] = name.path[i]); ++i) {}
+    const char *absolute = root_path(path);
+    if (bind) {
+        if (!linux64_socket_can_bind(file->socket)) return -EINVAL;
+        u64 inode;
+        long result = linux64_vfs_socket(&files, absolute, 0777u & ~linux64_current->process->umask, &inode);
+        if (result) return result == -EEXIST ? -EADDRINUSE : result;
+        linux64_socket_bind(file->socket, inode, name.path);
+        return 0;
+    }
+    struct linux64_socket_wait wait = {.file = file, .operation = SOCKET_CONNECT};
+    for (unsigned i = 0; (wait.path[i] = absolute[i]); ++i) {}
+    return socket_run(wait);
+}
+
 long linux64_sockopt(bool get, i32 fd, i32 level, i32 option, uptr value, uptr length) {
     if (!open_file(fd)) return -EBADF;
     if (!file_at(fd)->socket) return -ENOTSOCK;
@@ -651,6 +758,7 @@ static long lookup(i32 dirfd, uptr address, u32 flags, struct linux64_file *file
     if (result > 0) handle_stat(target, file, memfd);
     u32 type = file->mode & LINUX64_S_IFMT;
     *kind = type == LINUX64_S_IFDIR ? FILE_DIRECTORY :
+            type == LINUX64_S_IFSOCK ? FILE_NAMED_SOCKET :
             type == LINUX64_S_IFLNK ? FILE_SYMLINK : FILE_REGULAR;
     return 0;
 }
@@ -703,6 +811,10 @@ static long linux_open(i32 dirfd, uptr address, u32 flags) {
     if (type == LINUX64_S_IFLNK) {
         if (flags & O_DIRECTORY) return -ENOTDIR;
         return exclusive ? -EEXIST : -ELOOP;
+    }
+    if (type == LINUX64_S_IFSOCK) {
+        if (flags & O_DIRECTORY) return -ENOTDIR;
+        return exclusive ? -EEXIST : -ENXIO;
     }
     if (path_equal(absolute, "/dev/null", false)) {
         if (flags & O_DIRECTORY) return -ENOTDIR;
@@ -767,7 +879,7 @@ static long linux_open(i32 dirfd, uptr address, u32 flags) {
         if (flags & O_CREAT) return flags & O_EXCL ? -EEXIST : -EISDIR;
         if (flags & ~(O_NONBLOCK | O_LARGEFILE | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC))
             return -EINVAL;
-        if (!(linux64_directory_permissions(&file) & 4u)) return -EACCES;
+        if (!(linux64_file_permissions(&file) & 4u)) return -EACCES;
         uptr physical = pmm64_alloc();
         if (!physical) return -ENOMEM;
         result = new_handle(&file, NULL, flags | O_LARGEFILE);
@@ -860,8 +972,11 @@ static long linux_read(i32 fd, uptr buffer, uptr count, uptr offset, bool positi
         if ((handle->flags & O_ACCMODE) == O_WRONLY) return -EBADF;
         return pipe_io(handle, false, buffer, count);
     }
-    if (handle->socket)
-        return positioned ? -ESPIPE : linux64_socket_io(handle->socket, true, buffer, count);
+    if (handle->socket) {
+        if (positioned) return -ESPIPE;
+        return socket_run((struct linux64_socket_wait){.file = handle, .operation = SOCKET_READ,
+                                                       .address = buffer, .length = count});
+    }
     if (!positioned) offset = file_at(fd)->offset;
     if (handle->proc_node) {
         if (handle->proc_node == PROC_USER_NS) return positioned ? -ESPIPE : -EINVAL;
@@ -929,7 +1044,7 @@ static long file_stat(const struct linux64_file *file, const struct memfd *memfd
         mode = file->mode;
         device = 9;
         links = 2;
-    } else if (kind == FILE_SYMLINK) {
+    } else if (kind == FILE_SYMLINK || kind == FILE_NAMED_SOCKET) {
         mode = file->mode;
         device = 9;
     } else if (memfd) {
@@ -939,7 +1054,7 @@ static long file_stat(const struct linux64_file *file, const struct memfd *memfd
     const struct linux64_userns *ns = linux64_current->process->userns;
     bool owned = kind == FILE_SOCKET || kind == FILE_PIPE || kind == FILE_PROC_MAP ||
                  kind == FILE_PROC_LINK || memfd;
-    bool named = kind == FILE_DIRECTORY || kind == FILE_SYMLINK;
+    bool named = kind == FILE_DIRECTORY || kind == FILE_SYMLINK || kind == FILE_NAMED_SOCKET;
     const struct linux_stat stat = {
         .dev = device, .ino = file->inode, .nlink = links, .mode = mode,
         .uid = linux64_visible_id(ns, false, named ? file->uid : owned ? LINUX64_UID : 0),
@@ -972,7 +1087,9 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
             if (copied > 0) handle->offset += (uptr)copied;
             return copied;
         }
-        if (file_at(fd)->socket) return linux64_socket_io(file_at(fd)->socket, false, arg1, arg2);
+        if (file_at(fd)->socket)
+            return socket_run((struct linux64_socket_wait){.file = file_at(fd), .operation = SOCKET_WRITE,
+                                                           .address = arg1, .length = arg2});
         if (!file_at(fd)->pipe || (file_at(fd)->flags & O_ACCMODE) != O_WRONLY) return -EBADF;
         return pipe_io(file_at(fd), true, arg1, arg2);
     case 2: /* open */
@@ -1010,9 +1127,9 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
             if (arg1 & 1u) return -EACCES;
             return (arg1 & 2u) ? -EPERM : 0;
         }
-        if (kind == FILE_DIRECTORY) {
-            if ((arg1 & 2u) && !file.writable_directory) return -EROFS;
-            return (arg1 & ~linux64_directory_permissions(&file)) ? -EACCES : 0;
+        if (kind == FILE_DIRECTORY || kind == FILE_NAMED_SOCKET) {
+            if (kind == FILE_DIRECTORY && (arg1 & 2u) && !file.writable_directory) return -EROFS;
+            return (arg1 & ~linux64_file_permissions(&file)) ? -EACCES : 0;
         }
         return (arg1 & 3u) ? -EACCES : 0;
     case 22: /* pipe */
@@ -1023,15 +1140,39 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
         return dup_to(fd, (i32)arg1, false);
     case 41: /* socket */
         return linux_socket(fd, (u32)arg1, (i32)arg2);
+    case 42: /* connect */
+    case 49: /* bind */
+        if (!open_file(fd)) return -EBADF;
+        if (!file_at(fd)->socket) return -ENOTSOCK;
+        return socket_path(file_at(fd), number == 49, arg1, (u32)arg2);
+    case 43: /* accept */
+    case 288: /* accept4 */ {
+        if (!open_file(fd)) return -EBADF;
+        if (!file_at(fd)->socket) return -ENOTSOCK;
+        u32 flags = number == 288 ? (u32)arg3 : 0;
+        if (flags & ~(O_NONBLOCK | O_CLOEXEC)) return -EINVAL;
+        return socket_run((struct linux64_socket_wait){.file = file_at(fd), .operation = SOCKET_ACCEPT,
+                                                       .address = arg1, .length = arg2, .flags = flags});
+    }
     case 46: /* sendmsg */
     case 47: /* recvmsg */
         if (!open_file(fd)) return -EBADF;
         if (!file_at(fd)->socket) return -ENOTSOCK;
-        return linux64_socket_message(file_at(fd)->socket, number == 47, arg1, (u32)arg2);
+        return socket_run((struct linux64_socket_wait){.file = file_at(fd), .address = arg1, .flags = (u32)arg2,
+                                                       .operation = number == 47 ? SOCKET_RECVMSG : SOCKET_SENDMSG});
     case 48: /* shutdown */
         if (!open_file(fd)) return -EBADF;
         if (!file_at(fd)->socket) return -ENOTSOCK;
         return linux64_socket_shutdown(file_at(fd)->socket, (i32)arg1);
+    case 50: /* listen */
+        if (!open_file(fd)) return -EBADF;
+        if (!file_at(fd)->socket) return -ENOTSOCK;
+        return linux64_socket_listen(file_at(fd)->socket, (u32)arg1);
+    case 51: /* getsockname */
+    case 52: /* getpeername */
+        if (!open_file(fd)) return -EBADF;
+        if (!file_at(fd)->socket) return -ENOTSOCK;
+        return linux64_socket_name(file_at(fd)->socket, number == 52, arg1, arg2);
     case 53: /* socketpair */
         return linux_socketpair(fd, (u32)arg1, (i32)arg2, arg3);
     case 72: /* fcntl */

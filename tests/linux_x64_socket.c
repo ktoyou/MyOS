@@ -132,6 +132,134 @@ static long check_stream_fd_limit(void) {
     return 0;
 }
 
+struct unix_address {
+    unsigned short family;
+    char path[108];
+};
+
+static long named_call(word number, long fd, const struct unix_address *address) {
+    return call(number, fd, (word)address, sizeof(*address), 0, 0);
+}
+
+static long check_named(const struct unix_address *address) {
+    long listener = stream(SOCK_NONBLOCK), client = stream(0), second = stream(SOCK_NONBLOCK);
+    if (listener < 3 || client < 3 || second < 3 || call(50, listener, 0, 0, 0, 0) != -22 ||
+        named_call(42, client, address) != -2 || call(49, listener, (word)address, 111, 0, 0) != -22 ||
+        call(49, listener, 0, sizeof(*address), 0, 0) != -14) return 43;
+    long mask = call(95, 0077, 0, 0, 0, 0);
+    if (mask < 0 || named_call(49, listener, address) || call(95, mask, 0, 0, 0, 0) != 0077 ||
+        named_call(49, second, address) != -98 || named_call(42, client, address) != -111) return 44;
+    word info[18], descriptor[18];
+    if (call(4, (word)address->path, (word)info, 0, 0, 0) || (info[3] & 0177777) != 0140700 ||
+        call(5, listener, (word)descriptor, 0, 0, 0) ||
+        (info[0] == descriptor[0] && info[1] == descriptor[1]) ||
+        call(2, (word)address->path, 0, 0, 0, 0) != -6 ||
+        call(21, (word)address->path, 7, 0, 0, 0)) return 45;
+
+    struct { int fd; short events, revents; } pollfd = {(int)listener, 0x2255, 0};
+    if (call(50, listener, 0, 0, 0, 0) || call(43, listener, 0, 0, 0, 0) != -11 ||
+        call(7, (word)&pollfd, 1, 0, 0, 0) || pollfd.revents) return 46;
+    int extra[26];
+    for (unsigned i = 0; i < sizeof(extra) / sizeof(*extra); ++i) {
+        long fd = stream(0);
+        if (fd < 3) return 63;
+        extra[i] = (int)fd;
+    }
+    if (call(43, listener, 0, 0, 0, 0) != -24 || named_call(42, client, address) ||
+        named_call(42, second, address) != -11 || call(43, listener, 0, 0, 0, 0) != -24 ||
+        call(7, (word)&pollfd, 1, 0, 0, 0) != 1 || pollfd.revents != 0x41) return 64;
+    for (unsigned i = 0; i < sizeof(extra) / sizeof(*extra); ++i)
+        if (close_fd(extra[i])) return 65;
+    struct unix_address remote;
+    unsigned len = sizeof(remote);
+    if (call(288, listener, 0, 0, 1, 0) != -22) return 47;
+    long accepted = call(288, listener, (word)&remote, (word)&len, SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (accepted < 3 || len != 2 || remote.family != AF_UNIX ||
+        call(72, accepted, 1, 0, 0, 0) != 1 || call(72, accepted, 3, 0, 0, 0) != 0x802 ||
+        call(52, client, (word)&remote, (word)&len, 0, 0) || len <= 2 || remote.family != AF_UNIX ||
+        named_call(42, second, address)) return 48;
+    if (call(43, listener, 1, 0, 0, 0) != -14 || call(43, listener, 0, 0, 0, 0) != -11 ||
+        close_fd(second)) return 49;
+
+    char bytes[8];
+    struct iovec rx = {bytes, 2};
+    struct msghdr message = {.iov = &rx, .iov_count = 1};
+    if (receive(accepted, &message, 0) != -11 || call(1, client, 0, 0, 0, 0) ||
+        call(1, client, (word)"ab", 2, 0, 0) != 2 || call(1, client, (word)"cdef", 4, 0, 0) != 4 ||
+        call(0, accepted, (word)bytes, 3, 0, 0) != 3 || bytes[0] != 'a' || bytes[2] != 'c' ||
+        receive(accepted, &message, MSG_PEEK) != 2 || bytes[0] != 'd' || bytes[1] != 'e' ||
+        receive(accepted, &message, MSG_TRUNC) != 2 || bytes[0] != 'd' || bytes[1] != 'e') return 50;
+    if (shutdown(client, SHUT_WR) || call(0, accepted, (word)bytes, sizeof(bytes), 0, 0) != 1 ||
+        bytes[0] != 'f' || call(0, accepted, (word)bytes, sizeof(bytes), 0, 0)) return 51;
+
+    if (call(87, (word)address->path, 0, 0, 0, 0) ||
+        call(1, accepted, (word)"x", 1, 0, 0) != 1 || call(0, client, (word)bytes, 1, 0, 0) != 1 ||
+        bytes[0] != 'x' || close_fd(listener) || close_fd(accepted) || close_fd(client)) return 52;
+    listener = stream(0);
+    client = stream(0);
+    if (listener < 3 || client < 3 || named_call(49, listener, address) ||
+        call(50, listener, 1, 0, 0, 0) || named_call(42, client, address) || close_fd(listener) ||
+        call(0, client, (word)bytes, 1, 0, 0) != -104 || call(0, client, (word)bytes, 1, 0, 0)) return 53;
+    second = stream(0);
+    if (second < 3 || named_call(42, second, address) != -111 || named_call(49, second, address) != -98 ||
+        call(87, (word)address->path, 0, 0, 0, 0) || close_fd(second) || close_fd(client)) return 60;
+    return 0;
+}
+
+static unsigned char transfer[384 * 1024];
+
+static long check_blocking_stream(const struct unix_address *address) {
+    long listener = stream(0);
+    if (listener < 3 || named_call(49, listener, address) || call(50, listener, 4, 0, 0, 0)) return 54;
+    long pid = call(57, 0, 0, 0, 0, 0);
+    if (!pid) {
+        long client = stream(0);
+        if (client < 3 || close_fd(listener) || named_call(42, client, address)) goto child_fail;
+        for (word i = 0; i < sizeof(transfer); ++i) transfer[i] = (unsigned char)i;
+        if (call(1, client, (word)transfer, sizeof(transfer), 0, 0) == sizeof(transfer) &&
+            !shutdown(client, SHUT_WR) && !close_fd(client)) {
+            call(60, 0, 0, 0, 0, 0);
+        }
+    child_fail:
+        call(60, 1, 0, 0, 0, 0);
+        __builtin_trap();
+    }
+    if (pid < 0) return 55;
+    long accepted = call(43, listener, 0, 0, 0, 0);
+    if (accepted < 3 || call(72, accepted, 1, 0, 0, 0) || call(72, accepted, 3, 0, 0, 0) != 2) return 56;
+    unsigned char bytes[7777];
+    word total = 0;
+    for (;;) {
+        long got = call(0, accepted, (word)bytes, sizeof(bytes), 0, 0);
+        if (got < 0 || (word)got > sizeof(transfer) - total) return 57;
+        if (!got) break;
+        for (long i = 0; i < got; ++i)
+            if (bytes[i] != (unsigned char)(total + (word)i)) return 58;
+        total += (word)got;
+    }
+    int status;
+    if (total != sizeof(transfer) || call(61, pid, (word)&status, 0, 0, 0) != pid || status ||
+        close_fd(accepted) || close_fd(listener) || call(87, (word)address->path, 0, 0, 0, 0)) return 59;
+    return 0;
+}
+
+static long check_listener_shutdown(const struct unix_address *address) {
+    long listener = stream(0);
+    if (listener < 3 || named_call(49, listener, address) || call(50, listener, 0, 0, 0, 0)) return 61;
+    long pid = call(57, 0, 0, 0, 0, 0);
+    if (!pid) {
+        call(24, 0, 0, 0, 0, 0);
+        call(60, shutdown(listener, SHUT_RD) != 0, 0, 0, 0, 0);
+        __builtin_trap();
+    }
+    int status;
+    if (pid < 0 || call(43, listener, 0, 0, 0, 0) != -22 ||
+        call(61, pid, (word)&status, 0, 0, 0) != pid || status ||
+        call(72, listener, 4, SOCK_NONBLOCK, 0, 0) || call(43, listener, 0, 0, 0, 0) != -11 ||
+        close_fd(listener) || call(87, (word)address->path, 0, 0, 0, 0)) return 62;
+    return 0;
+}
+
 static long check_options(int fd) {
     int value;
     unsigned length = sizeof(value);
@@ -257,6 +385,13 @@ static long check_fd_limit(void) {
 static long check(void) {
     long status = check_stream();
     if (!status) status = check_stream_fd_limit();
+    struct unix_address address = {AF_UNIX, "/tmp/myos-socket-0000000000"};
+    unsigned pid = (unsigned)call(39, 0, 0, 0, 0, 0);
+    for (unsigned i = sizeof("/tmp/myos-socket-0000000000") - 2; pid; --i, pid /= 10)
+        address.path[i] = (char)('0' + pid % 10);
+    if (!status) status = check_named(&address);
+    if (!status) status = check_blocking_stream(&address);
+    if (!status) status = check_listener_shutdown(&address);
     if (status) return status;
     int ends[2];
     for (unsigned i = 0; i < 40; ++i)

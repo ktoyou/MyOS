@@ -406,6 +406,7 @@ static void stop_task(struct linux64_task *task) {
         paging64_copy_to_user(address, &zero, sizeof(zero)) == sizeof(zero))
         linux64_futex(address, FUTEX_WAKE, 1, 0, 0);
     linux64_pipe_finish(task);
+    linux64_socket_wait_finish(task);
     task->state = TASK_DEAD;
     --task->process->threads;
 }
@@ -470,7 +471,8 @@ static struct linux64_task *pick_task(const struct linux64_task *current) {
         for (unsigned i = 1; i <= LINUX64_TASK_COUNT; ++i) {
             struct linux64_task *candidate = &tasks[(index + i) % LINUX64_TASK_COUNT];
             if (candidate->state == TASK_RUNNABLE ||
-                (candidate->state == TASK_PIPE_WAIT && linux64_pipe_ready(&candidate->pipe_io)))
+                (candidate->state == TASK_PIPE_WAIT && linux64_pipe_ready(&candidate->pipe_io)) ||
+                (candidate->state == TASK_SOCKET_WAIT && linux64_socket_wait_ready(candidate)))
                 return candidate;
             if (candidate->state != TASK_POLL_WAIT) continue;
             if (linux64_poll_ready(candidate)) return candidate;
@@ -494,6 +496,11 @@ static void resume_wait(struct linux64_task *task) {
         task->frame.rax = (u64)linux64_pipe_resume();
         if (task->state == TASK_RUNNABLE) linux64_pipe_finish(task);
     }
+    if (task->state == TASK_SOCKET_WAIT) {
+        task->state = TASK_RUNNABLE;
+        task->frame.rax = (u64)linux64_socket_wait_resume();
+        if (task->state == TASK_RUNNABLE) linux64_socket_wait_finish(task);
+    }
     if (task->finish_wait) {
         task->finish_wait = false;
         task->frame.rax = (u64)wait_child(task->wait);
@@ -503,7 +510,7 @@ static void resume_wait(struct linux64_task *task) {
 static void schedule(struct linux64_frame *frame) {
     struct linux64_task *old = linux64_current;
     struct linux64_task *next = pick_task(old);
-    if (next == old) {
+    if (next == old && old->state != TASK_SOCKET_WAIT) {
         if (old->state == TASK_POLL_WAIT) {
             frame->rax = (u64)linux64_poll_resume(old);
             old->state = TASK_RUNNABLE;
