@@ -4,12 +4,16 @@
 enum {
     EPERM = 1, ESRCH = 3, ECHILD = 10, EAGAIN = 11, ENOMEM = 12, EFAULT = 14,
     EINVAL = 22, ENOSYS = 38,
-    SIGCHLD = 17, CHILD_CLEARTID = 0x200000, CHILD_SETTID = 0x1000000,
+    SIGCHLD = 17, CLONE_VM = 0x100, CLONE_VFORK = 0x4000,
+    CHILD_CLEARTID = 0x200000, CHILD_SETTID = 0x1000000,
     SA_NOCLDWAIT = 2, SIG_IGN = 1,
-    WNOHANG = 1, WUNTRACED = 2, WCONTINUED = 8,
+    WNOHANG = 1, WUNTRACED = 2, WEXITED = 4, WCONTINUED = 8, WNOWAIT = 0x01000000,
+    P_ALL = 0, P_PID = 1, P_PGID = 2,
+    CLD_EXITED = 1, CLD_KILLED = 2,
 };
 
 static struct linux64_task tasks[LINUX64_TASK_COUNT];
+static struct linux64_address_space address_spaces[LINUX64_TASK_COUNT];
 struct linux64_task *linux64_current = &tasks[0];
 static i32 next_pid = LINUX64_PID + 1;
 static u64 xfeatures;
@@ -24,7 +28,9 @@ void linux64_task_init(void) {
     linux64_current->pid = LINUX64_PID;
     linux64_current->sid = LINUX64_PID;
     linux64_current->pgid = LINUX64_PID;
-    linux64_current->root = paging64_active_root();
+    linux64_current->memory = &address_spaces[0];
+    linux64_current->memory->root = paging64_active_root();
+    linux64_current->memory->references = 1;
     linux64_current->state = TASK_RUNNABLE;
     xstate_supported = true;
     uptr cr0, cr4;
@@ -71,68 +77,156 @@ static void restore_state(const struct linux64_task *task) {
     }
 }
 
+static struct linux64_address_space *fork_memory(const struct linux64_address_space *parent) {
+    for (unsigned i = 0; i < LINUX64_TASK_COUNT; ++i) {
+        struct linux64_address_space *child = &address_spaces[i];
+        if (child->references) continue;
+        uptr root = paging64_fork_root();
+        if (!root) return NULL;
+        child->root = root;
+        child->references = 1;
+        child->reserve_count = parent->reserve_count;
+        for (unsigned j = 0; j < parent->reserve_count; ++j) child->reserves[j] = parent->reserves[j];
+        return child;
+    }
+    return NULL;
+}
+
+static void release_memory(struct linux64_task *task) {
+    struct linux64_address_space *memory = task->memory;
+    task->memory = NULL;
+    if (!--memory->references) {
+        paging64_drop_root(memory->root);
+        memory->root = 0;
+    }
+}
+
 static long fork_task(struct linux64_frame *frame, uptr flags, uptr stack, uptr tid) {
-    if (stack || (flags & ~(CHILD_CLEARTID | CHILD_SETTID)) != SIGCHLD || !xstate_supported)
-        return -ENOSYS;
+    bool shared = flags == (CLONE_VM | CLONE_VFORK | SIGCHLD);
+    if ((!shared && (stack || (flags & ~(CHILD_CLEARTID | CHILD_SETTID)) != SIGCHLD)) ||
+        !xstate_supported) return -ENOSYS;
+    if (stack >= X64_USER_TOP) return -EINVAL;
     unsigned slot = 1;
     while (slot < LINUX64_TASK_COUNT && tasks[slot].state != TASK_FREE) ++slot;
     if (slot == LINUX64_TASK_COUNT || next_pid == 0x7fffffff) return -EAGAIN;
-    uptr root = paging64_fork_root();
-    if (!root) return -ENOMEM;
-
     struct linux64_task *child = &tasks[slot];
     struct linux64_task *parent = linux64_current;
+    struct linux64_address_space *memory = shared ? parent->memory : fork_memory(parent->memory);
+    if (!memory) return -ENOMEM;
+    if (shared) ++memory->references;
     child->frame = *frame;
     child->frame.rax = 0;
-    child->root = root;
+    if (stack) child->frame.rsp = stack;
+    child->memory = memory;
     child->pid = next_pid++;
     child->ppid = parent->pid;
     child->sid = parent->sid;
     child->pgid = parent->pgid;
     child->child_tid = flags & CHILD_SETTID ? tid : 0;
     child->finish_wait = false;
+    child->vfork_child = 0;
     child->signal_mask = parent->signal_mask;
-    child->reserve_count = parent->reserve_count;
-    for (unsigned i = 0; i < parent->reserve_count; ++i) child->reserves[i] = parent->reserves[i];
     for (unsigned i = 0; i < LINUX64_SIGNAL_COUNT; ++i) child->actions[i] = parent->actions[i];
     for (unsigned i = 0; i < LINUX64_FD_COUNT; ++i) child->fds[i] = parent->fds[i];
     linux64_retain_files(child);
     save_state(child);
     child->state = TASK_RUNNABLE;
+    if (shared) {
+        parent->vfork_child = child->pid;
+        parent->state = TASK_VFORK_WAIT;
+    }
     return child->pid;
 }
 
 static bool wait_matches(const struct linux64_task *parent, const struct linux64_task *child,
-                         i32 filter) {
+                         const struct linux64_wait *wait) {
     return child->state != TASK_FREE && child->state != TASK_DEAD && child->ppid == parent->pid &&
-           (filter == -1 || child->pid == filter ||
-            (filter == 0 && child->pgid == parent->pgid) ||
-            (filter < -1 && child->pgid == -(long)filter));
+           (wait->kind == P_ALL || (wait->kind == P_PID && child->pid == wait->filter) ||
+            (wait->kind == P_PGID && child->pgid == wait->filter));
 }
 
-static long wait_child(i32 pid, uptr address, u32 options, uptr usage) {
-    if (usage || (options & ~(WNOHANG | WUNTRACED | WCONTINUED))) return -EINVAL;
-    if (pid == -0x7fffffff - 1) return -ESRCH;
+/* x86-64 siginfo_t: union начинается на смещении 16 и дополняется до 128 байт. */
+struct wait_siginfo {
+    i32 signo, error, code, padding;
+    i32 pid;
+    u32 uid;
+    i32 status;
+    u8 reserved[100];
+};
+
+_Static_assert(sizeof(struct wait_siginfo) == 128, "Linux x86-64 siginfo");
+
+static long wait_result(const struct linux64_wait *wait, i32 pid, i32 status) {
+    if (!wait->address) return wait->signal_info ? 0 : pid;
+    if (wait->signal_info) {
+        struct wait_siginfo info = {0};
+        if (wait->address > X64_USER_TOP - sizeof(info)) return -EFAULT;
+        if (pid) {
+            i32 signal = status & 0x7f;
+            info.signo = SIGCHLD;
+            info.code = signal ? CLD_KILLED : CLD_EXITED;
+            info.pid = pid;
+            info.uid = LINUX64_UID;
+            info.status = signal ? signal : status >> 8;
+        }
+        uptr header = __builtin_offsetof(struct wait_siginfo, padding);
+        uptr payload = __builtin_offsetof(struct wait_siginfo, pid);
+        uptr length = __builtin_offsetof(struct wait_siginfo, reserved) - payload;
+        if (paging64_copy_to_user(wait->address, &info, header) != header ||
+            paging64_copy_to_user(wait->address + payload, &info.pid, length) != length)
+            return -EFAULT;
+        return 0;
+    }
+    return paging64_copy_to_user(wait->address, &status, sizeof(status)) == sizeof(status) ? pid : -EFAULT;
+}
+
+static long wait_error(const struct linux64_wait *wait, i32 error) {
+    if (wait->signal_info && wait_result(wait, 0, 0) < 0) return -EFAULT;
+    return error;
+}
+
+static long wait_child(struct linux64_wait wait) {
     struct linux64_task *parent = linux64_current;
     bool found = false;
     for (unsigned i = 1; i < LINUX64_TASK_COUNT; ++i) {
         struct linux64_task *child = &tasks[i];
-        if (!wait_matches(parent, child, pid)) continue;
+        if (!wait_matches(parent, child, &wait)) continue;
         found = true;
         if (child->state != TASK_ZOMBIE) continue;
-        i32 status = child->exit_status;
-        child->state = TASK_FREE;
-        if (address && paging64_copy_to_user(address, &status, sizeof(status)) != sizeof(status))
-            return -EFAULT;
-        return child->pid;
+        if (!(wait.options & WNOWAIT)) child->state = TASK_FREE;
+        return wait_result(&wait, child->pid, child->exit_status);
     }
-    if (!found) return -ECHILD;
-    if (!(options & WNOHANG)) {
-        parent->wait_pid = pid;
-        parent->wait_status_address = address;
-        parent->state = TASK_WAITING;
-    }
+    if (!found) return wait_error(&wait, -ECHILD);
+    if (wait.options & WNOHANG) return wait.signal_info ? wait_result(&wait, 0, 0) : 0;
+    parent->wait = wait;
+    parent->state = TASK_WAITING;
     return 0;
+}
+
+static long wait4(i32 pid, uptr address, u32 options, uptr usage) {
+    if (usage || (options & ~(WNOHANG | WUNTRACED | WCONTINUED))) return -EINVAL;
+    if (pid == -0x7fffffff - 1) return -ESRCH;
+    struct linux64_wait wait = {.address = address, .options = options};
+    if (pid > 0) {
+        wait.kind = P_PID;
+        wait.filter = pid;
+    } else if (pid != -1) {
+        wait.kind = P_PGID;
+        wait.filter = pid ? -pid : linux64_current->pgid;
+    }
+    return wait_child(wait);
+}
+
+static long waitid(i32 kind, i32 id, uptr address, u32 options, uptr usage) {
+    struct linux64_wait wait = {
+        .address = address, .kind = kind, .filter = id, .options = options, .signal_info = true,
+    };
+    if (usage || !(options & WEXITED) || (options & ~(WEXITED | WNOHANG | WNOWAIT)) ||
+        (kind != P_ALL && kind != P_PID && kind != P_PGID) ||
+        (kind == P_PID && id <= 0) || (kind == P_PGID && id < 0))
+        return wait_error(&wait, -EINVAL);
+    if (kind == P_PGID && !id) wait.filter = linux64_current->pgid;
+    return wait_child(wait);
 }
 
 static void publish_child_exit(struct linux64_task *child) {
@@ -141,11 +235,11 @@ static void publish_child_exit(struct linux64_task *child) {
         if (parent->state == TASK_FREE || parent->pid != child->ppid) continue;
         const struct linux64_sigaction *action = &parent->actions[SIGCHLD - 1];
         if (action->handler == SIG_IGN || (action->flags & SA_NOCLDWAIT))
-            child->state = child->root ? TASK_DEAD : TASK_FREE;
+            child->state = child->memory ? TASK_DEAD : TASK_FREE;
         if (parent->state != TASK_WAITING) return;
         bool live_child = false;
         for (unsigned j = 1; j < LINUX64_TASK_COUNT; ++j) {
-            if (!wait_matches(parent, &tasks[j], parent->wait_pid)) continue;
+            if (!wait_matches(parent, &tasks[j], &parent->wait)) continue;
             if (tasks[j].state == TASK_ZOMBIE) {
                 live_child = false;
                 break;
@@ -159,11 +253,22 @@ static void publish_child_exit(struct linux64_task *child) {
     }
 }
 
+static void complete_vfork(const struct linux64_task *child) {
+    for (unsigned i = 0; i < LINUX64_TASK_COUNT; ++i) {
+        struct linux64_task *parent = &tasks[i];
+        if (parent->state != TASK_VFORK_WAIT || parent->vfork_child != child->pid) continue;
+        parent->vfork_child = 0;
+        parent->state = TASK_RUNNABLE;
+        return;
+    }
+}
+
 static void finish_child(i32 wait_status) {
     struct linux64_task *task = linux64_current;
     linux64_close_files(task);
     task->exit_status = wait_status;
     task->state = TASK_ZOMBIE;
+    complete_vfork(task);
     for (unsigned i = 1; i < LINUX64_TASK_COUNT; ++i) {
         struct linux64_task *orphan = &tasks[i];
         if (orphan->state == TASK_FREE || orphan->ppid != task->pid) continue;
@@ -218,11 +323,10 @@ static void schedule(struct linux64_frame *frame) {
         old->frame = *frame;
         save_state(old);
     }
-    paging64_switch_root(next->root);
+    if (next->memory != old->memory) paging64_switch_root(next->memory->root);
     linux64_current = next;
     if (exited) {
-        paging64_drop_root(old->root);
-        old->root = 0;
+        release_memory(old);
         if (old->state == TASK_DEAD) old->state = TASK_FREE;
     }
     restore_state(next);
@@ -232,7 +336,9 @@ static void schedule(struct linux64_frame *frame) {
     }
     if (next->finish_wait) {
         next->finish_wait = false;
-        next->frame.rax = (u64)wait_child(next->wait_pid, next->wait_status_address, WNOHANG, 0);
+        struct linux64_wait wait = next->wait;
+        wait.options |= WNOHANG;
+        next->frame.rax = (u64)wait_child(wait);
     }
     *frame = next->frame;
 }
@@ -264,18 +370,21 @@ void linux64_task_syscall(struct linux64_frame *frame) {
     case 24: /* sched_yield */
         frame->rax = 0;
         break;
-    case 56: /* clone без CLONE_VM */
+    case 56: /* clone */
         frame->rax = (u64)fork_task(frame, frame->rdi, frame->rsi, frame->r10);
         break;
     case 57: /* fork */
         frame->rax = (u64)fork_task(frame, SIGCHLD, 0, 0);
+        break;
+    case 58: /* vfork */
+        frame->rax = (u64)fork_task(frame, CLONE_VM | CLONE_VFORK | SIGCHLD, 0, 0);
         break;
     case 60: /* exit */
     case 231: /* exit_group */
         exit_task((u32)frame->rdi);
         break;
     case 61: /* wait4 */
-        frame->rax = (u64)wait_child((i32)frame->rdi, frame->rsi, (u32)frame->rdx, frame->r10);
+        frame->rax = (u64)wait4((i32)frame->rdi, frame->rsi, (u32)frame->rdx, frame->r10);
         break;
     case 110: /* getppid */
         frame->rax = (u64)linux64_current->ppid;
@@ -285,6 +394,10 @@ void linux64_task_syscall(struct linux64_frame *frame) {
         break;
     case 112: /* setsid */
         frame->rax = (u64)new_session();
+        break;
+    case 247: /* waitid */
+        frame->rax = (u64)waitid((i32)frame->rdi, (i32)frame->rsi, frame->rdx,
+                                (u32)frame->r10, frame->r8);
         break;
     default:
         frame->rax = (u64)linux64_syscall(number, frame->rdi, frame->rsi, frame->rdx,

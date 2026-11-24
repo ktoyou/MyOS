@@ -29,8 +29,9 @@ static bool append_range(uptr start, uptr end) {
 }
 
 static bool stage_range(uptr start, uptr end, bool reserve) {
-    const struct linux64_reserve_range *reserves = linux64_current->reserves;
-    unsigned reserve_count = linux64_current->reserve_count;
+    const struct linux64_address_space *memory = linux64_current->memory;
+    const struct linux64_reserve_range *reserves = memory->reserves;
+    unsigned reserve_count = memory->reserve_count;
     staged_count = 0;
     for (unsigned i = 0; i < reserve_count && reserves[i].start < start; ++i) {
         uptr limit = reserves[i].end < start ? reserves[i].end : start;
@@ -46,20 +47,23 @@ static bool stage_range(uptr start, uptr end, bool reserve) {
 }
 
 static void commit_ranges(void) {
-    for (unsigned i = 0; i < staged_count; ++i) linux64_current->reserves[i] = staged[i];
-    linux64_current->reserve_count = staged_count;
+    struct linux64_address_space *memory = linux64_current->memory;
+    for (unsigned i = 0; i < staged_count; ++i) memory->reserves[i] = staged[i];
+    memory->reserve_count = staged_count;
 }
 
 static uptr reserved_end(uptr address) {
-    const struct linux64_reserve_range *reserves = linux64_current->reserves;
-    for (unsigned i = 0; i < linux64_current->reserve_count && reserves[i].start <= address; ++i)
+    const struct linux64_address_space *memory = linux64_current->memory;
+    const struct linux64_reserve_range *reserves = memory->reserves;
+    for (unsigned i = 0; i < memory->reserve_count && reserves[i].start <= address; ++i)
         if (address < reserves[i].end) return reserves[i].end;
     return 0;
 }
 
 static uptr overlap_end(uptr start, uptr end) {
-    const struct linux64_reserve_range *reserves = linux64_current->reserves;
-    for (unsigned i = 0; i < linux64_current->reserve_count && reserves[i].start < end; ++i)
+    const struct linux64_address_space *memory = linux64_current->memory;
+    const struct linux64_reserve_range *reserves = memory->reserves;
+    for (unsigned i = 0; i < memory->reserve_count && reserves[i].start < end; ++i)
         if (start < reserves[i].end) return reserves[i].end;
     return 0;
 }

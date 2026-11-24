@@ -20,6 +20,12 @@ struct linux64_reserve_range {
     uptr start, end;
 };
 
+struct linux64_address_space {
+    struct linux64_reserve_range reserves[LINUX64_RESERVE_COUNT];
+    uptr root;
+    unsigned reserve_count, references;
+};
+
 struct linux64_sigaction {
     u64 handler, flags, restorer, mask;
 };
@@ -29,17 +35,27 @@ struct linux64_fd_slot {
     bool cloexec;
 };
 
-enum linux64_task_state { TASK_FREE, TASK_RUNNABLE, TASK_WAITING, TASK_ZOMBIE, TASK_DEAD };
+enum linux64_task_state {
+    TASK_FREE, TASK_RUNNABLE, TASK_WAITING, TASK_VFORK_WAIT, TASK_ZOMBIE, TASK_DEAD,
+};
+
+struct linux64_wait {
+    uptr address;
+    i32 kind;
+    i32 filter;
+    u32 options;
+    bool signal_info;
+};
 
 struct linux64_task {
     struct linux64_frame frame;
     struct linux64_fd_slot fds[LINUX64_FD_COUNT];
-    struct linux64_reserve_range reserves[LINUX64_RESERVE_COUNT];
+    struct linux64_address_space *memory;
     struct linux64_sigaction actions[LINUX64_SIGNAL_COUNT];
     u64 signal_mask, fs, gs;
-    uptr root, child_tid, wait_status_address;
-    unsigned reserve_count;
-    i32 pid, ppid, sid, pgid, wait_pid, exit_status;
+    struct linux64_wait wait;
+    uptr child_tid;
+    i32 pid, ppid, sid, pgid, vfork_child, exit_status;
     u16 ds_selector, es_selector, fs_selector, gs_selector;
     enum linux64_task_state state;
     bool finish_wait;

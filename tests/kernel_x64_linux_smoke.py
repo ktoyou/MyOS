@@ -171,6 +171,17 @@ def check_fork(build):
     print('OVMF: Linux fork, wait4, address spaces and shared file descriptions: PASS', flush=True)
 
 
+def check_vfork(build):
+    probe = (build / 'linux-vfork.elf').resolve()
+    marker = 'Linux ELF64 vfork probe'
+    host = subprocess.run([str(probe)], env={}, capture_output=True, timeout=5,
+                          preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_CORE, (0, 0)))
+    assert (host.returncode, host.stdout, host.stderr) == (0, (marker + '\n').encode(), b''), host
+    serial = check_guest('vfork', probe.read_bytes(), 'Linux x86-64 exit status=0x00')
+    assert marker in serial, serial
+    print('OVMF: Linux vfork, shared address space and waitid: PASS', flush=True)
+
+
 def main():
     build = pathlib.Path('build/x86_64')
     probe = build / 'linux-probe.elf'
@@ -211,6 +222,7 @@ def main():
     check_mmap(build)
     check_socket(build)
     check_fork(build)
+    check_vfork(build)
 
 
 if __name__ == '__main__':
