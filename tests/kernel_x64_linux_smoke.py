@@ -115,7 +115,8 @@ def check_interpreter(build):
 def check_files(build):
     probe = build / 'linux-files.elf'
     data = (build / 'linux-interp.elf').absolute()
-    host = subprocess.run([str(probe.resolve())], env={}, capture_output=True, timeout=5)
+    host = subprocess.run([str(probe.resolve())], env={}, capture_output=True, timeout=5,
+                          preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_NOFILE, (256, 256)))
     assert (host.returncode, host.stderr) == (0, b''), host
     host_uname, host_time, host_marker = host.stdout.decode().splitlines()
     assert host_uname == 'Linux uname: Linux' and host_marker == 'Linux ELF64 files probe', host

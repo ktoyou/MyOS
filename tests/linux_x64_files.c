@@ -599,6 +599,42 @@ static long check_high_proc_fd(void) {
     return 0;
 }
 
+static long check_limits(void) {
+    enum { DATA = 2, NOFILE = 7, NICE = 13 };
+    struct {
+        word before, values[2], after;
+    } out = {0x31415926, {0, 0}, 0x27182818};
+    word address = (word)out.values;
+    long pid = call(39, 0, 0, 0, 0);
+    if (pid <= 0 || call(97, DATA, address, 0, 0)) return 98;
+    word data_soft = out.values[0], data_hard = out.values[1];
+    out.values[0] = out.values[1] = 0;
+    if (call(302, 0, DATA, 0, address) ||
+        out.values[0] != data_soft || out.values[1] != data_hard ||
+        call(302, pid, NOFILE, 0, address) || out.values[0] != 256 || out.values[1] != 256 ||
+        call(302, 0, NOFILE, 0, 0) || out.before != 0x31415926 || out.after != 0x27182818)
+        return 98;
+    if (call(302, (word)-1, DATA, 0, address) != -3 ||
+        call(302, 0, 16, 0, address) != -22 || call(97, 16, address, 0, 0) != -22 ||
+        call(97, NOFILE, 0, 0, 0) != -14 || call(302, 0, DATA, 0, 1) != -14)
+        return 99;
+    if (call(10, (word)(buffer + 4096), 4096, 1, 0) ||
+        call(302, 0, NOFILE, 0, (word)(buffer + 4096 - sizeof(word))) != -14 ||
+        call(10, (word)(buffer + 4096), 4096, 3, 0)) return 100;
+    char system[390];
+    if (call(63, (word)system, 0, 0, 0)) return 101;
+    if (system[0] == 'M') {
+        const word proposed[2] = {8, 8};
+        if (data_soft != (word)-1 || data_hard != (word)-1 ||
+            call(302, 0, NOFILE, (word)proposed, address) != -38 ||
+            call(302, 0, NICE, 0, address) != -38 ||
+            out.values[0] != 256 || out.values[1] != 256 ||
+            call(97, NOFILE, address, 0, 0) || out.values[0] != 256 || out.values[1] != 256)
+            return 101;
+    }
+    return 0;
+}
+
 __attribute__((noreturn)) void _start(void) {
     long status = check_files();
     if (!status) status = check_signals();
@@ -612,6 +648,7 @@ __attribute__((noreturn)) void _start(void) {
     if (!status) status = check_directories();
     if (!status) status = check_proc_fds();
     if (!status) status = check_high_proc_fd();
+    if (!status) status = check_limits();
     if (!status) status = check_realtime();
     if (!status) {
         static const char message[] = "Linux ELF64 files probe\n";

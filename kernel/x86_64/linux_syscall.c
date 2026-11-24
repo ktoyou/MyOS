@@ -9,6 +9,8 @@
 #define ARCH_SET_FS  0x1002
 #define ARCH_GET_FS  0x1003
 
+enum { RLIMIT_DATA = 2, RLIMIT_NOFILE = 7, RLIMIT_COUNT = 16 };
+
 extern void linux64_syscall_entry(void);
 
 static void set_fs_base(uptr base) {
@@ -66,6 +68,36 @@ static long linux_getresid(u32 id, uptr real, uptr effective, uptr saved) {
     return 0;
 }
 
+static i32 linux_getpid(void) {
+    const struct linux64_process *process = linux64_current->process;
+    return linux64_pid_number(process->pid_identity, process->pid_ns);
+}
+
+static long linux_getrlimit(u32 resource, uptr address, bool copy) {
+    u64 limit;
+    switch (resource) {
+    case RLIMIT_DATA:
+        /* Отдельного накопительного лимита данных у процесса пока нет. */
+        limit = (u64)-1;
+        break;
+    case RLIMIT_NOFILE:
+        limit = LINUX64_FD_COUNT;
+        break;
+    default:
+        return resource >= RLIMIT_COUNT ? -22 : -38;
+    }
+    const u64 values[2] = {limit, limit};
+    return !copy || paging64_copy_to_user(address, values, sizeof(values)) == sizeof(values) ? 0 : -14;
+}
+
+static long linux_prlimit(i32 pid, u32 resource, uptr new_limit, uptr old_limit) {
+    if (pid < 0) return -3;
+    if (pid && pid != linux_getpid() && pid != linux64_current->visible_tid) return -38;
+    if (resource >= RLIMIT_COUNT) return -22;
+    if (new_limit) return -38;
+    return linux_getrlimit(resource, old_limit, old_limit != 0);
+}
+
 static long linux_sysinfo(uptr address) {
     struct linux_sysinfo {
         long uptime;
@@ -108,16 +140,14 @@ long linux64_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2,
     if (number == 28) return linux64_madvise(arg0, arg1, (i32)arg2);
     if (number == 13) return linux64_rt_sigaction((i32)arg0, arg1, arg2, arg3);
     if (number == 14) return linux64_rt_sigprocmask((i32)arg0, arg1, arg2, arg3);
-    if (number == 39) { /* getpid */
-        const struct linux64_process *process = linux64_current->process;
-        return linux64_pid_number(process->pid_identity, process->pid_ns);
-    }
+    if (number == 39) return linux_getpid();
     if (number == 44) return linux64_sendto((i32)arg0, arg1, arg2, (u32)arg3, arg4, (i32)arg5);
     if (number == 186) return linux64_current->visible_tid; /* gettid */
     if (number == 54 || number == 55)
         return linux64_sockopt(number == 55, (i32)arg0, (i32)arg1, (i32)arg2, arg3, arg4);
     if (number == 63) return linux_uname(arg0);
     if (number == 96) return linux64_gettimeofday(arg0, arg1);
+    if (number == 97) return linux_getrlimit((u32)arg0, arg1, true);
     if (number == 99) return linux_sysinfo(arg0);
     const struct linux64_userns *ns = linux64_current->process->userns;
     if (number == 102 || number == 107) return linux64_visible_id(ns, false, LINUX64_UID);
@@ -129,6 +159,7 @@ long linux64_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2,
     if (number == 202) return linux64_futex(arg0, (u32)arg1, (u32)arg2, arg3, (u32)arg5);
     if (number == 228) return linux64_clock_gettime((i32)arg0, arg1);
     if (number == 271) return linux64_ppoll(arg0, (u32)arg1, arg2, arg3, arg4);
+    if (number == 302) return linux_prlimit((i32)arg0, (u32)arg1, arg2, arg3);
     if (number == 318) return linux64_getrandom(arg0, arg1, (u32)arg2);
     return linux64_file_syscall(number, arg0, arg1, arg2, arg3);
 }
