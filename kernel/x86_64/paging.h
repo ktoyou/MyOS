@@ -9,6 +9,7 @@ bool paging64_init(const struct boot_info *boot);
 uptr paging64_active_root(void);
 void paging64_switch_root(uptr root);
 uptr paging64_fork_root(void);
+uptr paging64_exec_root(void);
 void paging64_drop_root(uptr root);
 void *paging64_user_page(uptr address);
 bool paging64_user_code(uptr address, const u8 *code, uptr length);

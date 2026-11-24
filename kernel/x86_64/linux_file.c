@@ -31,8 +31,6 @@ _Static_assert(sizeof(struct linux_stat) == 144, "Linux x86-64 stat size");
 _Static_assert(__builtin_offsetof(struct linux_stat, size) == 48, "Linux x86-64 st_size");
 
 static struct linux64_file_source files;
-static const char *executable_path;
-static uptr executable_path_length;
 static struct memfd {
     uptr *chunks[MEMFD_CHUNKS];
     uptr size;
@@ -100,6 +98,11 @@ void linux64_close_files(struct linux64_task *task) {
     for (unsigned fd = STDIO_COUNT; fd < FD_COUNT; ++fd) close_slot(&task->fds[fd]);
 }
 
+void linux64_close_on_exec(struct linux64_task *task) {
+    for (unsigned fd = STDIO_COUNT; fd < FD_COUNT; ++fd)
+        if (task->fds[fd].cloexec) close_slot(&task->fds[fd]);
+}
+
 void linux64_retain_files(struct linux64_task *task) {
     for (unsigned fd = STDIO_COUNT; fd < FD_COUNT; ++fd)
         if (task->fds[fd].file) ++task->fds[fd].file->references;
@@ -107,9 +110,13 @@ void linux64_retain_files(struct linux64_task *task) {
 
 void linux64_use_files(const struct linux64_file_source *source, const char *path, uptr path_length) {
     files = source ? *source : (struct linux64_file_source){0};
-    executable_path = path;
-    executable_path_length = path_length;
+    linux64_current->executable_path_length = path_length;
+    for (uptr i = 0; i <= path_length; ++i) linux64_current->executable_path[i] = path[i];
     linux64_close_files(linux64_current);
+}
+
+const struct linux64_file_source *linux64_file_source(void) {
+    return &files;
 }
 
 static bool open_file(i32 fd) {
@@ -132,7 +139,7 @@ long linux64_get_file(i32 fd, struct linux64_fd_view *view) {
     return 0;
 }
 
-static long user_string(uptr address, char *string, uptr limit) {
+long linux64_user_string(uptr address, char *string, uptr limit) {
     for (uptr copied = 0; copied < limit;) {
         const u8 *source = paging64_user_read(address + copied);
         if (!source) return -EFAULT;
@@ -140,7 +147,7 @@ static long user_string(uptr address, char *string, uptr limit) {
         if (chunk > limit - copied) chunk = limit - copied;
         for (uptr i = 0; i < chunk; ++i) {
             string[copied + i] = (char)source[i];
-            if (!source[i]) return 0;
+            if (!source[i]) return (long)(copied + i);
         }
         copied += chunk;
     }
@@ -148,7 +155,8 @@ static long user_string(uptr address, char *string, uptr limit) {
 }
 
 static long user_path(uptr address, char *path) {
-    return user_string(address, path, LINUX64_PATH_LIMIT);
+    long result = linux64_user_string(address, path, LINUX64_PATH_LIMIT);
+    return result < 0 ? result : 0;
 }
 
 static const char *root_path(char *path) {
@@ -234,8 +242,8 @@ long linux64_sockopt(bool get, i32 fd, i32 level, i32 option, uptr value, uptr l
 static long memfd_create(uptr name_address, u32 flags) {
     if (flags & ~(MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_NOEXEC_SEAL)) return -EINVAL;
     char name[MEMFD_NAME_LIMIT + 1];
-    long result = user_string(name_address, name, sizeof(name));
-    if (result) return result == -ENAMETOOLONG ? -EINVAL : result;
+    long result = linux64_user_string(name_address, name, sizeof(name));
+    if (result < 0) return result == -ENAMETOOLONG ? -EINVAL : result;
     for (unsigned i = 0; i < OPEN_FILE_COUNT; ++i) {
         struct memfd *memfd = &memfds[i];
         if (memfd->handles) continue;
@@ -365,10 +373,11 @@ static long linux_readlink(uptr path_address, uptr destination, i32 size) {
         struct linux64_file file;
         return files.lookup && files.lookup(files.context, absolute, &file) ? -EINVAL : -ENOENT;
     }
-    if (!executable_path_length) return -ENOENT;
-    uptr length = executable_path_length;
+    uptr length = linux64_current->executable_path_length;
+    if (!length) return -ENOENT;
     if (length > (uptr)size) length = (uptr)size;
-    return paging64_copy_to_user(destination, executable_path, length) == length ? (long)length : -EFAULT;
+    return paging64_copy_to_user(destination, linux64_current->executable_path, length) == length
+        ? (long)length : -EFAULT;
 }
 
 static long linux_open(i32 dirfd, uptr address, u32 flags) {

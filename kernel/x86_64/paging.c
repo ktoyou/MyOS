@@ -271,6 +271,36 @@ uptr paging64_fork_root(void) {
     return child;
 }
 
+static bool copy_supervisor_mappings(uptr target, uptr source, unsigned shift, unsigned entries,
+                                     uptr base) {
+    const u64 *table = pmm64_pointer(source);
+    for (unsigned i = 0; i < entries; ++i) {
+        u64 entry = table[i];
+        if (!(entry & PRESENT)) continue;
+        uptr address = base | ((uptr)i << shift);
+        if (shift > 12) {
+            if (!copy_supervisor_mappings(target, entry & ADDRESS_MASK, shift - 9, 512, address))
+                return false;
+        } else if (!(entry & USER) && !map_entry(target, address, entry)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+uptr paging64_exec_root(void) {
+    uptr previous = paging64_active_root(), root = pmm64_alloc();
+    if (!root) return 0;
+    if (!copy_supervisor_mappings(root, previous, 39, 256, 0)) {
+        paging64_drop_root(root);
+        return 0;
+    }
+    u64 *to = pmm64_pointer(root);
+    const u64 *from = pmm64_pointer(previous);
+    for (unsigned i = 256; i < 512; ++i) to[i] = from[i];
+    return root;
+}
+
 static void clear_mmap(uptr root, uptr start, uptr end, u64 marker) {
     uptr next, last = 0;
     for (uptr address = start; address < end; address = next) {
