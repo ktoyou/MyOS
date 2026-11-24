@@ -130,7 +130,10 @@ def check_mmap(build):
     serial = check_guest('mprotect-relro', relro, 'x86-64 exception halted', fault=True, files=files)
     assert ('vector=0x000000000000000e error=0x0000000000000007' in serial and
             f'cr2=0x{symbols["relro"]:016x} cpl=3' in serial), serial
-    print('OVMF: private mmap, mprotect, rollback, RELRO, W^X and past EOF: PASS', flush=True)
+    sparse_oom = bytearray(elf)
+    struct.pack_into('<Q', sparse_oom, 24, symbols['mprotect_sparse_oom'])
+    check_guest('mprotect-sparse-oom', sparse_oom, 'Linux x86-64 exit status=0x00', files=files)
+    print('OVMF: private and sparse mmap, mprotect, rollback, RELRO, W^X and past EOF: PASS', flush=True)
 
 
 def main():
