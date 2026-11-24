@@ -593,9 +593,18 @@ uptr paging64_copy_to_user(uptr address, const void *source, uptr length) {
     return copied;
 }
 
-bool paging64_put_user_u64(uptr address, u64 value) {
+static bool put_user_scalar(uptr address, const void *value, uptr size) {
     const u64 required = PRESENT | USER | WRITE;
+    /* Ошибка на границе страниц не должна оставлять часть значения. */
     if (!user_pointer(address, required) ||
-        !user_pointer(address + sizeof(value) - 1, required)) return false;
-    return paging64_copy_to_user(address, &value, sizeof(value)) == sizeof(value);
+        !user_pointer(address + size - 1, required)) return false;
+    return paging64_copy_to_user(address, value, size) == size;
+}
+
+bool paging64_put_user_u32(uptr address, u32 value) {
+    return put_user_scalar(address, &value, sizeof(value));
+}
+
+bool paging64_put_user_u64(uptr address, u64 value) {
+    return put_user_scalar(address, &value, sizeof(value));
 }
