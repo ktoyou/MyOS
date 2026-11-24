@@ -38,7 +38,8 @@ struct linux64_fd_slot {
 struct linux64_userns;
 
 enum linux64_proc_node {
-    USERNS_NONE, USERNS_UID_MAP, USERNS_GID_MAP, USERNS_SETGROUPS, PROC_ROOT, PROC_TASKS,
+    USERNS_NONE, USERNS_UID_MAP, USERNS_GID_MAP, USERNS_SETGROUPS,
+    PROC_USER_NS, PROC_USER_NS_NOTDIR, PROC_ROOT, PROC_TASKS,
 };
 
 struct linux64_caps {
@@ -120,6 +121,8 @@ extern struct linux64_task *linux64_current;
 long linux64_userns_create(struct linux64_userns *parent, struct linux64_userns **result);
 void linux64_userns_retain(struct linux64_userns *ns);
 void linux64_userns_release(struct linux64_userns *ns);
+u64 linux64_userns_inode(const struct linux64_userns *ns);
+long linux64_userns_readlink(const struct linux64_userns *ns, uptr buffer, uptr size);
 u32 linux64_visible_id(const struct linux64_userns *ns, bool group, u32 id);
 void linux64_userns_caps(struct linux64_task *task);
 long linux64_capabilities(bool set, uptr header, uptr data);
