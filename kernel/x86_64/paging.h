@@ -19,6 +19,7 @@ const u8 *paging64_user_read(uptr address);
 uptr paging64_copy_from_user(void *destination, uptr address, uptr length);
 bool paging64_shared_futex_address(uptr address);
 uptr paging64_copy_to_user(uptr address, const void *source, uptr length);
+bool paging64_put_user_u32(uptr address, u32 value);
 bool paging64_put_user_u64(uptr address, u64 value);
 bool paging64_range_free(uptr start, uptr end);
 enum paging64_protect_result {

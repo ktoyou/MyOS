@@ -75,6 +75,13 @@ static long linux_uname(uptr address) {
     return paging64_copy_to_user(address, &name, sizeof(name)) == sizeof(name) ? 0 : -14;
 }
 
+static long linux_getresid(u32 id, uptr real, uptr effective, uptr saved) {
+    if (!paging64_put_user_u32(real, id) ||
+        !paging64_put_user_u32(effective, id) ||
+        !paging64_put_user_u32(saved, id)) return -14;
+    return 0;
+}
+
 __attribute__((noreturn)) void linux64_invalid_return(void) {
     linux64_task_exception(13);
     static const char message[] = "Linux x86-64 invalid syscall return\r\n";
@@ -97,6 +104,8 @@ long linux64_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2,
     if (number == 63) return linux_uname(arg0);
     if (number == 102 || number == 107) return LINUX64_UID; /* getuid, geteuid */
     if (number == 104 || number == 108) return LINUX64_GID; /* getgid, getegid */
+    if (number == 118) return linux_getresid(LINUX64_UID, arg0, arg1, arg2); /* getresuid */
+    if (number == 120) return linux_getresid(LINUX64_GID, arg0, arg1, arg2); /* getresgid */
     if (number == 158) return linux_arch_prctl((i32)arg0, arg1);
     if (number == 202) return linux64_futex(arg0, (u32)arg1, (u32)arg2, arg3, (u32)arg5);
     if (number == 228) return linux64_clock_gettime((i32)arg0, arg1);

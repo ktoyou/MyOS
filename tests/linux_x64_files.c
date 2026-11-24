@@ -138,11 +138,40 @@ static long check_uname(void) {
     return call(1, 1, (word)marker, length, 0) == (long)length ? 0 : 29;
 }
 
+static long check_ids(word syscall, word get_real, word get_effective) {
+    const unsigned sentinel = 0xa5a5a5a5u;
+    const unsigned real = (unsigned)call(get_real, 0, 0, 0, 0);
+    const unsigned effective = (unsigned)call(get_effective, 0, 0, 0, 0);
+    unsigned ids[4] = {sentinel, sentinel, sentinel, sentinel};
+    word first = (word)&ids[0], second = (word)&ids[1], third = (word)&ids[2];
+    if (call(syscall, first, second, third, 0) || ids[0] != real || ids[1] != effective ||
+        ids[2] != effective || ids[3] != sentinel) return 30;
+    ids[0] = ids[1] = ids[2] = sentinel;
+    if (call(syscall, 0, second, third, 0) != -14 || ids[1] != sentinel || ids[2] != sentinel ||
+        call(syscall, first, second, 0, 0) != -14 || ids[0] != real || ids[1] != effective)
+        return 31;
+
+    unsigned char *cross = buffer + 4094;
+    for (unsigned i = 0; i < 4; ++i) cross[i] = 0xa5;
+    ids[0] = sentinel;
+    if (call(10, (word)(buffer + 4096), 4096, 1, 0) ||
+        call(syscall, first, (word)cross, third, 0) != -14 ||
+        ids[0] != real || ids[2] != sentinel ||
+        cross[0] != 0xa5 || cross[1] != 0xa5 || cross[2] != 0xa5 || cross[3] != 0xa5 ||
+        call(10, (word)(buffer + 4096), 4096, 3, 0)) return 32;
+    if (call(syscall, first, (word)cross, third, 0) || ids[2] != effective) return 33;
+    for (unsigned i = 0; i < 4; ++i)
+        if (cross[i] != (unsigned char)(effective >> (i * 8))) return 34;
+    return 0;
+}
+
 __attribute__((noreturn)) void _start(void) {
     long status = check_files();
     if (!status) status = check_signals();
     if (!status) status = check_signal_mask();
     if (!status) status = check_uname();
+    if (!status) status = check_ids(118, 102, 107);
+    if (!status) status = check_ids(120, 104, 108);
     if (!status) {
         static const char message[] = "Linux ELF64 files probe\n";
         if (call(1, 1, (word)message, sizeof(message) - 1, 0) != sizeof(message) - 1)
