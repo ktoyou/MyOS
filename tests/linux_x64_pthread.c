@@ -68,6 +68,13 @@ static long clock_time(unsigned clock, struct timespec *time) {
     return call(228, clock, (word)time, 0, 0, 0, 0);
 }
 
+static long clock_ns(unsigned clock) {
+    struct timespec time;
+    if (clock_time(clock, &time) || time.seconds < 0 || time.nanos < 0 || time.nanos >= 1000000000)
+        return -1;
+    return time.seconds * 1000000000 + time.nanos;
+}
+
 static __attribute__((noreturn)) void finish(word number, long status) {
     simple(number, status);
     __builtin_trap();
@@ -76,6 +83,16 @@ static __attribute__((noreturn)) void finish(word number, long status) {
 static int mode;
 
 __attribute__((noreturn)) void worker(void) {
+    if (mode == 5) {
+        long start = clock_ns(3), wall = clock_ns(1), now;
+        if (start < 0 || wall < 0) finish(231, 35);
+        do {
+            now = clock_ns(1);
+            if (now < wall) finish(231, 35);
+        } while (now - wall < 60000000);
+        if (clock_ns(3) <= start) finish(231, 35);
+        finish(60, 0);
+    }
     if (mode == 4) {
         word index;
         __asm__ volatile("mov %%fs:0,%0" : "=r"(index));
@@ -268,6 +285,36 @@ static int check_timeout_from_other_thread(void) {
     return result;
 }
 
+static int check_cpu_clock(void) {
+    const struct timespec timeout = {0, 60000000};
+    volatile unsigned sleeping = 0;
+    if (clock_time(3, (void *)1) != -14) return 36;
+    long cpu_before = clock_ns(3), wall_before = clock_ns(1);
+    if (cpu_before < 0 || wall_before < 0 ||
+        futex_timed(&sleeping, 0x80, 0, 0, &timeout) != -110) return 36;
+    long cpu_after = clock_ns(3), wall_after = clock_ns(1);
+    if (wall_after - wall_before < 60000000 ||
+        cpu_after < cpu_before || cpu_after - cpu_before >= (wall_after - wall_before) / 2)
+        return 36;
+
+    mode = 5;
+    clear_tid = 1;
+    if (clone_thread((word)(stack + sizeof(stack)), &parent_tid, &clear_tid, &tls) <= 0) return 37;
+    while (clear_tid) {
+        long error = futex(&clear_tid, 0x109, 1, -1);
+        if (error && error != -11) return 37;
+    }
+    mode = 0;
+    cpu_before = cpu_after;
+    wall_before = wall_after;
+    cpu_after = clock_ns(3);
+    wall_after = clock_ns(1);
+    if (wall_after - wall_before < 60000000 ||
+        cpu_after < cpu_before || cpu_after - cpu_before >= (wall_after - wall_before) / 2)
+        return 37;
+    return 0;
+}
+
 static int check_process_exit(int test_mode) {
     long child = simple(57, 0);
     if (child < 0) return 11;
@@ -293,6 +340,7 @@ void _start(void) {
         (system[0] == 'M' && inherited_no_new_privs)) finish(231, 17);
     int timed = check_timeout();
     if (!timed) timed = check_timeout_from_other_thread();
+    if (!timed) timed = check_cpu_clock();
     if (timed) finish(231, timed);
     for (int i = 0; i < 10; ++i) {
         int status = check_thread();

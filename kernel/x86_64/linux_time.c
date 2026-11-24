@@ -1,4 +1,4 @@
-#include "linux.h"
+#include "linux_task.h"
 #include "paging.h"
 
 #define PIT_HZ 1193182ul
@@ -165,10 +165,20 @@ bool linux64_clock_sample(bool realtime, long *seconds, u64 *nanoseconds) {
 }
 
 long linux64_clock_gettime(i32 clock, uptr address) {
-    if (clock != 0 && clock != 1) return -22; /* CLOCK_REALTIME, CLOCK_MONOTONIC */
     long seconds;
     u64 nanos;
-    if (!linux64_clock_sample(clock == 0, &seconds, &nanos)) return -5;
+    switch (clock) {
+    case 0: case 1: /* CLOCK_REALTIME, CLOCK_MONOTONIC */
+        if (!linux64_clock_sample(clock == 0, &seconds, &nanos)) return -5;
+        break;
+    case 3: /* CLOCK_THREAD_CPUTIME_ID */
+        if (!linux64_task_cpu_ns(&nanos)) return -5;
+        seconds = (long)(nanos / NS_PER_SECOND);
+        nanos %= NS_PER_SECOND;
+        break;
+    default:
+        return -22;
+    }
     const u64 timespec[2] = {(u64)seconds, nanos};
     return paging64_copy_to_user(address, timespec, sizeof(timespec)) == sizeof(timespec) ? 0 : -14;
 }

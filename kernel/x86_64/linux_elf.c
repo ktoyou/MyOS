@@ -335,5 +335,6 @@ bool linux64_run(const struct linux64_file *file, const char *path, uptr path_le
     linux64_use_files(source, path, path_length);
     linux64_reset_signals();
     linux64_clock_init();
+    linux64_task_clock_resume();
     segments64_enter_user(entry, stack);
 }
