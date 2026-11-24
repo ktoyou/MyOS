@@ -18,6 +18,7 @@ enum {
     F_DUPFD_CLOEXEC = 1030, F_ADD_SEALS = 1033, F_GET_SEALS = 1034,
     F_SEAL_SEAL = 1, F_SEAL_SHRINK = 2, F_SEAL_GROW = 4, F_SEAL_EXEC = 0x20,
     MFD_CLOEXEC = 1, MFD_ALLOW_SEALING = 2, MFD_NOEXEC_SEAL = 8,
+    EFD_SEMAPHORE = 1,
     MEMFD_NAME_LIMIT = 249, MEMFD_CHUNKS = 128,
     FRAMES_PER_CHUNK = PMM_PAGE_SIZE / sizeof(uptr),
     FD_COUNT = LINUX64_FD_COUNT, OPEN_FILE_COUNT = LINUX64_TASK_COUNT * FD_COUNT,
@@ -26,7 +27,9 @@ enum {
 enum file_kind {
     FILE_REGULAR, FILE_SOCKET, FILE_PIPE, FILE_PROC_DIR, FILE_PROC_MAP, FILE_NULL, FILE_SERIAL,
     FILE_NAMESPACE, FILE_PROC_LINK, FILE_DIRECTORY, FILE_SYMLINK, FILE_NAMED_SOCKET, FILE_URANDOM,
+    FILE_EVENTFD,
 };
+#define EVENTFD_MAX ((u64)-2)
 static const struct linux64_file null_file = {.inode = 1};
 static const struct linux64_file urandom_file = {.inode = 2};
 
@@ -68,8 +71,10 @@ static struct file_handle {
     bool serial;
     uptr directory_path;
     uptr offset;
+    u64 event_count;
     u32 flags;
     unsigned references;
+    bool event_semaphore;
 } open_files[OPEN_FILE_COUNT];
 
 static struct file_handle *file_at(i32 fd) {
@@ -79,17 +84,22 @@ static struct file_handle *file_at(i32 fd) {
 _Static_assert(sizeof(struct linux64_pollfd) == 8, "Linux x86-64 pollfd size");
 _Static_assert(__builtin_offsetof(struct linux64_pollfd, revents) == 6, "Linux x86-64 revents");
 
+static u16 file_ready(const struct file_handle *file) {
+    if (file->serial) return LINUX64_POLL_WRITE;
+    if (file->pipe) return linux64_pipe_poll(file->pipe, (file->flags & O_ACCMODE) == O_WRONLY);
+    if (file->socket) return linux64_socket_poll(file->socket);
+    if (file->device == FILE_EVENTFD)
+        return (file->event_count ? LINUX64_POLLIN : 0) |
+               (file->event_count < EVENTFD_MAX ? LINUX64_POLLOUT : 0);
+    return LINUX64_POLL_READ | LINUX64_POLL_WRITE;
+}
+
 static u16 poll_fd(const struct linux64_process *process, i32 fd, u16 events) {
     if (fd < 0) return 0;
     if (fd >= FD_COUNT) return LINUX64_POLLNVAL;
     const struct file_handle *file = process->fds[fd].file;
     if (!file) return LINUX64_POLLNVAL;
-    u16 ready;
-    if (file->serial) ready = LINUX64_POLL_WRITE;
-    else if (file->pipe) ready = linux64_pipe_poll(file->pipe, (file->flags & O_ACCMODE) == O_WRONLY);
-    else if (file->socket) ready = linux64_socket_poll(file->socket);
-    else ready = LINUX64_POLL_READ | LINUX64_POLL_WRITE;
-    return ready & (events | LINUX64_POLLERR | LINUX64_POLLHUP);
+    return file_ready(file) & (events | LINUX64_POLLERR | LINUX64_POLLHUP);
 }
 
 bool linux64_poll_ready(struct linux64_task *task) {
@@ -276,6 +286,54 @@ void linux64_pipe_finish(struct linux64_task *task) {
 void linux64_socket_wait_finish(struct linux64_task *task) {
     release_file(task->socket_wait.file);
     task->socket_wait.file = NULL;
+}
+
+void linux64_eventfd_wait_finish(struct linux64_task *task) {
+    release_file(task->eventfd_wait.file);
+    task->eventfd_wait.file = NULL;
+}
+
+bool linux64_eventfd_ready(const struct linux64_eventfd_wait *wait) {
+    u64 count = wait->file->event_count;
+    return wait->write ? wait->value <= EVENTFD_MAX - count : count != 0;
+}
+
+static long eventfd_attempt(const struct linux64_eventfd_wait *wait) {
+    if (!linux64_eventfd_ready(wait)) return -EAGAIN;
+    struct file_handle *file = wait->file;
+    if (wait->write) {
+        file->event_count += wait->value;
+    } else {
+        u64 value = file->event_semaphore ? 1 : file->event_count;
+        file->event_count -= value;
+        /* Linux уменьшает счётчик до копирования в буфер пользователя. */
+        if (paging64_copy_to_user(wait->address, &value, sizeof(value)) != sizeof(value))
+            return -EFAULT;
+    }
+    return sizeof(u64);
+}
+
+long linux64_eventfd_resume(void) {
+    long result = eventfd_attempt(&linux64_current->eventfd_wait);
+    if (result == -EAGAIN) linux64_current->state = TASK_EVENTFD_WAIT;
+    return result;
+}
+
+static long eventfd_io(struct file_handle *file, bool write, uptr address, uptr length) {
+    if (length < sizeof(u64) || (write && length != sizeof(u64))) return -EINVAL;
+    struct linux64_eventfd_wait wait = {.file = file, .address = address, .write = write};
+    if (write) {
+        if (paging64_copy_from_user(&wait.value, address, sizeof(wait.value)) != sizeof(wait.value))
+            return -EFAULT;
+        if (wait.value > EVENTFD_MAX) return -EINVAL;
+    }
+    long result = eventfd_attempt(&wait);
+    if (result == -EAGAIN && !(file->flags & O_NONBLOCK)) {
+        ++file->references;
+        linux64_current->eventfd_wait = wait;
+        linux64_current->state = TASK_EVENTFD_WAIT;
+    }
+    return result;
 }
 
 static long pipe_io(struct file_handle *file, bool write, uptr address, uptr length) {
@@ -546,6 +604,18 @@ static bool copy_fd_pair(uptr address, i32 left, i32 right) {
     return paging64_put_user_u64(address, (u32)left | ((u64)(u32)right << 32));
 }
 
+static long linux_eventfd(u32 initial, u32 flags) {
+    if (flags & ~(EFD_SEMAPHORE | O_NONBLOCK | O_CLOEXEC)) return -EINVAL;
+    long fd = new_handle(NULL, NULL, (flags & (O_NONBLOCK | O_CLOEXEC)) | O_RDWR);
+    if (fd < 0) return fd;
+    struct file_handle *file = file_at((i32)fd);
+    file->device = FILE_EVENTFD;
+    file->event_count = initial;
+    file->event_semaphore = (flags & EFD_SEMAPHORE) != 0;
+    file->file.inode = next_special_inode++;
+    return fd;
+}
+
 static long linux_pipe2(uptr address, u32 flags) {
     if (flags & ~(O_CLOEXEC | O_NONBLOCK)) return -EINVAL;
     long read_fd = new_handle(NULL, NULL, flags);
@@ -800,7 +870,7 @@ static long linux_fcntl(i32 fd, i32 command, u32 value) {
         return 0;
     }
     if (command == F_GETFL) return file_at(fd)->flags;
-    if (command == F_SETFL && file_at(fd)->socket) {
+    if (command == F_SETFL && (file_at(fd)->socket || file_at(fd)->device == FILE_EVENTFD)) {
         if (value & O_DIRECT) return -EINVAL;
         const u32 mask = O_APPEND | O_NONBLOCK;
         file_at(fd)->flags = (file_at(fd)->flags & ~mask) | (value & mask);
@@ -1123,10 +1193,11 @@ static long linux_unlink(i32 dirfd, uptr address, u32 flags) {
     return result ? result : linux64_vfs_unlink(&base, path);
 }
 
-static long device_io(const struct file_handle *file, bool write, uptr buffer, uptr count) {
+static long device_io(struct file_handle *file, bool write, uptr buffer, uptr count) {
     if ((file->flags & O_ACCMODE) == (write ? 0u : O_WRONLY)) return -EBADF;
     /* VFS проверяет диапазон даже у устройства, которое не обращается к буферу. */
     if (buffer >= X64_USER_TOP || count > X64_USER_TOP - buffer) return -EFAULT;
+    if (file->device == FILE_EVENTFD) return eventfd_io(file, write, buffer, count);
     if (file->device == FILE_URANDOM) {
         /* Запись требует пула энтропии, которого у источника RDRAND нет. */
         return write ? -ENOSYS : linux64_getrandom(buffer, count, 0);
@@ -1154,6 +1225,7 @@ static long linux_read(i32 fd, uptr buffer, uptr count, uptr offset, bool positi
     if (!open_file(fd)) return -EBADF;
     struct file_handle *handle = file_at(fd);
     if (handle->directory_path) return -EISDIR;
+    if (positioned && handle->device == FILE_EVENTFD) return -ESPIPE;
     if (handle->device) return device_io(handle, false, buffer, count);
     if (handle->serial) return positioned ? -ESPIPE : -EBADF;
     if (handle->pipe) {
@@ -1216,6 +1288,9 @@ static long file_stat(const struct linux64_file *file, const struct memfd *memfd
     } else if (kind == FILE_PIPE) {
         mode = 0010600;
         device = 4;
+    } else if (kind == FILE_EVENTFD) {
+        mode = 0600;
+        device = 10;
     } else if (kind == FILE_PROC_DIR) {
         mode = 0040555;
         links = 2 + (file->inode == PROC_TASKS ? linux64_current->process->threads : 0);
@@ -1377,7 +1452,7 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
     case 18: /* pwrite64 */
         if ((long)arg3 < 0) return -EINVAL;
         if (!open_file(fd)) return -EBADF;
-        if (file_at(fd)->serial || file_at(fd)->socket) return -ESPIPE;
+        if (file_at(fd)->serial || file_at(fd)->socket || file_at(fd)->device == FILE_EVENTFD) return -ESPIPE;
         return file_at(fd)->device ? device_io(file_at(fd), true, arg1, arg2) : -ENOSYS;
     case 21: /* access */
         if ((u32)arg1 & ~7u) return -EINVAL;
@@ -1468,6 +1543,9 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
         return linux_symlink((i32)arg1, arg2, arg0);
     case 267: /* readlinkat */
         return linux_readlink(fd, arg1, arg2, (i32)arg3);
+    case 284: /* eventfd */
+    case 290: /* eventfd2 */
+        return linux_eventfd((u32)arg0, number == 290 ? (u32)arg1 : 0);
     case 292: /* dup3 */
         if (((u32)arg2 & ~O_CLOEXEC) || fd == (i32)arg1) return -EINVAL;
         return dup_to(fd, (i32)arg1, (arg2 & O_CLOEXEC) != 0);
