@@ -136,7 +136,8 @@ long linux64_mmap(uptr address, uptr length, u32 protection, u32 flags, i32 fd, 
     struct paging64_mmap_file mapping = {0};
     bool no_write = false;
     if (!anonymous) {
-        if (!linux64_get_file(fd, &view)) return -EBADF;
+        long result = linux64_get_file(fd, &view);
+        if (result) return result;
         if (offset > 0x7ffffffffffffffful - length) return -EOVERFLOW;
         no_write = shared && !view.writable;
         if (offset < view.file.size) {

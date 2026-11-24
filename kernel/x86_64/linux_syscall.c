@@ -94,12 +94,17 @@ __attribute__((noreturn)) void linux64_invalid_return(void) {
 
 long linux64_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2,
                     uptr arg3, uptr arg4, uptr arg5) {
-    if (number == 1) return linux_write(arg0, arg1, arg2);
+    if (number == 1 && (arg0 == 1 || arg0 == 2)) return linux_write(arg0, arg1, arg2);
     if (number == 9) return linux64_mmap(arg0, arg1, (u32)arg2, (u32)arg3, (i32)arg4, arg5);
     if (number == 10) return linux64_mprotect(arg0, arg1, arg2);
     if (number == 11) return linux64_munmap(arg0, arg1);
     if (number == 13) return linux64_rt_sigaction((i32)arg0, arg1, arg2, arg3);
     if (number == 14) return linux64_rt_sigprocmask((i32)arg0, arg1, arg2, arg3);
+    if (number == 39) return LINUX64_PID; /* getpid */
+    if (number == 54 || number == 55)
+        return linux64_sockopt(number == 55, (i32)arg0, (i32)arg1, (i32)arg2, arg3, arg4);
+    if (number == 102 || number == 107) return LINUX64_UID; /* getuid, geteuid */
+    if (number == 104 || number == 108) return LINUX64_GID; /* getgid, getegid */
     if (number == 158) return linux_arch_prctl((i32)arg0, arg1);
     if (number == 202) return linux_futex(arg0, (u32)arg1);
     if (number == 228) return linux64_clock_gettime((i32)arg0, arg1);

@@ -4,7 +4,7 @@
 enum {
     EPERM = 1, ENOENT = 2, EBADF = 9, ENOMEM = 12, EACCES = 13, EFAULT = 14,
     EBUSY = 16, ENOTDIR = 20, EINVAL = 22, EMFILE = 24, EFBIG = 27, EROFS = 30,
-    ENAMETOOLONG = 36, ENOSYS = 38, ELOOP = 40,
+    ENODEV = 19, ESPIPE = 29, ENAMETOOLONG = 36, ENOSYS = 38, ELOOP = 40, ENOTSOCK = 88,
     AT_FDCWD = -100, AT_SYMLINK_NOFOLLOW = 0x100, AT_NO_AUTOMOUNT = 0x800,
     AT_EMPTY_PATH = 0x1000,
     O_ACCMODE = 3, O_RDWR = 2, O_CREAT = 0x40, O_TRUNC = 0x200, O_NONBLOCK = 0x800,
@@ -15,7 +15,7 @@ enum {
     MFD_CLOEXEC = 1, MFD_ALLOW_SEALING = 2, MFD_NOEXEC_SEAL = 8,
     MEMFD_NAME_LIMIT = 249, MEMFD_CHUNKS = 128,
     FRAMES_PER_CHUNK = PMM_PAGE_SIZE / sizeof(uptr),
-    STDIO_COUNT = 3, FD_COUNT = 32,
+    STDIO_COUNT = 3, FD_COUNT = LINUX64_FD_COUNT,
 };
 
 /* Linux x86-64 передаёт 144 байта; у i386 другая раскладка stat. */
@@ -40,10 +40,12 @@ static struct memfd {
     unsigned handles;
 } memfds[FD_COUNT - STDIO_COUNT];
 static u64 next_memfd_inode = 1;
+static u64 next_socket_inode = 1;
 
 static struct file_handle {
     struct linux64_file file;
     struct memfd *memfd;
+    struct linux64_socket *socket;
     uptr offset;
     u32 flags;
     bool used;
@@ -73,6 +75,7 @@ static void memfd_trim(struct memfd *memfd, uptr first, uptr end) {
 }
 
 static void close_file(i32 fd) {
+    if (handles[fd].socket) linux64_socket_close(handles[fd].socket);
     struct memfd *memfd = handles[fd].memfd;
     if (memfd && !--memfd->handles) {
         memfd_trim(memfd, 0, memfd_page_count(memfd->size));
@@ -93,8 +96,9 @@ static bool open_file(i32 fd) {
     return fd >= STDIO_COUNT && fd < FD_COUNT && handles[fd].used;
 }
 
-bool linux64_get_file(i32 fd, struct linux64_fd_view *view) {
-    if (!open_file(fd)) return false;
+long linux64_get_file(i32 fd, struct linux64_fd_view *view) {
+    if (!open_file(fd)) return -EBADF;
+    if (handles[fd].socket) return -ENODEV;
     const struct memfd *memfd = handles[fd].memfd;
     *view = (struct linux64_fd_view){.file = handles[fd].file};
     if (memfd) {
@@ -105,7 +109,7 @@ bool linux64_get_file(i32 fd, struct linux64_fd_view *view) {
         view->writable = (handles[fd].flags & O_ACCMODE) == O_RDWR;
         view->may_grow = !(memfd->seals & F_SEAL_GROW);
     }
-    return true;
+    return 0;
 }
 
 static long user_string(uptr address, char *string, uptr limit) {
@@ -169,6 +173,36 @@ static long new_handle(const struct linux64_file *file, struct memfd *memfd, u32
         return i;
     }
     return -EMFILE;
+}
+
+static long linux_socketpair(i32 domain, u32 type, i32 protocol, uptr address) {
+    struct linux64_socket *ends[2];
+    long error = linux64_socket_pair(domain, type, protocol, ends);
+    if (error) return error;
+    i32 fds[2];
+    for (unsigned i = 0; i < 2; ++i) {
+        long fd = new_handle(NULL, NULL, O_RDWR | (type & (O_CLOEXEC | O_NONBLOCK)));
+        if (fd < 0) {
+            if (i) close_file(fds[0]);
+            else linux64_socket_close(ends[0]);
+            linux64_socket_close(ends[1]);
+            return fd;
+        }
+        fds[i] = (i32)fd;
+        handles[fd].socket = ends[i];
+        handles[fd].file.inode = next_socket_inode++;
+    }
+    u64 pair = (u32)fds[0] | ((u64)(u32)fds[1] << 32);
+    if (paging64_put_user_u64(address, pair)) return 0;
+    close_file(fds[0]);
+    close_file(fds[1]);
+    return -EFAULT;
+}
+
+long linux64_sockopt(bool get, i32 fd, i32 level, i32 option, uptr value, uptr length) {
+    if (!open_file(fd)) return fd >= 0 && fd < STDIO_COUNT ? -ENOTSOCK : -EBADF;
+    if (!handles[fd].socket) return -ENOTSOCK;
+    return linux64_socket_option(handles[fd].socket, get, level, option, value, length);
 }
 
 static long memfd_create(uptr name_address, u32 flags) {
@@ -263,7 +297,7 @@ static void handle_stat(i32 fd, struct linux64_file *file, const struct memfd **
 }
 
 static long lookup(i32 dirfd, uptr address, bool empty_path, struct linux64_file *file,
-                   const struct memfd **memfd) {
+                   const struct memfd **memfd, bool *socket) {
     char path[LINUX64_PATH_LIMIT + 1];
     path[1] = 0;
     if (address || !empty_path) {
@@ -274,12 +308,14 @@ static long lookup(i32 dirfd, uptr address, bool empty_path, struct linux64_file
         if (!empty_path || dirfd == AT_FDCWD) return -ENOENT;
         if (!open_file(dirfd)) return -EBADF;
         handle_stat(dirfd, file, memfd);
+        *socket = handles[dirfd].socket != NULL;
         return 0;
     }
     const char *absolute;
     long result = absolute_path(dirfd, path, &absolute);
     if (result) return result;
     *memfd = NULL;
+    *socket = false;
     return files.lookup && files.lookup(files.context, absolute, file) ? 0 : -ENOENT;
 }
 
@@ -334,6 +370,8 @@ static long linux_open(i32 dirfd, uptr address, u32 flags) {
 
 static long linux_read(i32 fd, uptr buffer, uptr count, uptr offset, bool positioned) {
     if (!open_file(fd)) return -EBADF;
+    if (handles[fd].socket)
+        return positioned ? -ESPIPE : linux64_socket_io(handles[fd].socket, true, buffer, count);
     if (!positioned) offset = handles[fd].offset;
     if ((long)offset < 0) return -EINVAL;
     if (buffer >= X64_USER_TOP || count > X64_USER_TOP - buffer) return -EFAULT;
@@ -361,10 +399,12 @@ static long linux_read(i32 fd, uptr buffer, uptr count, uptr offset, bool positi
     return (long)copied;
 }
 
-static long file_stat(const struct linux64_file *file, const struct memfd *memfd, uptr stat_address) {
-    u32 mode = memfd ? (memfd->seals & F_SEAL_EXEC ? 0100666 : 0100777) : 0100444;
+static long file_stat(const struct linux64_file *file, const struct memfd *memfd, bool socket,
+                      uptr stat_address) {
+    u32 mode = socket ? 0140777 : memfd ? (memfd->seals & F_SEAL_EXEC ? 0100666 : 0100777) : 0100444;
     const struct linux_stat stat = {
-        .dev = memfd ? 2 : 1, .ino = file->inode, .nlink = !memfd, .mode = mode,
+        .dev = socket ? 3 : memfd ? 2 : 1, .ino = file->inode, .nlink = !memfd, .mode = mode,
+        .uid = socket || memfd ? LINUX64_UID : 0, .gid = socket || memfd ? LINUX64_GID : 0,
         .size = file->size, .blksize = PMM_PAGE_SIZE, .blocks = (file->size + 511) / 512,
     };
     return paging64_copy_to_user(stat_address, &stat, sizeof(stat)) == sizeof(stat) ? 0 : -EFAULT;
@@ -374,10 +414,14 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
     const i32 fd = (i32)arg0;
     struct linux64_file file;
     const struct memfd *memfd;
+    bool socket;
     long result;
     switch (number) {
     case 0: /* read */
         return linux_read(fd, arg1, arg2, 0, false);
+    case 1: /* write */
+        if (!open_file(fd) || !handles[fd].socket) return -EBADF;
+        return linux64_socket_io(handles[fd].socket, false, arg1, arg2);
     case 2: /* open */
         return linux_open(AT_FDCWD, arg0, (u32)arg1);
     case 3: /* close */
@@ -387,14 +431,21 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
     case 5: /* fstat */
         if (!open_file(fd)) return -EBADF;
         handle_stat(fd, &file, &memfd);
-        return file_stat(&file, memfd, arg1);
+        return file_stat(&file, memfd, handles[fd].socket != NULL, arg1);
     case 17: /* pread64 */
         return linux_read(fd, arg1, arg2, arg3, true);
     case 21: /* access */
         if ((u32)arg1 & ~7u) return -EINVAL;
-        result = lookup(AT_FDCWD, arg0, false, &file, &memfd);
+        result = lookup(AT_FDCWD, arg0, false, &file, &memfd, &socket);
         if (result) return result;
         return (arg1 & 3u) ? -EACCES : 0;
+    case 46: /* sendmsg */
+    case 47: /* recvmsg */
+        if (!open_file(fd)) return fd >= 0 && fd < STDIO_COUNT ? -ENOTSOCK : -EBADF;
+        if (!handles[fd].socket) return -ENOTSOCK;
+        return linux64_socket_message(handles[fd].socket, number == 47, arg1, (u32)arg2);
+    case 53: /* socketpair */
+        return linux_socketpair(fd, (u32)arg1, (i32)arg2, arg3);
     case 72: /* fcntl */
         return linux_fcntl(fd, (i32)arg1, (u32)arg2);
     case 77: /* ftruncate */
@@ -406,8 +457,8 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
     case 262: /* newfstatat */
         if ((u32)arg3 & ~(AT_EMPTY_PATH | AT_NO_AUTOMOUNT | AT_SYMLINK_NOFOLLOW))
             return -EINVAL;
-        result = lookup(fd, arg1, (arg3 & AT_EMPTY_PATH) != 0, &file, &memfd);
-        return result ? result : file_stat(&file, memfd, arg2);
+        result = lookup(fd, arg1, (arg3 & AT_EMPTY_PATH) != 0, &file, &memfd, &socket);
+        return result ? result : file_stat(&file, memfd, socket, arg2);
     case 319: /* memfd_create */
         return memfd_create(arg0, (u32)arg1);
     default:
