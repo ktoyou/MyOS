@@ -90,6 +90,7 @@ aux_done:
 
     call check_fs
     call check_getrandom
+    call check_clock
 
     mov eax,1
     mov edi,7
@@ -305,6 +306,57 @@ getrandom_fail:
     mov edi,14
     syscall
     ud2
+
+check_clock:
+    mov eax,228
+    mov edi,-1
+    xor esi,esi
+    syscall
+    cmp rax,-22
+    jne clock_fail
+    mov eax,228
+    mov edi,1
+    lea rsi,[rip+message]
+    syscall
+    cmp rax,-14
+    jne clock_fail
+    lea rsi,[rip+buffer+4093]
+    call monotonic_ns
+    mov r13,rax
+    mov r14,rax
+    mov r15d,2000000
+clock_wait:
+    call monotonic_ns
+    cmp rax,r14
+    jb clock_fail
+    mov r14,rax
+    sub rax,r13
+    cmp rax,20000000
+    jae clock_done
+    dec r15d
+    jnz clock_wait
+clock_fail:
+    mov eax,60
+    mov edi,15
+    syscall
+    ud2
+clock_done:
+    ret
+
+monotonic_ns:
+    mov eax,228
+    mov edi,1
+    syscall
+    test rax,rax
+    jne clock_fail
+    cmp qword ptr [rsi+8],1000000000
+    jae clock_fail
+    mov rax,[rsi]
+    test rax,rax
+    js clock_fail
+    imul rax,1000000000
+    add rax,[rsi+8]
+    ret
 
 .global guard_probe
 guard_probe:
