@@ -314,6 +314,24 @@ const u8 *paging64_user_read(uptr address) {
     return user_pointer(address, PRESENT | USER);
 }
 
-u8 *paging64_user_write(uptr address) {
-    return user_pointer(address, PRESENT | USER | WRITE);
+uptr paging64_copy_to_user(uptr address, const void *source, uptr length) {
+    const u8 *bytes = source;
+    uptr copied = 0;
+    while (copied < length) {
+        uptr current = address + copied;
+        u8 *target = user_pointer(current, PRESENT | USER | WRITE);
+        if (!target) break;
+        uptr chunk = PMM_PAGE_SIZE - (current & (PMM_PAGE_SIZE - 1));
+        if (chunk > length - copied) chunk = length - copied;
+        for (uptr i = 0; i < chunk; ++i) target[i] = bytes[copied + i];
+        copied += chunk;
+    }
+    return copied;
+}
+
+bool paging64_put_user_u64(uptr address, u64 value) {
+    const u64 required = PRESENT | USER | WRITE;
+    if (!user_pointer(address, required) ||
+        !user_pointer(address + sizeof(value) - 1, required)) return false;
+    return paging64_copy_to_user(address, &value, sizeof(value)) == sizeof(value);
 }

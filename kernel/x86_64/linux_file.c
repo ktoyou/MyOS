@@ -44,20 +44,6 @@ const struct linux64_file *linux64_get_file(i32 fd) {
     return open_file(fd) ? &handles[fd].file : NULL;
 }
 
-static uptr user_store(uptr address, const void *data, uptr size) {
-    const u8 *source = data;
-    uptr copied = 0;
-    while (copied < size) {
-        u8 *target = paging64_user_write(address + copied);
-        if (!target) break;
-        uptr chunk = PMM_PAGE_SIZE - ((address + copied) & (PMM_PAGE_SIZE - 1));
-        if (chunk > size - copied) chunk = size - copied;
-        for (uptr i = 0; i < chunk; ++i) target[i] = source[copied + i];
-        copied += chunk;
-    }
-    return copied;
-}
-
 static long user_path(uptr address, char path[PATH_LIMIT]) {
     for (uptr copied = 0; copied < PATH_LIMIT;) {
         const u8 *source = paging64_user_read(address + copied);
@@ -124,7 +110,7 @@ static long linux_read(i32 fd, uptr buffer, uptr count, uptr offset, bool positi
     if (!count || offset >= file->size) return 0;
     if (count > 0x7ffff000u) count = 0x7ffff000u;
     if (count > file->size - offset) count = file->size - offset;
-    uptr copied = user_store(buffer, file->bytes + offset, count);
+    uptr copied = paging64_copy_to_user(buffer, file->bytes + offset, count);
     if (!copied) return -EFAULT;
     if (!positioned) handles[fd].offset += copied;
     return (long)copied;
@@ -135,7 +121,7 @@ static long file_stat(const struct linux64_file *file, uptr stat_address) {
         .dev = 1, .ino = file->inode, .nlink = 1, .mode = 0100444,
         .size = file->size, .blksize = PMM_PAGE_SIZE, .blocks = (file->size + 511) / 512,
     };
-    return user_store(stat_address, &stat, sizeof(stat)) == sizeof(stat) ? 0 : -EFAULT;
+    return paging64_copy_to_user(stat_address, &stat, sizeof(stat)) == sizeof(stat) ? 0 : -EFAULT;
 }
 
 long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg3) {
