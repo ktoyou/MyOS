@@ -38,6 +38,9 @@ __attribute__((noreturn)) void child_exec(unsigned empty_argv) {
         failed_phase = 2;
         finish(43);
     }
+    long input = sys(2, (word)"/dev/null", 0x80000, 0, 0, 0, 0);
+    if (input < 5 || sys(33, input, 0, 0, 0, 0, 0) ||
+        sys(3, input, 0, 0, 0, 0, 0) || sys(72, 2, 2, 1, 0, 0, 0)) finish(44);
     sys(59, (word)TARGET_PATH, empty_argv ? 0 : (word)argv,
         empty_argv ? 0 : (word)envp, 0, 0, 0);
     finish(41);

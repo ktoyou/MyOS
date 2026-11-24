@@ -206,6 +206,41 @@ static long check_null(void) {
     return 0;
 }
 
+static long check_dup(void) {
+    long rd = call(2, (word)"/dev/null", 0x80000, 0, 0);
+    if (rd < 3 || call(33, rd, rd, 0, 0) != rd || call(72, rd, 1, 0, 0) != 1 ||
+        call(33, -1, rd, 0, 0) != -9 || call(33, rd, -1, 0, 0) != -9 ||
+        call(292, -1, -1, 0, 0) != -22 || call(292, rd, 0, 1, 0) != -22 ||
+        call(72, rd, 0, -1, 0) != -22 || call(72, -1, 0, -1, 0) != -9) return 41;
+    long smallest = call(32, rd, 0, 0, 0);
+    long minimum = call(72, rd, 1030, 12, 0);
+    if (smallest != rd + 1 || minimum != 12 || call(72, smallest, 1, 0, 0) ||
+        call(72, minimum, 1, 0, 0) != 1 || call(3, smallest, 0, 0, 0) ||
+        call(3, minimum, 0, 0, 0) || call(33, rd, 0, 0, 0) || call(3, rd, 0, 0, 0) ||
+        call(72, 0, 1, 0, 0) || call(0, 0, 1, 8, 0)) return 42;
+
+    int ends[2], status;
+    if (call(22, (word)ends, 0, 0, 0)) return 43;
+    long child = call(57, 0, 0, 0, 0);
+    if (!child) {
+        int error = call(3, ends[0], 0, 0, 0) || call(33, ends[1], 1, 0, 0) != 1 ||
+                    call(292, ends[1], 2, 0x80000, 0) != 2 || call(72, 2, 1, 0, 0) != 1 ||
+                    call(3, ends[1], 0, 0, 0) || call(3, 0, 0, 0, 0) ||
+                    call(32, 1, 0, 0, 0) || call(1, 0, (word)"x", 1, 0) != 1 ||
+                    call(1, 1, (word)"y", 1, 0) != 1 || call(1, 2, (word)"z", 1, 0) != 1;
+        call(60, error, 0, 0, 0);
+        __builtin_trap();
+    }
+    char byte;
+    if (child < 0 || call(3, ends[1], 0, 0, 0)) return 44;
+    for (char expected = 'x'; expected <= 'z'; ++expected)
+        if (call(0, ends[0], (word)&byte, 1, 0) != 1 || byte != expected) return 45;
+    if (call(0, ends[0], (word)&byte, 1, 0) ||
+        call(61, child, (word)&status, 0, 0) != child || status ||
+        call(3, ends[0], 0, 0, 0)) return 46;
+    return 0;
+}
+
 __attribute__((noreturn)) void _start(void) {
     long status = check_files();
     if (!status) status = check_signals();
@@ -214,6 +249,7 @@ __attribute__((noreturn)) void _start(void) {
     if (!status) status = check_ids(118, 102, 107);
     if (!status) status = check_ids(120, 104, 108);
     if (!status) status = check_null();
+    if (!status) status = check_dup();
     if (!status) {
         static const char message[] = "Linux ELF64 files probe\n";
         if (call(1, 1, (word)message, sizeof(message) - 1, 0) != sizeof(message) - 1)
