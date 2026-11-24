@@ -4,6 +4,10 @@
 #include "../types.h"
 
 #define LINUX64_PATH_LIMIT 4096u
+#define LINUX64_FD_COUNT 32u
+#define LINUX64_PID 1
+#define LINUX64_UID 1000
+#define LINUX64_GID 1000
 
 struct linux64_file {
     const u8 *bytes;
@@ -25,8 +29,16 @@ struct linux64_fd_view {
     uptr (*frame)(const void *object, uptr offset);
     bool writable, may_grow;
 };
-bool linux64_get_file(i32 fd, struct linux64_fd_view *view);
+long linux64_get_file(i32 fd, struct linux64_fd_view *view);
 long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg3);
+long linux64_sockopt(bool get, i32 fd, i32 level, i32 option, uptr value, uptr length);
+struct linux64_socket;
+long linux64_socket_pair(i32 domain, u32 type, i32 protocol, struct linux64_socket *ends[2]);
+void linux64_socket_close(struct linux64_socket *socket);
+long linux64_socket_option(struct linux64_socket *socket, bool get, i32 level, i32 option,
+                           uptr value, uptr length);
+long linux64_socket_message(struct linux64_socket *socket, bool receive, uptr message, u32 flags);
+long linux64_socket_io(struct linux64_socket *socket, bool receive, uptr buffer, uptr length);
 long linux64_mmap(uptr address, uptr length, u32 protection, u32 flags, i32 fd, uptr offset);
 long linux64_mprotect(uptr address, uptr length, uptr protection);
 long linux64_munmap(uptr address, uptr length);

@@ -144,6 +144,17 @@ def check_mmap(build):
     print('OVMF: mmap, memfd, mprotect, RELRO and Linux futex wake: PASS', flush=True)
 
 
+def check_socket(build):
+    probe = (build / 'linux-socket.elf').resolve()
+    marker = 'Linux ELF64 seqpacket probe'
+    host = subprocess.run([str(probe)], env={}, capture_output=True, timeout=5,
+                          preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_NOFILE, (32, 32)))
+    assert (host.returncode, host.stdout, host.stderr) == (0, (marker + '\n').encode(), b''), host
+    serial = check_guest('socket', probe.read_bytes(), 'Linux x86-64 exit status=0x00')
+    assert marker in serial, serial
+    print('OVMF: AF_UNIX seqpacket, SO_PASSCRED and descriptor cleanup: PASS', flush=True)
+
+
 def main():
     build = pathlib.Path('build/x86_64')
     probe = build / 'linux-probe.elf'
@@ -182,6 +193,7 @@ def main():
     check_interpreter(build)
     check_files(build)
     check_mmap(build)
+    check_socket(build)
 
 
 if __name__ == '__main__':

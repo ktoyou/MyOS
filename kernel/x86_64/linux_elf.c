@@ -177,7 +177,8 @@ static uptr make_stack(const struct elf_image *main, u64 interp_bias, const u64 
     const u64 initial[] = {
         1, argv_address, 0, 0,
         3, main->phdr, 4, main->header->phentsize, 5, main->header->phnum, 6, PMM_PAGE_SIZE,
-        7, interp_bias, 9, main->entry, AT_RANDOM, random_address, 31, execfn_address, 0, 0,
+        7, interp_bias, 9, main->entry, 11, LINUX64_UID, 12, LINUX64_UID,
+        13, LINUX64_GID, 14, LINUX64_GID, AT_RANDOM, random_address, 31, execfn_address, 0, 0,
     };
     uptr stack = (random_address - sizeof(initial)) & ~15ul;
     /* argv[0] изменяется программой независимо от AT_EXECFN. */
