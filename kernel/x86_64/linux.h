@@ -10,6 +10,7 @@
 #define LINUX64_GID 1000
 #define LINUX64_STACK_TOP 0x00007ffffff00000ul
 #define LINUX64_STACK_FLOOR (LINUX64_STACK_TOP - 8 * 1024 * 1024ul)
+#define LINUX64_S_IFDIR 0040000u
 
 enum linux64_poll_events {
     LINUX64_POLLIN = 0x001, LINUX64_POLLOUT = 0x004, LINUX64_POLLERR = 0x008,
@@ -23,11 +24,14 @@ struct linux64_file {
     const u8 *bytes;
     uptr size;
     u64 inode;
+    u32 mode, uid, gid;
+    bool writable_directory;
 };
 
 struct linux64_file_source {
     bool (*lookup)(const void *context, const char *path, struct linux64_file *file);
     const void *context;
+    u64 (*directory)(const void *context, const char *path);
 };
 
 bool linux64_run(const void *image, uptr size, const char *path, uptr path_length,

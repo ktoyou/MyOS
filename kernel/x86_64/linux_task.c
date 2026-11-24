@@ -34,7 +34,7 @@ _Static_assert(__builtin_offsetof(struct linux64_frame, rip) == 15 * sizeof(u64)
 
 void linux64_task_init(void) {
     processes[0] = (struct linux64_process){
-        .pid = LINUX64_PID, .sid = LINUX64_PID, .pgid = LINUX64_PID, .threads = 1,
+        .pid = LINUX64_PID, .sid = LINUX64_PID, .pgid = LINUX64_PID, .threads = 1, .umask = 022,
     };
     linux64_current->tid = LINUX64_PID;
     linux64_current->process = &processes[0];
@@ -583,6 +583,10 @@ void linux64_task_syscall(struct linux64_frame *frame) {
         break;
     case 61: /* wait4 */
         frame->rax = (u64)wait4((i32)frame->rdi, frame->rsi, (u32)frame->rdx, frame->r10);
+        break;
+    case 95: /* umask */
+        frame->rax = linux64_current->process->umask;
+        linux64_current->process->umask = (u32)frame->rdi & 0777u;
         break;
     case 110: /* getppid */
         frame->rax = (u64)linux64_current->process->ppid;
