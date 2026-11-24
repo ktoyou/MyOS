@@ -7,11 +7,18 @@ static char stack[16384] __attribute__((aligned(16)));
 static const char uid_map[] = "/proc/self/uid_map";
 static const char gid_map[] = "/proc/self/gid_map";
 static const char setgroups[] = "/proc/self/setgroups";
+static const char namespace_path[] = "/proc/self/ns/user";
 static unsigned host_uid, host_gid;
 static long backing;
+static word initial_namespace;
 
 struct cap_header { unsigned version; int pid; };
 struct cap_data { unsigned effective, permitted, inheritable; };
+struct stat {
+    word dev, inode, nlink;
+    unsigned mode, uid, gid, padding;
+    word rest[13];
+};
 
 extern long fork_namespace(word child_stack);
 
@@ -78,7 +85,46 @@ static int caps_empty(const struct cap_data data[2]) {
              data[1].effective | data[1].permitted | data[1].inheritable);
 }
 
+static word check_namespace_path(void) {
+    struct stat target, link, opened;
+    if (call(21, (word)namespace_path, 0, 0, 0) || call(21, (word)namespace_path, 4, 0, 0) ||
+        call(21, (word)namespace_path, 2, 0, 0) != -1 ||
+        call(21, (word)namespace_path, 3, 0, 0) != -13 ||
+        call(4, (word)namespace_path, (word)&target, 0, 0) || (target.mode & 0170777) != 0100444 ||
+        call(6, (word)namespace_path, (word)&link, 0, 0) || (link.mode & 0170000) != 0120000 ||
+        target.dev == link.dev || call(2, (word)namespace_path, 0x20000, 0, 0) != -40 ||
+        call(2, (word)namespace_path, 0x10000, 0, 0) != -20 ||
+        call(2, (word)namespace_path, 0x30000, 0, 0) != -20 ||
+        call(21, (word)"/proc/self/ns/user/", 0, 0, 0) != -20) finish(19);
+    long fd = open_file(namespace_path, 0x80000);
+    if (fd < 0 || call(5, fd, (word)&opened, 0, 0) || opened.inode != target.inode ||
+        opened.dev != target.dev || call(72, fd, 1, 0, 0) != 1 ||
+        call(262, fd, (word)"", (word)&opened, 0x1000) || opened.inode != target.inode ||
+        call(3, fd, 0, 0, 0)) finish(20);
+    char text[32];
+    for (unsigned i = 0; i < sizeof(text); ++i) text[i] = 'z';
+    long bytes = call(89, (word)namespace_path, (word)text, sizeof(text), 0);
+    if (bytes < 8 || (word)bytes >= sizeof(text) || text[0] != 'u' || text[1] != 's' ||
+        text[2] != 'e' || text[3] != 'r' || text[4] != ':' || text[5] != '[' ||
+        text[bytes - 1] != ']' || text[bytes] != 'z') finish(21);
+    word inode = 0;
+    for (long i = 6; i < bytes - 1; ++i) {
+        if (text[i] < '0' || text[i] > '9') finish(22);
+        inode = inode * 10 + (unsigned)(text[i] - '0');
+    }
+    long proc = open_file("/proc/", 0x90000);
+    text[3] = 'z';
+    if (inode != target.inode || proc < 0 ||
+        call(262, proc, (word)"self/ns/user", (word)&opened, 0x100) ||
+        opened.inode != link.inode || opened.mode != link.mode ||
+        call(267, proc, (word)"self/ns/user", (word)text, 3) != 3 || text[3] != 'z' ||
+        call(3, proc, 0, 0, 0)) finish(23);
+    return inode;
+}
+
 __attribute__((noreturn)) void namespace_child(void) {
+    word outer_namespace = check_namespace_path();
+    if (outer_namespace == initial_namespace) finish(24);
     if (call(102, 0, 0, 0, 0) != 65534 || call(104, 0, 0, 0, 0) != 65534 ||
         call(272, NEWUSER, 0, 0, 0) != -1) finish(1);
     struct cap_header caps = {CAP_V3, 0};
@@ -96,11 +142,7 @@ __attribute__((noreturn)) void namespace_child(void) {
     if (fd < 0 || call(1, fd, (word)"allow", 5, 0) != -1 ||
         call(3, fd, 0, 0, 0)) finish(6);
 
-    struct {
-        word dev, inode, nlink;
-        unsigned mode, uid, gid, padding;
-        word rest[13];
-    } stat;
+    struct stat stat;
     long proc = open_file("/proc/", 0x90000);
     if (proc < 0 || call(262, proc, (word)"self/task/", (word)&stat, 0) ||
         stat.nlink != 3 || (stat.mode & 0170000) != 0040000 || call(3, proc, 0, 0, 0) ||
@@ -110,7 +152,13 @@ __attribute__((noreturn)) void namespace_child(void) {
         call(125, (word)&caps, (word)dropped, 0, 0) || !caps_empty(dropped)) finish(8);
 
     long previous = open_file(uid_map, 0);
-    if (previous < 0 || call(272, NEWUSER, 0, 0, 0) || call(102, 0, 0, 0, 0) != 65534) finish(9);
+    long ns_fd = open_file(namespace_path, 0);
+    if (previous < 0 || ns_fd < 0 || call(272, NEWUSER, 0, 0, 0) ||
+        call(102, 0, 0, 0, 0) != 65534) finish(9);
+    word nested_namespace = check_namespace_path();
+    if (nested_namespace == initial_namespace || nested_namespace == outer_namespace ||
+        call(5, ns_fd, (word)&stat, 0, 0) || stat.inode != outer_namespace ||
+        call(3, ns_fd, 0, 0, 0)) finish(25);
     if (write_map(uid_map, 0) != -1) finish(17);
     if (call(126, (word)&caps, (word)dropped, 0, 0) ||
         write_map(gid_map, 0) != -1 || open_file(setgroups, 1) != -13) finish(18);
@@ -123,6 +171,7 @@ __attribute__((noreturn)) void namespace_child(void) {
 }
 
 void _start(void) {
+    initial_namespace = check_namespace_path();
     host_uid = (unsigned)call(102, 0, 0, 0, 0);
     host_gid = (unsigned)call(104, 0, 0, 0, 0);
     backing = call(319, (word)"userns-test", 0, 0, 0);
@@ -136,6 +185,7 @@ void _start(void) {
     int status;
     if (call(61, child, (word)&status, 0, 0) != child || (status & 0x7f)) finish(14);
     if (status) finish(status >> 8);
+    if (check_namespace_path() != initial_namespace) finish(26);
     if (call(102, 0, 0, 0, 0) != host_uid || call(104, 0, 0, 0, 0) != host_gid ||
         call(125, (word)&caps, (word)parent, 0, 0) || !caps_empty(parent) ||
         call(3, backing, 0, 0, 0)) finish(15);

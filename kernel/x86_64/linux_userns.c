@@ -9,12 +9,14 @@ enum {
 
 struct linux64_userns {
     struct linux64_userns *parent;
+    u64 inode;
     u32 ids[2];
     bool mapped[2], deny_setgroups, parent_could_setfcap;
     unsigned references, depth;
 };
 
 static struct linux64_userns namespaces[USERNS_COUNT];
+static u64 next_inode = 2;
 
 void linux64_userns_retain(struct linux64_userns *ns) {
     if (ns) ++ns->references;
@@ -22,6 +24,10 @@ void linux64_userns_retain(struct linux64_userns *ns) {
 
 void linux64_userns_release(struct linux64_userns *ns) {
     while (ns && !--ns->references) ns = ns->parent;
+}
+
+u64 linux64_userns_inode(const struct linux64_userns *ns) {
+    return ns ? ns->inode : 1;
 }
 
 u32 linux64_visible_id(const struct linux64_userns *ns, bool group, u32 id) {
@@ -38,7 +44,7 @@ long linux64_userns_create(struct linux64_userns *parent, struct linux64_userns 
         struct linux64_userns *ns = &namespaces[i];
         if (ns->references) continue;
         *ns = (struct linux64_userns){
-            .parent = parent, .references = 1, .depth = depth,
+            .parent = parent, .inode = next_inode++, .references = 1, .depth = depth,
             .deny_setgroups = parent && parent->deny_setgroups,
             .parent_could_setfcap = (linux64_current->caps.effective & LINUX64_CAP_SETFCAP) != 0,
         };
@@ -151,8 +157,8 @@ long linux64_userns_write(struct linux64_userns *ns, enum linux64_proc_node file
     return (long)count;
 }
 
-static char *write_number(char *out, u32 value) {
-    char reverse[10];
+static char *write_number(char *out, u64 value) {
+    char reverse[20];
     unsigned length = 0;
     do {
         reverse[length++] = (char)('0' + value % 10);
@@ -160,6 +166,15 @@ static char *write_number(char *out, u32 value) {
     } while (value);
     while (length) *out++ = reverse[--length];
     return out;
+}
+
+long linux64_userns_readlink(const struct linux64_userns *ns, uptr buffer, uptr size) {
+    char text[27] = {'u', 's', 'e', 'r', ':', '['};
+    char *end = write_number(text + 6, linux64_userns_inode(ns));
+    *end++ = ']';
+    uptr count = (uptr)(end - text);
+    if (size < count) count = size;
+    return paging64_copy_to_user(buffer, text, count) == count ? (long)count : -EFAULT;
 }
 
 long linux64_userns_read(const struct linux64_userns *ns, enum linux64_proc_node file,
