@@ -134,7 +134,7 @@ static struct linux64_process *unused_process(void) {
     return NULL;
 }
 
-static struct linux64_process *process_by_pid(i32 pid) {
+const struct linux64_process *linux64_process_by_pid(i32 pid) {
     if (!pid) return NULL;
     for (unsigned i = 0; i < LINUX64_TASK_COUNT; ++i)
         if (processes[i].pid == pid) return &processes[i];
@@ -244,6 +244,7 @@ static long clone_task(struct linux64_frame *frame, uptr flags, uptr stack, uptr
         process->exit_status = 0;
         process->pid_ns_link_inode = 0;
         process->fdinfo_inode = 0;
+        process->proc_fd_inode = 0;
         process->userns = ns;
         process->fs = fs;
         process->pid_ns = pid_ns;
@@ -746,7 +747,7 @@ void linux64_task_syscall(struct linux64_frame *frame) {
         break;
     case 110: { /* getppid */
         const struct linux64_process *process = linux64_current->process;
-        const struct linux64_process *parent = process_by_pid(process->ppid);
+        const struct linux64_process *parent = linux64_process_by_pid(process->ppid);
         frame->rax = parent ? (u64)linux64_pid_number(parent->pid_identity, process->pid_ns) : 0;
         break;
     }

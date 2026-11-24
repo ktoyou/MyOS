@@ -140,7 +140,10 @@ static void check_socket_retry(void) {
 static void check_shared_root(void) {
     long proc = open_path("/proc", O_DIRECTORY);
     long outside = open_path("/dev/null", 0);
-    if (proc < 0 || outside < 0 || call(158, 0x1002, (word)&parent_tls, 0, 0)) finish(12);
+    long outside_dir = open_path("/tmp", O_DIRECTORY);
+    if (proc < 0 || outside < 0 || outside_dir < 0 ||
+        call(33, outside_dir, 27, 0, 0) != 27 || call(3, outside_dir, 0, 0, 0) ||
+        call(158, 0x1002, (word)&parent_tls, 0, 0)) finish(12);
     long child = launch_helper((word)(child_stack + sizeof(child_stack)));
     word stat[18], task[18];
     if (status_of(child) || tls_value() != parent_tls || call(95, 022, 0, 0, 0) != 077 ||
@@ -152,8 +155,72 @@ static void check_shared_root(void) {
     long retained = call(257, proc, (word)".", O_DIRECTORY, 0);
     if (retained < 0 || call(262, retained, (word)"self/task/", (word)task, 0) ||
         (task[3] & 0170000) != 0040000 ||
-        call(257, proc, (word)"/proc", O_DIRECTORY, 0) != -2 ||
-        call(3, retained, 0, 0, 0) || call(3, proc, 0, 0, 0) || call(3, outside, 0, 0, 0)) finish(14);
+        call(257, proc, (word)"/proc", O_DIRECTORY, 0) != -2) finish(14);
+    long scanner = call(257, retained, (word)"self/fd/", O_DIRECTORY, 0);
+    if (scanner < 0 || open_path("/proc/self/fd/", O_DIRECTORY) != -2 ||
+        call(262, scanner, (word)"27", (word)stat, 0) || (stat[3] & 0170000) != 0040000)
+        finish(27);
+    struct { word inode, next; unsigned short length; unsigned char type; char name[5]; } entry;
+    unsigned seen = 0;
+    for (;;) {
+        long count = call(217, scanner, (word)&entry, sizeof(entry), 0);
+        if (!count) break;
+        if (count != sizeof(entry)) finish(39);
+        if (entry.type == 10 && entry.name[0] == '2' && entry.name[1] == '7' && !entry.name[2])
+            ++seen;
+    }
+    if (seen != 1) finish(39);
+    long inherited = call(57, 0, 0, 0, 0);
+    if (!inherited) {
+        if (call(33, outside, 27, 0, 0) != 27 ||
+            call(262, scanner, (word)"27", (word)stat, 0) || (stat[3] & 0170000) != 0040000)
+            finish(28);
+        long own = call(257, retained, (word)"self/fd/", O_DIRECTORY, 0);
+        if (own < 0 || call(262, own, (word)"27", (word)stat, 0) ||
+            (stat[3] & 0170000) != 0020000) finish(29);
+        finish(0);
+    }
+    if (status_of(inherited) || call(3, 27, 0, 0, 0) ||
+        call(262, scanner, (word)"27", (word)stat, 0) != -2 ||
+        call(3, scanner, 0, 0, 0) || call(3, retained, 0, 0, 0) ||
+        call(3, proc, 0, 0, 0) || call(3, outside, 0, 0, 0)) finish(30);
+}
+
+static void check_stale_scanner(void) {
+    int gate[2], reuse[2];
+    if (call(22, (word)gate, 0, 0, 0) || call(22, (word)reuse, 0, 0, 0)) finish(31);
+    long child = call(57, 0, 0, 0, 0);
+    if (!child) {
+        long scanner = open_path("/proc/self/fd/", O_DIRECTORY);
+        if (scanner < 0) finish(32);
+        long grandchild = call(57, 0, 0, 0, 0);
+        if (grandchild < 0) finish(33);
+        if (!grandchild) {
+            char records[48], byte;
+            word stat[18];
+            if (call(0, gate[0], (word)&byte, 1, 0) != 1 ||
+                call(217, scanner, (word)records, sizeof(records), 0) != -2 ||
+                call(5, scanner, (word)stat, 0, 0) != -2 ||
+                call(262, scanner, (word)".", (word)stat, 0) != -2 ||
+                call(257, scanner, (word)".", O_DIRECTORY, 0) != -2) finish(34);
+            long own = open_path("/proc/self/fd/", O_DIRECTORY);
+            if (own < 0 || call(217, own, (word)records, sizeof(records), 0) != sizeof(records))
+                finish(35);
+        }
+        finish(0);
+    }
+    if (status_of(child)) finish(36);
+    long replacement = call(57, 0, 0, 0, 0);
+    if (!replacement) {
+        char byte;
+        finish(call(0, reuse[0], (word)&byte, 1, 0) == 1 ? 0 : 38);
+    }
+    int status;
+    if (replacement < 1 || call(1, gate[1], (word)"r", 1, 0) != 1 ||
+        call(61, -1, (word)&status, 0, 0) < 1 || status ||
+        call(1, reuse[1], (word)"r", 1, 0) != 1 || status_of(replacement) ||
+        call(3, gate[0], 0, 0, 0) || call(3, gate[1], 0, 0, 0) ||
+        call(3, reuse[0], 0, 0, 0) || call(3, reuse[1], 0, 0, 0)) finish(37);
 }
 
 static void check_namespace_detach(void) {
@@ -172,6 +239,7 @@ void _start(void) {
     if (chroot("/") != -1 || chroot("/outside.elf") != -20 || chroot("/no-such-path") != -2)
         finish(1);
     check_namespace_detach();
+    check_stale_scanner();
     long marker = open_path("/loader-missing", 0);
     if (marker >= 0 && call(3, marker, 0, 0, 0)) finish(18);
     long child = call(56, NEWUSER | SIGCHLD, 0, 0, 0);

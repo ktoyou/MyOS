@@ -41,7 +41,7 @@ struct linux64_pid;
 
 enum linux64_proc_node {
     USERNS_NONE, USERNS_UID_MAP, USERNS_GID_MAP, USERNS_SETGROUPS,
-    PROC_USER_NS, PROC_PID_NS, PROC_EXE, PROC_ROOT, PROC_TASKS,
+    PROC_USER_NS, PROC_PID_NS, PROC_EXE, PROC_ROOT, PROC_TASKS, PROC_FDS,
 };
 
 struct linux64_caps {
@@ -103,7 +103,7 @@ struct linux64_process {
     struct linux64_sigaction actions[LINUX64_SIGNAL_COUNT];
     char executable_path[LINUX64_PATH_LIMIT];
     uptr executable_path_length;
-    u64 pid_ns_link_inode, fdinfo_inode;
+    u64 pid_ns_link_inode, fdinfo_inode, proc_fd_inode;
     i32 pid, ppid, sid, pgid, exit_status;
     unsigned threads;
     struct linux64_fs *fs;
@@ -187,6 +187,7 @@ long linux64_userns_read(const struct linux64_userns *ns, enum linux64_proc_node
 long linux64_userns_write(struct linux64_userns *ns, enum linux64_proc_node file,
                           uptr buffer, uptr count, uptr offset);
 void linux64_task_init(void);
+const struct linux64_process *linux64_process_by_pid(i32 pid);
 u16 linux64_task_count(void);
 void linux64_task_syscall(struct linux64_frame *frame);
 void linux64_retain_files(struct linux64_process *process);
@@ -223,6 +224,7 @@ long linux64_vfs_socket(const struct linux64_directory *base, const char *path, 
 long linux64_vfs_unlink(const struct linux64_directory *base, const char *path);
 u32 linux64_file_permissions(const struct linux64_file *file);
 bool linux64_special_node(const char *path, struct linux64_file *file);
+long linux64_proc_fd_entry(i32 owner, const char *name, uptr length, struct linux64_file *file);
 long linux64_user_string(uptr address, char *string, uptr limit);
 long linux64_execve(struct linux64_frame *frame, uptr filename, uptr argv, uptr envp);
 bool linux64_commit_exec(struct linux64_frame *frame, uptr root, uptr entry, uptr stack,
