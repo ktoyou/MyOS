@@ -22,12 +22,12 @@ def linux_root(elf, files):
     return root
 
 
-def check_guest(name, elf, marker, *, fault=False, files=None):
+def check_guest(name, elf, marker, *, fault=False, files=None, cpu='max'):
     payload, kernel_end = image('kernel-linux')
     root_header = linux_root(elf, files or {})
     with tempfile.TemporaryDirectory(prefix='myos-linux-x64-') as temp:
         serial = boot_x64(pathlib.Path(temp), 'x64-linux-' + name, payload,
-                          kernel_end, [marker], live_root_header=root_header)
+                          kernel_end, [marker], live_root_header=root_header, cpu=cpu)
     if not fault:
         assert 'x86-64 exception' not in serial, serial
     return serial
@@ -135,6 +135,9 @@ def main():
     serial = check_guest('probe', elf, 'Linux x86-64 exit status=0x2a')
     assert 'OK Linux ELF64 syscall probe' in serial and 'Linux x86-64 ELF rejected' not in serial, serial
     print('OVMF: same Linux ELF64, same output and exit status: PASS', flush=True)
+    serial = check_guest('no-rdrand', elf, 'Linux x86-64 ELF rejected', cpu='max,-rdrand')
+    assert 'AT_RANDOM entropy unavailable' in serial and 'Linux x86-64 exit status' not in serial, serial
+    print('OVMF: Linux ELF64 rejects CPU without RDRAND: PASS', flush=True)
 
     executable = next(p for p in program_headers(elf) if struct.unpack_from('<II', elf, p) == (1, 5))
     for name, offset, value in (('wx', executable + 4, struct.pack('<I', 7)),

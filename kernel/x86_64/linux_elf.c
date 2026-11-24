@@ -18,6 +18,7 @@
 #define PF_X            1u
 #define PF_W            2u
 #define PF_R            4u
+#define AT_RANDOM       25u
 
 struct elf_header {
     u8 ident[16];
@@ -163,7 +164,24 @@ static bool map_image(const struct elf_image *elf) {
     return true;
 }
 
-static uptr make_stack(const struct elf_image *main, u64 interp_bias) {
+static bool startup_entropy(u64 entropy[2]) {
+    u32 eax = 0, ebx, ecx, edx;
+    __asm__ volatile("cpuid" : "+a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx));
+    if (eax < 1) return false;
+    eax = 1;
+    __asm__ volatile("cpuid" : "+a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx));
+    if (!(ecx & (1u << 30))) return false;
+    for (unsigned i = 0; i < 2; ++i) {
+        bool ready = false;
+        for (unsigned attempt = 0; attempt < 10 && !ready; ++attempt)
+            __asm__ volatile("rdrand %0" : "=r"(entropy[i]), "=@ccc"(ready));
+        if (!ready) return false;
+    }
+    /* Некоторые неисправные реализации возвращают одну константу при CF=1. */
+    return entropy[0] != entropy[1];
+}
+
+static uptr make_stack(const struct elf_image *main, u64 interp_bias, const u64 entropy[2]) {
     u8 *top_page = NULL;
     for (uptr page = STACK_BOTTOM; page < STACK_TOP; page += PMM_PAGE_SIZE) {
         top_page = paging64_user_page(page);
@@ -171,14 +189,17 @@ static uptr make_stack(const struct elf_image *main, u64 interp_bias) {
     }
     static const char command[] = "linux-elf";
     const uptr command_address = STACK_TOP - sizeof(command);
+    const uptr random_address = (command_address - 2 * sizeof(u64)) & ~7ul;
     const u64 initial[] = {
         1, command_address, 0, 0,
         3, main->phdr, 4, main->header->phentsize, 5, main->header->phnum, 6, PMM_PAGE_SIZE,
-        7, interp_bias, 9, main->entry, 31, command_address, 0, 0,
+        7, interp_bias, 9, main->entry, AT_RANDOM, random_address, 31, command_address, 0, 0,
     };
-    uptr stack = (command_address - sizeof(initial)) & ~15ul;
+    uptr stack = (random_address - sizeof(initial)) & ~15ul;
     for (unsigned i = 0; i < sizeof(command); ++i)
         top_page[PMM_PAGE_SIZE - sizeof(command) + i] = (u8)command[i];
+    u64 *random_bytes = (void *)(top_page + (random_address & (PMM_PAGE_SIZE - 1)));
+    for (unsigned i = 0; i < 2; ++i) random_bytes[i] = entropy[i];
     u64 *words = (void *)(top_page + (stack & (PMM_PAGE_SIZE - 1)));
     for (unsigned i = 0; i < sizeof(initial) / sizeof(*initial); ++i) words[i] = initial[i];
     return stack;
@@ -195,8 +216,14 @@ bool linux64_run(const void *image, uptr size, const struct linux64_file_source 
             !load_layout(&interpreter, interp.bytes, interp.size, true, &mapped) ||
             (main.first < interpreter.end && interpreter.first < main.end)) return false;
     }
+    u64 entropy[2];
+    if (!startup_entropy(entropy)) {
+        static const char message[] = "Linux x86-64 AT_RANDOM entropy unavailable\n";
+        for (unsigned i = 0; message[i]; ++i) kernel64_serial_char(message[i]);
+        return false;
+    }
     if (!map_image(&main) || (main.interp && !map_image(&interpreter))) return false;
-    uptr stack = make_stack(&main, interpreter.bias);
+    uptr stack = make_stack(&main, interpreter.bias, entropy);
     if (!stack || !linux64_enable_syscall()) return false;
     linux64_use_files(source);
     segments64_enter_user(main.interp ? interpreter.entry : main.entry, stack);
