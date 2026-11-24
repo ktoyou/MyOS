@@ -162,6 +162,7 @@ struct linux64_poll_wait {
 
 struct linux64_task {
     struct linux64_frame frame;
+    u64 cpu_ns;
     struct linux64_address_space *memory;
     struct linux64_process *process;
     struct linux64_caps caps;
@@ -212,6 +213,8 @@ long linux64_userns_read(const struct linux64_userns *ns, enum linux64_proc_node
 long linux64_userns_write(struct linux64_userns *ns, enum linux64_proc_node file,
                           uptr buffer, uptr count, uptr offset);
 bool linux64_task_init(uptr data_bytes);
+void linux64_task_clock_resume(void);
+bool linux64_task_cpu_ns(u64 *nanos);
 const struct linux64_process *linux64_process_by_pid(i32 pid);
 u16 linux64_task_count(void);
 void linux64_task_syscall(struct linux64_frame *frame);

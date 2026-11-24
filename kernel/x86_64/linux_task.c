@@ -29,6 +29,8 @@ struct linux64_task *linux64_current = &tasks[0];
 static i32 next_pid = LINUX64_PID + 1;
 static u64 xfeatures;
 static u32 xstate_bytes, xstate_pages;
+static u64 task_clock_start;
+static bool task_clock_running;
 
 extern __attribute__((noreturn)) void linux64_task_resume(struct linux64_frame *frame);
 
@@ -96,6 +98,17 @@ bool linux64_task_init(uptr data_bytes) {
     linux64_current->memory->data_bytes = data_bytes;
     linux64_current->memory->references = 1;
     linux64_current->state = TASK_RUNNABLE;
+    return true;
+}
+
+void linux64_task_clock_resume(void) {
+    task_clock_running = linux64_monotonic_ns(&task_clock_start);
+}
+
+bool linux64_task_cpu_ns(u64 *nanos) {
+    u64 now;
+    if (!task_clock_running || !linux64_monotonic_ns(&now)) return false;
+    *nanos = linux64_current->cpu_ns + (now - task_clock_start);
     return true;
 }
 
@@ -252,6 +265,7 @@ static long clone_task(struct linux64_frame *frame, uptr flags, uptr stack, uptr
         return local;
     }
     child->frame = *frame;
+    child->cpu_ns = 0;
     child->frame.rax = 0;
     if (stack) child->frame.rsp = stack;
     child->tid = next_pid++;
@@ -740,6 +754,9 @@ static void resume_wait(struct linux64_task *task) {
 static void schedule(struct linux64_frame *frame) {
     linux64_scm_collect_pending();
     struct linux64_task *old = linux64_current;
+    /* Поиск готовой задачи может ждать тайм-аут даже при возврате к той же задаче. */
+    linux64_task_cpu_ns(&old->cpu_ns);
+    task_clock_running = false;
     struct linux64_task *next = pick_task(old);
     if (next == old && old->state != TASK_SOCKET_WAIT && old->state != TASK_EVENTFD_WAIT &&
         old->state != TASK_EPOLL_WAIT) {
@@ -748,6 +765,7 @@ static void schedule(struct linux64_frame *frame) {
             frame->rax = (u64)linux64_poll_resume(old);
             old->state = TASK_RUNNABLE;
         }
+        linux64_task_clock_resume();
         return;
     }
     bool exited = old->state == TASK_DEAD;
@@ -776,6 +794,7 @@ static void schedule(struct linux64_frame *frame) {
         next->child_tid = 0;
     }
     *frame = next->frame;
+    linux64_task_clock_resume();
 }
 
 void linux64_task_exception(u64 vector) {
