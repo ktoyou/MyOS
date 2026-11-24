@@ -241,6 +241,66 @@ static long check_dup(void) {
     return 0;
 }
 
+static long check_directories(void) {
+    static char path[] = "/tmp/myos-dir-0000000000";
+    unsigned pid = (unsigned)call(39, 0, 0, 0, 0);
+    for (unsigned i = sizeof(path) - 2; pid; --i, pid /= 10) path[i] = (char)('0' + pid % 10);
+    word root[18], info[18], opened[18];
+    if (call(4, (word)"/", (word)root, 0, 0) || (root[3] & 0170000) != 0040000 ||
+        call(83, (word)"/", 0700, 0, 0) != -17 || call(83, 1, 0700, 0, 0) != -14 ||
+        call(258, -1, (word)"relative", 0700, 0) != -9 ||
+        call(258, -1, (word)"/", 0700, 0) != -17) return 47;
+    if (call(4, (word)"/proc", (word)info, 0, 0) ||
+        call(4, (word)"/proc/.", (word)opened, 0, 0) || info[0] != opened[0] || info[1] != opened[1])
+        return 56;
+    long root_fd = call(2, (word)"/", 0x10000, 0, 0);
+    long null = call(257, root_fd, (word)"./dev//null", 0, 0);
+    if (root_fd < 0 || null < 0 || call(0, null, 0, 1, 0) ||
+        call(3, null, 0, 0, 0) || call(3, root_fd, 0, 0, 0)) return 57;
+    long mask = call(95, 0077, 0, 0, 0);
+    if (mask < 0 || call(83, (word)path, 0777, 0, 0) ||
+        call(95, mask, 0, 0, 0) != 0077 || call(83, (word)path, 0700, 0, 0) != -17)
+        return 48;
+    long tmp = call(2, (word)"/tmp/", 0x10000, 0, 0);
+    long dir = call(257, tmp, (word)(path + 5), 0x90000, 0);
+    if (tmp < 0 || dir < 0 || call(3, tmp, 0, 0, 0) ||
+        call(4, (word)path, (word)info, 0, 0) || call(5, dir, (word)opened, 0, 0) ||
+        (info[3] & 0170777) != 0040700 || info[0] != opened[0] || info[1] != opened[1] ||
+        call(0, dir, (word)buffer, 1, 0) != -21 || call(2, (word)path, 1, 0, 0) != -21 ||
+        call(21, (word)path, 7, 0, 0)) return 49;
+    if (call(83, (word)FILE_PATH, 0700, 0, 0) != -17 ||
+        call(83, (word)(FILE_PATH "/missing"), 0700, 0, 0) != -20 ||
+        call(258, dir, (word)"missing/../child", 0700, 0) != -2 ||
+        call(258, dir, (word)"child/", 0700, 0) ||
+        call(262, dir, (word)"./child/../.", (word)opened, 0) ||
+        opened[0] != info[0] || opened[1] != info[1]) return 50;
+    long child = call(57, 0, 0, 0, 0);
+    if (!child) {
+        call(60, call(258, dir, (word)"shared", 0700, 0) != 0, 0, 0, 0);
+        __builtin_trap();
+    }
+    int status;
+    if (child < 0 || call(61, child, (word)&status, 0, 0) != child || status ||
+        call(262, dir, (word)"shared", (word)opened, 0) ||
+        (opened[3] & 0170777) != 0040700 || call(3, dir, 0, 0, 0)) return 51;
+    if (call(63, (word)buffer, 0, 0, 0)) return 52;
+    if (buffer[0] == 'M') {
+        long ro = call(2, (word)"/", 0x10000, 0, 0);
+        if (ro < 0 || call(258, ro, (word)(path + 5), 0700, 0) != -30) return 53;
+        call(3, ro, 0, 0, 0);
+    } else {
+        char nested[sizeof(path) + 8];
+        for (unsigned i = 0; i < sizeof(path) - 1; ++i) nested[i] = path[i];
+        const char *names[] = {"/child", "/shared"};
+        for (unsigned n = 0; n < 2; ++n) {
+            for (unsigned i = 0; (nested[sizeof(path) - 1 + i] = names[n][i]); ++i) {}
+            if (call(84, (word)nested, 0, 0, 0)) return 54;
+        }
+        if (call(84, (word)path, 0, 0, 0)) return 55;
+    }
+    return 0;
+}
+
 __attribute__((noreturn)) void _start(void) {
     long status = check_files();
     if (!status) status = check_signals();
@@ -250,6 +310,7 @@ __attribute__((noreturn)) void _start(void) {
     if (!status) status = check_ids(120, 104, 108);
     if (!status) status = check_null();
     if (!status) status = check_dup();
+    if (!status) status = check_directories();
     if (!status) {
         static const char message[] = "Linux ELF64 files probe\n";
         if (call(1, 1, (word)message, sizeof(message) - 1, 0) != sizeof(message) - 1)

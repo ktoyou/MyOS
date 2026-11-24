@@ -118,8 +118,9 @@ static bool linux_test_next(struct linux_test_files *files, const char **path,
         entry->file_size > remaining - entry->path_size) return false;
     *path = (const char *)(entry + 1);
     if (!valid_test_path(*path, entry->path_size)) return false;
-    file->bytes = (const u8 *)*path + entry->path_size;
-    file->size = entry->file_size;
+    *file = (struct linux64_file){
+        .bytes = (const u8 *)*path + entry->path_size, .size = entry->file_size,
+    };
     files->cursor = file->bytes + file->size;
     return true;
 }
@@ -141,6 +142,26 @@ static bool linux_test_lookup(const void *context, const char *path, struct linu
     return false;
 }
 
+static bool test_has_child(const char *entry, const char *path) {
+    while (*path && *entry == *path) { ++entry; ++path; }
+    return !*path && *entry == '/' && entry[1];
+}
+
+static u64 linux_test_directory(const void *context, const char *path) {
+    struct linux_test_files files = *(const struct linux_test_files *)context;
+    uptr length = 0;
+    while (path[length]) ++length;
+    if (test_has_child(files.exec_path, path)) return 3 + length;
+    for (uptr i = 0; i < files.count; ++i) {
+        const char *entry;
+        struct linux64_file file;
+        if (!linux_test_next(&files, &entry, &file)) return 0;
+        /* Один файл и длина префикса однозначно задают каталог. */
+        if (test_has_child(entry, path)) return 3 + (i + 1) * LINUX64_PATH_LIMIT + length;
+    }
+    return 0;
+}
+
 static void linux_test_boot(uptr root_phys, uptr root_bytes) {
     /* Заголовок, путь запуска, основной ELF и записи дополнительных файлов. */
     if (!root_phys || root_bytes < 32) return;
@@ -153,7 +174,8 @@ static void linux_test_boot(uptr root_phys, uptr root_bytes) {
     const u8 *image = (const u8 *)path + header[3];
     test_files = (struct linux_test_files){
         .cursor = image + header[1], .end = (const u8 *)header + root_bytes,
-        .count = header[2], .exec_path = path, .executable = {image, header[1], 1},
+        .count = header[2], .exec_path = path,
+        .executable = {.bytes = image, .size = header[1], .inode = 1},
     };
     struct linux_test_files scan = test_files;
     for (uptr i = 0; i < scan.count; ++i) {
@@ -161,7 +183,9 @@ static void linux_test_boot(uptr root_phys, uptr root_bytes) {
         struct linux64_file file;
         if (!linux_test_next(&scan, &entry_path, &file)) return;
     }
-    const struct linux64_file_source source = {linux_test_lookup, &test_files};
+    const struct linux64_file_source source = {
+        .lookup = linux_test_lookup, .context = &test_files, .directory = linux_test_directory,
+    };
     linux64_run(image, header[1], path, header[3] - 1, &source);
 }
 #endif

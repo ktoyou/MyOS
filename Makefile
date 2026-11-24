@@ -1630,13 +1630,13 @@ $(X64_RING3_TESTS:.bin=.elf): $(X64BUILD)/kernel-ring3-%.elf: $(X64_CORE) $(X64B
 	$(LD) -m elf_x86_64 -T kernel/x86_64/linker.ld -nostdlib $(filter %.o,$^) -o $@
 $(X64BUILD)/early-linux.o: kernel/x86_64/early.c kernel/x86_64/linux.h $(X64_HEADERS) | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -DX64_TEST_LINUX -c $< -o $@
-$(X64BUILD)/linux_elf.o $(X64BUILD)/linux_syscall.o $(X64BUILD)/linux_file.o $(X64BUILD)/linux_mmap.o $(X64BUILD)/linux_random.o $(X64BUILD)/linux_time.o $(X64BUILD)/linux_signal.o $(X64BUILD)/linux_socket.o $(X64BUILD)/linux_pipe.o $(X64BUILD)/linux_userns.o $(X64BUILD)/linux_task.o: $(X64BUILD)/%.o: kernel/x86_64/%.c kernel/x86_64/linux.h kernel/x86_64/linux_task.h $(X64_HEADERS) | $(X64BUILD)
+$(X64BUILD)/linux_elf.o $(X64BUILD)/linux_syscall.o $(X64BUILD)/linux_file.o $(X64BUILD)/linux_mmap.o $(X64BUILD)/linux_random.o $(X64BUILD)/linux_time.o $(X64BUILD)/linux_signal.o $(X64BUILD)/linux_socket.o $(X64BUILD)/linux_pipe.o $(X64BUILD)/linux_userns.o $(X64BUILD)/linux_vfs.o $(X64BUILD)/linux_task.o: $(X64BUILD)/%.o: kernel/x86_64/%.c kernel/x86_64/linux.h kernel/x86_64/linux_task.h $(X64_HEADERS) | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
 $(X64BUILD)/linux_syscall.o: X64CFLAGS += -I$(BUILD)
 $(X64BUILD)/linux_syscall.o: $(BUILD)/build_info.h
 $(X64BUILD)/linux-entry.o: kernel/x86_64/linux_syscall.asm | $(X64BUILD)
 	$(NASM) -f elf64 $< -o $@
-$(X64BUILD)/kernel-linux.elf: $(X64_CORE) $(X64BUILD)/early-linux.o $(X64BUILD)/linux_elf.o $(X64BUILD)/linux_syscall.o $(X64BUILD)/linux_file.o $(X64BUILD)/linux_mmap.o $(X64BUILD)/linux_random.o $(X64BUILD)/linux_time.o $(X64BUILD)/linux_signal.o $(X64BUILD)/linux_socket.o $(X64BUILD)/linux_pipe.o $(X64BUILD)/linux_userns.o $(X64BUILD)/linux_task.o $(X64BUILD)/linux-entry.o kernel/x86_64/linker.ld
+$(X64BUILD)/kernel-linux.elf: $(X64_CORE) $(X64BUILD)/early-linux.o $(X64BUILD)/linux_elf.o $(X64BUILD)/linux_syscall.o $(X64BUILD)/linux_file.o $(X64BUILD)/linux_mmap.o $(X64BUILD)/linux_random.o $(X64BUILD)/linux_time.o $(X64BUILD)/linux_signal.o $(X64BUILD)/linux_socket.o $(X64BUILD)/linux_pipe.o $(X64BUILD)/linux_userns.o $(X64BUILD)/linux_vfs.o $(X64BUILD)/linux_task.o $(X64BUILD)/linux-entry.o kernel/x86_64/linker.ld
 	$(LD) -m elf_x86_64 -T kernel/x86_64/linker.ld -nostdlib $(filter %.o,$^) -o $@
 $(X64BUILD)/linux-probe.o: tests/linux_x64_probe.S | $(X64BUILD)
 	$(CC) -m64 -c $< -o $@

@@ -94,7 +94,7 @@ def check_files(build):
     serial = check_guest('files', probe.read_bytes(), 'Linux x86-64 exit status=0x00',
                          files={data: data.read_bytes()})
     assert 'Linux uname: MyOS' in serial and 'Linux ELF64 files probe' in serial, serial
-    print('OVMF: Linux ELF64 files, dup, /dev/null, signals, uname and process IDs: PASS', flush=True)
+    print('OVMF: Linux ELF64 files, directories, descriptors, signals, uname and process IDs: PASS', flush=True)
 
 
 def check_mmap(build):

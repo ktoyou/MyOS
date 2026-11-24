@@ -39,7 +39,7 @@ struct linux64_userns;
 
 enum linux64_proc_node {
     USERNS_NONE, USERNS_UID_MAP, USERNS_GID_MAP, USERNS_SETGROUPS,
-    PROC_USER_NS, PROC_USER_NS_NOTDIR, PROC_ROOT, PROC_TASKS,
+    PROC_USER_NS, PROC_ROOT, PROC_TASKS,
 };
 
 struct linux64_caps {
@@ -76,6 +76,7 @@ struct linux64_process {
     uptr executable_path_length;
     i32 pid, ppid, sid, pgid, exit_status;
     unsigned threads;
+    u32 umask;
     struct linux64_userns *userns;
 };
 
@@ -147,6 +148,10 @@ long linux64_poll(uptr address, u32 count, i32 timeout);
 bool linux64_poll_ready(struct linux64_task *task);
 long linux64_poll_resume(const struct linux64_task *task);
 const struct linux64_file_source *linux64_file_source(void);
+long linux64_vfs_walk(const struct linux64_file_source *source, const char *absolute,
+                      struct linux64_file *file, char *resolved, u32 create_mode);
+u32 linux64_directory_permissions(const struct linux64_file *file);
+bool linux64_special_node(const char *path, struct linux64_file *file);
 long linux64_user_string(uptr address, char *string, uptr limit);
 long linux64_execve(struct linux64_frame *frame, uptr filename, uptr argv, uptr envp);
 bool linux64_commit_exec(struct linux64_frame *frame, uptr root, uptr entry, uptr stack,

@@ -22,7 +22,7 @@ enum {
 
 enum file_kind {
     FILE_REGULAR, FILE_SOCKET, FILE_PIPE, FILE_PROC_DIR, FILE_PROC_MAP, FILE_NULL, FILE_SERIAL,
-    FILE_NAMESPACE, FILE_NS_LINK,
+    FILE_NAMESPACE, FILE_NS_LINK, FILE_DIRECTORY,
 };
 static const struct linux64_file null_file = {.inode = 1};
 
@@ -58,6 +58,7 @@ static struct file_handle {
     bool proc_admin;
     bool null_device;
     bool serial;
+    uptr directory_path;
     uptr offset;
     u32 flags;
     unsigned references;
@@ -128,6 +129,7 @@ long linux64_poll(uptr address, u32 count, i32 timeout) {
 }
 
 static enum file_kind kind_of(const struct file_handle *file) {
+    if (file->directory_path) return FILE_DIRECTORY;
     if (file->null_device) return FILE_NULL;
     if (file->serial) return FILE_SERIAL;
     if (file->proc_node == PROC_USER_NS) return FILE_NAMESPACE;
@@ -165,6 +167,7 @@ static void release_file(struct file_handle *file) {
     if (file->socket) linux64_socket_close(file->socket);
     if (file->pipe) linux64_pipe_close(file->pipe, (file->flags & O_ACCMODE) == O_WRONLY);
     linux64_userns_release(file->proc_ns);
+    if (file->directory_path) pmm64_free(file->directory_path);
     struct memfd *memfd = file->memfd;
     if (memfd && !--memfd->handles) {
         memfd_trim(memfd, 0, memfd_page_count(memfd->size));
@@ -298,8 +301,21 @@ static long absolute_path(i32 dirfd, char *path, const char **absolute) {
     *absolute = path + 1;
     if (**absolute == '/') return 0;
     if (dirfd != AT_FDCWD) {
-        if (open_file(dirfd) && file_at(dirfd)->proc_node == PROC_ROOT) return 0;
-        return open_file(dirfd) ? -ENOTDIR : -EBADF;
+        if (!open_file(dirfd)) return -EBADF;
+        const struct file_handle *handle = file_at(dirfd);
+        if (!handle->directory_path && handle->proc_node != PROC_ROOT) return -ENOTDIR;
+        const char *directory = handle->proc_node == PROC_ROOT ? "/proc" :
+                                pmm64_pointer(handle->directory_path);
+        uptr base = 0, relative = 0;
+        while (directory[base]) ++base;
+        if (base > 1) ++base;
+        while (path[relative + 1]) ++relative;
+        if (base + relative >= LINUX64_PATH_LIMIT) return -ENAMETOOLONG;
+        for (uptr i = relative + 1; i; --i) path[base + i - 1] = path[i];
+        for (uptr i = 0; i < base - 1; ++i) path[i] = directory[i];
+        path[base - 1] = '/';
+        *absolute = path;
+        return 0;
     }
     *absolute = root_path(path);
     return 0;
@@ -317,13 +333,6 @@ static bool path_equal(const char *actual, const char *expected, bool directory)
     return !*actual;
 }
 
-static long null_path(const char *path) {
-    path = path_tail(path, "/dev/null");
-    if (!path) return 0;
-    if (!*path) return 1;
-    return *path == '/' ? -ENOTDIR : 0;
-}
-
 static enum linux64_proc_node proc_path(const char *path) {
     if (*path == '/') {
         if (path_equal(path, "/proc", true)) return PROC_ROOT;
@@ -335,10 +344,36 @@ static enum linux64_proc_node proc_path(const char *path) {
     if (path_equal(path, "self/uid_map", false)) return USERNS_UID_MAP;
     if (path_equal(path, "self/gid_map", false)) return USERNS_GID_MAP;
     if (path_equal(path, "self/setgroups", false)) return USERNS_SETGROUPS;
-    const char *tail = path_tail(path, "self/ns/user");
-    if (tail && !*tail) return PROC_USER_NS;
-    if (tail && *tail == '/') return PROC_USER_NS_NOTDIR;
+    if (path_equal(path, "self/ns/user", false)) return PROC_USER_NS;
     return USERNS_NONE;
+}
+
+bool linux64_special_node(const char *path, struct linux64_file *file) {
+    if (path_equal(path, "/dev/null", false)) {
+        *file = null_file;
+        return true;
+    }
+    enum linux64_proc_node proc = proc_path(path);
+    if (proc) {
+        *file = (struct linux64_file){
+            .mode = proc >= PROC_ROOT ? LINUX64_S_IFDIR | 0555 : 0, .inode = proc,
+        };
+        return true;
+    }
+    static const char *const dirs[] = {"/dev", "/proc/self", "/proc/self/ns", "/proc/self/fd"};
+    for (unsigned i = 0; i < sizeof(dirs) / sizeof(*dirs); ++i) {
+        if (!path_equal(path, dirs[i], false)) continue;
+        *file = (struct linux64_file){.mode = LINUX64_S_IFDIR | 0555, .inode = (1ull << 31) + i};
+        return true;
+    }
+    if (path_equal(path, "/proc/self/exe", false)) {
+        const char *exe = linux64_current->process->executable_path;
+        return files.lookup && files.lookup(files.context, exe, file);
+    }
+    i32 fd;
+    if (memfd_proc_path(path, &fd) <= 0) return false;
+    *file = file_at(fd)->file;
+    return true;
 }
 
 static unsigned free_fd(unsigned fd) {
@@ -557,16 +592,16 @@ static long lookup(i32 dirfd, uptr address, u32 flags, struct linux64_file *file
     const char *absolute;
     long result = absolute_path(dirfd, path, &absolute);
     if (result) return result;
+    result = linux64_vfs_walk(&files, absolute, file, path, 0);
+    if (result) return result;
+    absolute = path;
     *memfd = NULL;
-    result = null_path(absolute);
-    if (result < 0) return result;
-    if (result) {
+    if (path_equal(absolute, "/dev/null", false)) {
         *file = null_file;
         *kind = FILE_NULL;
         return 0;
     }
     enum linux64_proc_node proc = proc_path(absolute);
-    if (proc == PROC_USER_NS_NOTDIR) return -ENOTDIR;
     if (proc == PROC_USER_NS) {
         const struct linux64_process *process = linux64_current->process;
         bool nofollow = (flags & AT_SYMLINK_NOFOLLOW) != 0;
@@ -581,9 +616,12 @@ static long lookup(i32 dirfd, uptr address, u32 flags, struct linux64_file *file
         *kind = proc >= PROC_ROOT ? FILE_PROC_DIR : FILE_PROC_MAP;
         return 0;
     }
-    if (*absolute != '/') return -ENOENT;
-    *kind = FILE_REGULAR;
-    return files.lookup && files.lookup(files.context, absolute, file) ? 0 : -ENOENT;
+    i32 target;
+    result = memfd_proc_path(absolute, &target);
+    if (result < 0 && !path_equal(absolute, "/proc/self/fd", false)) return result;
+    if (result > 0) handle_stat(target, file, memfd);
+    *kind = file->mode & LINUX64_S_IFDIR ? FILE_DIRECTORY : FILE_REGULAR;
+    return 0;
 }
 
 static long linux_readlink(i32 dirfd, uptr path_address, uptr destination, i32 size) {
@@ -595,23 +633,14 @@ static long linux_readlink(i32 dirfd, uptr path_address, uptr destination, i32 s
     const char *absolute;
     result = absolute_path(dirfd, path, &absolute);
     if (result) return result;
+    struct linux64_file file;
+    result = linux64_vfs_walk(&files, absolute, &file, path, 0);
+    if (result) return result;
+    absolute = path;
     enum linux64_proc_node proc = proc_path(absolute);
-    if (proc == PROC_USER_NS_NOTDIR) return -ENOTDIR;
     if (proc == PROC_USER_NS)
         return linux64_userns_readlink(linux64_current->process->userns, destination, (uptr)size);
-    if (proc) return -EINVAL;
-    if (*absolute != '/') return -ENOENT;
-    result = null_path(absolute);
-    if (result) return result < 0 ? result : -EINVAL;
-    const char *actual = absolute, *expected = "/proc/self/exe";
-    while (*actual && *actual == *expected) {
-        ++actual;
-        ++expected;
-    }
-    if (*actual != *expected) {
-        struct linux64_file file;
-        return files.lookup && files.lookup(files.context, absolute, &file) ? -EINVAL : -ENOENT;
-    }
+    if (!path_equal(absolute, "/proc/self/exe", false)) return -EINVAL;
     uptr length = linux64_current->process->executable_path_length;
     if (!length) return -ENOENT;
     if (length > (uptr)size) length = (uptr)size;
@@ -628,9 +657,14 @@ static long linux_open(i32 dirfd, uptr address, u32 flags) {
     const char *absolute;
     result = absolute_path(dirfd, path, &absolute);
     if (result) return result;
-    result = null_path(absolute);
-    if (result < 0) return result;
+    struct linux64_file file;
+    result = linux64_vfs_walk(&files, absolute, &file, path, 0);
     if (result) {
+        if (result == -ENOENT && (flags & (O_ACCMODE | O_CREAT | O_TRUNC))) return -EROFS;
+        return result;
+    }
+    absolute = path;
+    if (path_equal(absolute, "/dev/null", false)) {
         if (flags & O_DIRECTORY) return -ENOTDIR;
         if ((flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL)) return -EEXIST;
         if (flags & ~(O_ACCMODE | O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC | O_APPEND |
@@ -641,7 +675,6 @@ static long linux_open(i32 dirfd, uptr address, u32 flags) {
         return result;
     }
     enum linux64_proc_node proc = proc_path(absolute);
-    if (proc == PROC_USER_NS_NOTDIR) return -ENOTDIR;
     if (proc == PROC_USER_NS) {
         if (flags & O_DIRECTORY) return -ENOTDIR;
         if (flags & O_NOFOLLOW) return -ELOOP;
@@ -678,7 +711,7 @@ static long linux_open(i32 dirfd, uptr address, u32 flags) {
         linux64_userns_retain(ns);
         return result;
     }
-    if (*absolute != '/') return -ENOENT;
+    if (path_equal(absolute, "/proc/self/fd", false)) return -ENOENT;
     i32 target;
     result = memfd_proc_path(absolute, &target);
     if (result < 0) return result;
@@ -688,13 +721,43 @@ static long linux_open(i32 dirfd, uptr address, u32 flags) {
         if (flags & ~(O_CLOEXEC | O_LARGEFILE | O_NONBLOCK)) return -EINVAL;
         return new_handle(NULL, file_at(target)->memfd, flags | O_LARGEFILE);
     }
+    if (file.mode & LINUX64_S_IFDIR) {
+        if (flags & (O_ACCMODE | O_TRUNC)) return -EISDIR;
+        if (flags & O_CREAT) return flags & O_EXCL ? -EEXIST : -EISDIR;
+        if (flags & ~(O_NONBLOCK | O_LARGEFILE | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC))
+            return -EINVAL;
+        if (!(linux64_directory_permissions(&file) & 4u)) return -EACCES;
+        uptr physical = pmm64_alloc();
+        if (!physical) return -ENOMEM;
+        result = new_handle(&file, NULL, flags | O_LARGEFILE);
+        if (result < 0) {
+            pmm64_free(physical);
+            return result;
+        }
+        char *directory = pmm64_pointer(physical);
+        const char *cursor = path;
+        while ((*directory++ = *cursor++)) {}
+        file_at((i32)result)->directory_path = physical;
+        return result;
+    }
     if (flags & (O_ACCMODE | O_CREAT | O_TRUNC)) return -EROFS;
     if (flags & ~(O_NONBLOCK | O_LARGEFILE | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC))
         return -EINVAL;
-    struct linux64_file file;
-    if (!files.lookup || !files.lookup(files.context, absolute, &file)) return -ENOENT;
     if (flags & O_DIRECTORY) return -ENOTDIR;
     return new_handle(&file, NULL, flags | O_LARGEFILE);
+}
+
+static long linux_mkdir(i32 dirfd, uptr address, u32 mode) {
+    char path[LINUX64_PATH_LIMIT + 1];
+    long result = user_path(address, path + 1);
+    if (result) return result;
+    if (!path[1]) return -ENOENT;
+    const char *absolute;
+    result = absolute_path(dirfd, path, &absolute);
+    if (result) return result;
+    struct linux64_file file;
+    u32 mask = linux64_current->process->umask;
+    return linux64_vfs_walk(&files, absolute, &file, NULL, LINUX64_S_IFDIR | (mode & 01777u & ~mask));
 }
 
 static long null_io(const struct file_handle *file, bool write, uptr buffer, uptr count) {
@@ -723,6 +786,7 @@ static long serial_write(uptr address, uptr size) {
 static long linux_read(i32 fd, uptr buffer, uptr count, uptr offset, bool positioned) {
     if (!open_file(fd)) return -EBADF;
     struct file_handle *handle = file_at(fd);
+    if (handle->directory_path) return -EISDIR;
     if (handle->null_device) return null_io(handle, false, buffer, count);
     if (handle->serial) return positioned ? -ESPIPE : -EBADF;
     if (handle->pipe) {
@@ -795,6 +859,10 @@ static long file_stat(const struct linux64_file *file, const struct memfd *memfd
     } else if (kind == FILE_NS_LINK) {
         mode = 0120777;
         device = 8;
+    } else if (kind == FILE_DIRECTORY) {
+        mode = file->mode;
+        device = 9;
+        links = 2;
     } else if (memfd) {
         mode = memfd->seals & F_SEAL_EXEC ? 0100666 : 0100777;
         device = 2;
@@ -804,8 +872,8 @@ static long file_stat(const struct linux64_file *file, const struct memfd *memfd
                  kind == FILE_NS_LINK || memfd;
     const struct linux_stat stat = {
         .dev = device, .ino = file->inode, .nlink = links, .mode = mode,
-        .uid = linux64_visible_id(ns, false, owned ? LINUX64_UID : 0),
-        .gid = linux64_visible_id(ns, true, owned ? LINUX64_GID : 0),
+        .uid = linux64_visible_id(ns, false, kind == FILE_DIRECTORY ? file->uid : owned ? LINUX64_UID : 0),
+        .gid = linux64_visible_id(ns, true, kind == FILE_DIRECTORY ? file->gid : owned ? LINUX64_GID : 0),
         .rdev = rdev, .size = file->size, .blksize = PMM_PAGE_SIZE, .blocks = (file->size + 511) / 512,
     };
     return paging64_copy_to_user(stat_address, &stat, sizeof(stat)) == sizeof(stat) ? 0 : -EFAULT;
@@ -871,6 +939,10 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
             if (arg1 & 1u) return -EACCES;
             return (arg1 & 2u) ? -EPERM : 0;
         }
+        if (kind == FILE_DIRECTORY) {
+            if ((arg1 & 2u) && !file.writable_directory) return -EROFS;
+            return (arg1 & ~linux64_directory_permissions(&file)) ? -EACCES : 0;
+        }
         return (arg1 & 3u) ? -EACCES : 0;
     case 22: /* pipe */
         return linux_pipe2(arg0, 0);
@@ -893,10 +965,14 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
         return linux_fcntl(fd, (i32)arg1, (u32)arg2);
     case 77: /* ftruncate */
         return linux_ftruncate(fd, arg1);
+    case 83: /* mkdir */
+        return linux_mkdir(AT_FDCWD, arg0, (u32)arg1);
     case 89: /* readlink */
         return linux_readlink(AT_FDCWD, arg0, arg1, (i32)arg2);
     case 257: /* openat */
         return linux_open(fd, arg1, (u32)arg2);
+    case 258: /* mkdirat */
+        return linux_mkdir(fd, arg1, (u32)arg2);
     case 262: /* newfstatat */
         if ((u32)arg3 & ~(AT_EMPTY_PATH | AT_NO_AUTOMOUNT | AT_SYMLINK_NOFOLLOW))
             return -EINVAL;
