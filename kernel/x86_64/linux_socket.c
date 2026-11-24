@@ -361,7 +361,6 @@ static long receive_packet(struct linux64_socket *socket, const struct iovec *io
     const struct packet *packet = socket->head;
     if (!packet) {
         if (message) message->control_length = 0;
-        /* Ожидание записи другого процесса ещё не связано с планировщиком. */
         return socket->peer->open && !socket->read_shutdown ? -EAGAIN : 0;
     }
     uptr copied = 0;

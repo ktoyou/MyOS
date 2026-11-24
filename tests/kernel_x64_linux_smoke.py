@@ -160,7 +160,7 @@ def check_socket(build):
     assert (host.returncode, host.stdout, host.stderr) == (0, (marker + '\n').encode(), b''), host
     serial = check_guest('socket', probe.read_bytes(), 'Linux x86-64 exit status=0x00')
     assert marker in serial, serial
-    print('OVMF: AF_UNIX pathname streams, blocking I/O, seqpacket and descriptor cleanup: PASS', flush=True)
+    print('OVMF: AF_UNIX pathname streams, blocking stream and seqpacket I/O, descriptor cleanup: PASS', flush=True)
 
 
 def check_pipe(build):

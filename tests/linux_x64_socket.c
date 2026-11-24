@@ -24,7 +24,7 @@ struct credentials {
 enum {
     AF_UNIX = 1, SOCK_STREAM = 1, SOCK_SEQPACKET = 5, SOCK_NONBLOCK = 0x800, SOCK_CLOEXEC = 0x80000,
     SOL_SOCKET = 1, SO_TYPE = 3, SO_PASSCRED = 16,
-    MSG_PEEK = 2, MSG_CTRUNC = 8, MSG_TRUNC = 0x20, MSG_NOSIGNAL = 0x4000,
+    MSG_PEEK = 2, MSG_CTRUNC = 8, MSG_TRUNC = 0x20, MSG_DONTWAIT = 0x40, MSG_NOSIGNAL = 0x4000,
     SHUT_RD = 0, SHUT_WR = 1, SHUT_RDWR = 2,
 };
 
@@ -382,6 +382,64 @@ static long check_fd_limit(void) {
     return 0;
 }
 
+static long check_seqpacket_receive_wait(void) {
+    int ends[2];
+    char bytes[8];
+    struct iovec rx = {bytes, sizeof(bytes)};
+    struct msghdr in = {.iov = &rx, .iov_count = 1};
+    if (call(53, AF_UNIX, SOCK_SEQPACKET, 0, (word)ends, 0) ||
+        receive(ends[0], &in, MSG_DONTWAIT) != -11 ||
+        call(72, ends[0], 4, SOCK_NONBLOCK, 0, 0) || receive(ends[0], &in, 0) != -11 ||
+        call(72, ends[0], 4, 0, 0, 0)) return 66;
+
+    long pid = call(57, 0, 0, 0, 0, 0);
+    if (!pid) {
+        call(24, 0, 0, 0, 0, 0);
+        int failed = close_fd(ends[0]) || call(1, ends[1], (word)"one", 3, 0, 0) != 3 ||
+                     call(1, ends[1], (word)"two", 3, 0, 0) != 3 || close_fd(ends[1]);
+        call(60, failed, 0, 0, 0, 0);
+        __builtin_trap();
+    }
+    int status;
+    if (pid < 0 || close_fd(ends[1]) || receive(ends[0], &in, 0) != 3 || bytes[0] != 'o' ||
+        call(0, ends[0], (word)bytes, sizeof(bytes), 0, 0) != 3 || bytes[0] != 't' ||
+        receive(ends[0], &in, 0) || call(61, pid, (word)&status, 0, 0, 0) != pid || status ||
+        close_fd(ends[0])) return 67;
+    return 0;
+}
+
+static long check_seqpacket_send_wait(void) {
+    int ends[2];
+    if (call(53, AF_UNIX, SOCK_SEQPACKET, 0, (word)ends, 0)) return 68;
+    struct iovec tx = {(char *)"old", 3};
+    struct msghdr out = {.iov = &tx, .iov_count = 1};
+    unsigned filled = 0;
+    for (;;) {
+        long result = call(46, ends[0], (word)&out, MSG_DONTWAIT | MSG_NOSIGNAL, 0, 0);
+        if (result == -11) break;
+        if (result != 3 || ++filled > 4096) return 69;
+    }
+    if (!filled) return 69;
+
+    long pid = call(57, 0, 0, 0, 0, 0);
+    if (!pid) {
+        char bytes[8];
+        int failed = close_fd(ends[0]) != 0;
+        call(24, 0, 0, 0, 0, 0);
+        for (unsigned i = 0; i < filled && !failed; ++i)
+            failed = call(0, ends[1], (word)bytes, sizeof(bytes), 0, 0) != 3 || bytes[0] != 'o';
+        if (!failed)
+            failed = call(0, ends[1], (word)bytes, sizeof(bytes), 0, 0) != 4 || bytes[0] != 't' ||
+                     call(0, ends[1], (word)bytes, sizeof(bytes), 0, 0) || close_fd(ends[1]);
+        call(60, failed, 0, 0, 0, 0);
+        __builtin_trap();
+    }
+    int status;
+    if (pid < 0 || close_fd(ends[1]) || call(1, ends[0], (word)"tail", 4, 0, 0) != 4 ||
+        close_fd(ends[0]) || call(61, pid, (word)&status, 0, 0, 0) != pid || status) return 70;
+    return 0;
+}
+
 static long check(void) {
     long status = check_stream();
     if (!status) status = check_stream_fd_limit();
@@ -392,6 +450,8 @@ static long check(void) {
     if (!status) status = check_named(&address);
     if (!status) status = check_blocking_stream(&address);
     if (!status) status = check_listener_shutdown(&address);
+    if (!status) status = check_seqpacket_receive_wait();
+    if (!status) status = check_seqpacket_send_wait();
     if (status) return status;
     int ends[2];
     for (unsigned i = 0; i < 40; ++i)
