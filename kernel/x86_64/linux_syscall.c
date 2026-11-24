@@ -5,11 +5,39 @@
 #define STAR   0xc0000081u
 #define LSTAR  0xc0000082u
 #define FMASK  0xc0000084u
+#define IA32_FS_BASE 0xc0000100u
+#define ARCH_SET_FS  0x1002
+#define ARCH_GET_FS  0x1003
 
 extern void linux64_syscall_entry(void);
 
 static void wrmsr(u32 reg, u64 value) {
     __asm__ volatile("wrmsr" : : "c"(reg), "a"((u32)value), "d"((u32)(value >> 32)) : "memory");
+}
+
+static u64 rdmsr(u32 reg) {
+    u32 low, high;
+    __asm__ volatile("rdmsr" : "=a"(low), "=d"(high) : "c"(reg));
+    return ((u64)high << 32) | low;
+}
+
+static void set_fs_base(uptr base) {
+    /* Загрузка селектора может изменить базу FS. Записываем базу после селектора. */
+    __asm__ volatile("mov %0,%%fs" : : "r"((u16)0) : "memory");
+    wrmsr(IA32_FS_BASE, base);
+}
+
+static long linux_arch_prctl(i32 operation, uptr value) {
+    if (operation == ARCH_SET_FS) {
+        /* Linux оставляет последнюю каноническую страницу за пределами TASK_SIZE_MAX. */
+        if (value >= X64_USER_TOP - PMM_PAGE_SIZE) return -1;
+        set_fs_base(value);
+        return 0;
+    }
+    if (operation == ARCH_GET_FS) {
+        return paging64_put_user_u64(value, rdmsr(IA32_FS_BASE)) ? 0 : -14;
+    }
+    return -22;
 }
 
 bool linux64_enable_syscall(void) {
@@ -25,8 +53,8 @@ bool linux64_enable_syscall(void) {
     /* Вход работает на одном CPU с отключёнными маскируемыми прерываниями. */
     wrmsr(FMASK, (1u << 8) | (1u << 9) | (1u << 10) | (3u << 12) |
                  (1u << 14) | (1u << 16) | (1u << 18));
-    __asm__ volatile("rdmsr" : "=a"(eax), "=d"(edx) : "c"(EFER));
-    wrmsr(EFER, ((u64)edx << 32) | eax | 1u);
+    wrmsr(EFER, rdmsr(EFER) | 1u);
+    set_fs_base(0);
     return true;
 }
 
@@ -56,6 +84,7 @@ long linux64_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2,
                     uptr arg3, uptr arg4, uptr arg5) {
     if (number == 1) return linux_write(arg0, arg1, arg2);
     if (number == 9) return linux64_mmap(arg0, arg1, (u32)arg2, (u32)arg3, (i32)arg4, arg5);
+    if (number == 158) return linux_arch_prctl((i32)arg0, arg1);
     if (number == 60) {
         static const char message[] = "Linux x86-64 exit status=0x";
         static const char digits[] = "0123456789abcdef";

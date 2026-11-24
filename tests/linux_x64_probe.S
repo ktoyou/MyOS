@@ -73,6 +73,8 @@ aux_done:
     cmp byte ptr [rip+buffer+8191],0
     jne fail
 
+    call check_fs
+
     mov eax,1
     mov edi,7
     xor esi,esi
@@ -126,6 +128,95 @@ fail:
     syscall
     ud2
 
+check_fs:
+    lea rsi,[rip+buffer+4093]
+    mov qword ptr [rsi],-1
+    mov eax,158
+    mov edi,0x1003
+    syscall
+    test rax,rax
+    jne fs_fail
+    cmp qword ptr [rsi],0
+    jne fs_fail
+
+    mov ax,ss
+    mov fs,ax
+    lea rsi,[rip+tls_data]
+    mov r12,rsi
+    mov eax,158
+    mov edi,0x1002
+    syscall
+    test rax,rax
+    jne fs_fail
+    mov ax,fs
+    test ax,ax
+    jne fs_fail
+    cmp dword ptr fs:[0],0x1234abcd
+    jne fs_fail
+
+    mov eax,158
+    mov edi,0x1002
+    mov rsi,0xffff800000000000
+    syscall
+    cmp rax,-1
+    jne fs_fail
+    cmp dword ptr fs:[0],0x1234abcd
+    jne fs_fail
+
+    mov eax,158
+    mov edi,0x1003
+    lea rsi,[rip+message]
+    syscall
+    cmp rax,-14
+    jne fs_fail
+    lea rsi,[rip+buffer+8191]
+    mov byte ptr [rsi],0x5a
+    mov eax,158
+    mov edi,0x1003
+    syscall
+    cmp rax,-14
+    jne fs_fail
+    cmp byte ptr [rsi],0x5a
+    jne fs_fail
+    mov eax,158
+    mov edi,0x1003
+    lea rsi,[rip+buffer+4093]
+    syscall
+    test rax,rax
+    jne fs_fail
+    cmp qword ptr [rsi],r12
+    jne fs_fail
+    mov dword ptr fs:[4],0x4321dcba
+    cmp dword ptr [rip+tls_data+4],0x4321dcba
+    jne fs_fail
+
+    mov eax,158
+    mov edi,0x1002
+    mov esi,3
+    syscall
+    test rax,rax
+    jne fs_fail
+    mov eax,158
+    mov edi,0x1003
+    lea rsi,[rip+buffer+4093]
+    syscall
+    test rax,rax
+    jne fs_fail
+    cmp qword ptr [rsi],3
+    jne fs_fail
+    mov eax,158
+    mov edi,0x1002
+    xor esi,esi
+    syscall
+    test rax,rax
+    jne fs_fail
+    ret
+fs_fail:
+    mov eax,60
+    mov edi,13
+    syscall
+    ud2
+
 .global guard_probe
 guard_probe:
     mov rax,0x00007fffffefb000
@@ -137,6 +228,8 @@ message: .ascii " Linux ELF64 syscall probe\n"
 message_end:
 .section .data
 data_byte: .byte 0x5a
+.balign 8
+tls_data: .long 0x1234abcd, 0
 .section .bss
 .balign 4096
 buffer: .skip 8192
