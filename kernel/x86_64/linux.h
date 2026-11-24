@@ -27,6 +27,7 @@ void linux64_clock_init(void);
 long linux64_clock_gettime(i32 clock, uptr address);
 void linux64_reset_signals(void);
 long linux64_rt_sigaction(i32 signal, uptr action, uptr previous, uptr sigset_size);
+long linux64_rt_sigprocmask(i32 how, uptr set, uptr previous, uptr sigset_size);
 bool linux64_enable_syscall(void);
 void kernel64_serial_char(char ch);
 

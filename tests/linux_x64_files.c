@@ -77,9 +77,35 @@ static long check_signals(void) {
     return 0;
 }
 
+static long sigprocmask(word how, const void *set, void *old) {
+    return call(14, how, (word)set, (word)old, sizeof(word));
+}
+
+static long check_signal_mask(void) {
+    struct __attribute__((packed)) mask { word bits; };
+    struct mask *cross = (void *)(buffer + 4096 - 4);
+    const word high = 1ul << 63, pipe = 1ul << 12, user1 = 1ul << 9;
+    const word zero = 0, extra = user1 | 0x40100ul;
+    word inherited, old;
+    if (sigprocmask(2, &zero, &inherited)) return 20;
+    cross->bits = high | pipe | 0x40100ul;
+    if (sigprocmask(2, cross, cross) || cross->bits ||
+        sigprocmask(99, 0, cross) || cross->bits != (high | pipe)) return 21;
+    if (sigprocmask(0, &extra, &old) || old != (high | pipe) ||
+        sigprocmask(1, &pipe, &old) || old != (high | pipe | user1)) return 22;
+    if (call(14, 99, 0xffff800000000000ul, 0, 16) != -22 ||
+        call(14, 99, 0xffff800000000000ul, 0, 8) != -14 ||
+        sigprocmask(99, &zero, 0) != -22 ||
+        sigprocmask(2, 0, &old) || old != (high | user1)) return 23;
+    if (sigprocmask(2, &pipe, (void *)path) != -14 ||
+        sigprocmask(2, &inherited, &old) || old != pipe) return 24;
+    return 0;
+}
+
 __attribute__((noreturn)) void _start(void) {
     long status = check_files();
     if (!status) status = check_signals();
+    if (!status) status = check_signal_mask();
     if (!status) {
         static const char message[] = "Linux ELF64 files probe\n";
         if (call(1, 1, (word)message, sizeof(message) - 1, 0) != sizeof(message) - 1)
