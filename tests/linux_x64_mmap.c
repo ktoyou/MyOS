@@ -28,6 +28,25 @@ static long munmap(word address, word length) {
     return call(11, address, length, 0, 0, 0, 0);
 }
 
+static long wake(word address, word op, word count) {
+    return call(202, address, op, count, (word)-1, (word)-1, (word)-1);
+}
+
+static long check_futex(word file_address) {
+    unsigned int word_in_memory = 1;
+    word rw = (word)&word_in_memory;
+    if (wake(rw, 1, 0x7fffffff) || wake(rw, 129, 0) || wake(rw, 129, (unsigned)-1) ||
+        wake(rw, 0x100000081ul, 1) || wake(file_address, 1, 1)) return 30;
+    if (wake(rw + 1, 129, 0) != -22 || wake(0, 129, 1) ||
+        wake(0, 1, 1) != -14 || wake(0xffff800000000000ul, 129, 1) != -14 ||
+        wake(rw + 1, 0x181, 1) != -38) return 31;
+    long page = mmap(0, 0x1000, 0, 0x22, -1, 0);
+    if (page < 0 || wake(page, 129, 1) || wake(page, 1, 1) != -14 ||
+        mprotect(page, 0x1000, 1) || wake(page, 129, 1) ||
+        wake(page, 1, 1) != -14 || munmap(page, 0x1000)) return 32;
+    return 0;
+}
+
 static long check_sparse(void) {
     const word size = 0x800000000ul;
     const word hint = 0x30000000000ul;
@@ -83,6 +102,8 @@ static long check_mmap(void) {
     volatile unsigned char *bytes = (void *)address;
     if (bytes[0] != 0xb8 || bytes[0x1000] != 0x5a ||
         bytes[0x1001] || bytes[0x1fff]) return 4;
+    long wake_result = check_futex((word)address);
+    if (wake_result) return wake_result;
     long result = check_mprotect(fd, (word)address);
     if (result) return result;
     if (mmap(address + 0x2000, 0x2000, 1, 0x100002, fd, 0) != -17) return 5;
