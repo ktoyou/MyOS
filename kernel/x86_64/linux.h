@@ -3,7 +3,9 @@
 
 #include "../types.h"
 
-bool linux64_run(const void *image, uptr size);
+typedef const void *(*linux64_resolve_interp)(const char *path, void *context, uptr *size);
+
+bool linux64_run(const void *image, uptr size, linux64_resolve_interp resolve, void *context);
 bool linux64_enable_syscall(void);
 void kernel64_serial_char(char ch);
 
