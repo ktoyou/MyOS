@@ -1596,6 +1596,21 @@ videopolicytest: videodrivertest | $(BUILD)
 	$(HOSTCC) -std=gnu11 -g -O1 -fsanitize=address,undefined -DGNU_EFI_USE_MS_ABI -I/usr/include/efi -I/usr/include/efi/x86_64 tests/uefi_video_test.c -o $(BUILD)/uefi-video-test
 	./$(BUILD)/uefi-video-test
 
+.PHONY: displaytest
+displaytest: | $(BUILD)
+	$(HOSTCC) -m32 -std=gnu11 -g -O1 -fno-builtin -ffunction-sections -fdata-sections -fsanitize=address,undefined tests/display_trial_test.c -Wl,--gc-sections -o $(BUILD)/display-trial-test
+	./$(BUILD)/display-trial-test
+	$(HOSTCC) -m32 -std=gnu11 -g -O1 -fno-builtin -ffunction-sections -fdata-sections -fsanitize=address,undefined -Iuser/include -Iuser/lib tests/display_ui_test.c -Wl,--gc-sections -o $(BUILD)/display-ui-test
+	./$(BUILD)/display-ui-test
+
+$(BUILD)/user/display-ui-check.o: tests/display_ui_check.c user/display.c user/lib/win.h user/lib/video_mode.h | $(BUILD)/user
+	$(CC) $(UCFLAGS) -c $< -o $@
+$(BUILD)/user/display-ui-check: $(BUILD)/user/display-ui-check.o $(ULIB) user/user.ld
+	$(LD) $(ULDFLAGS) $< $(ULIB) -o $@
+.PHONY: display-smoke
+display-smoke: displaytest $(HWBUILD)/kernel.bin $(BUILD)/myfs $(BUILD)/ld.so $(BUILD)/user/libc.so $(BUILD)/user/libgfx.so $(addprefix $(BUILD)/user/,sh desktop display-ui-check sleep mode cat poweroff)
+	python3 tests/display_smoke.py
+
 $(BUILD)/user/nativewindowcheck.o: tests/native_window_check.c user/lib/win.h user/lib/video_mode.h | $(BUILD)/user
 	$(CC) $(UCFLAGS) -c $< -o $@
 $(BUILD)/user/nativewindowcheck: $(BUILD)/user/nativewindowcheck.o $(ULIB) user/user.ld

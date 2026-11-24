@@ -7,6 +7,8 @@
 #define VIDEO_SURFACE_WIDTH 5184
 #define VIDEO_SURFACE_HEIGHT 5248
 #define VIDEO_EDID_BLOCKS 8u
+#define VIDEO_TRIAL_MS 15000u
+enum { VIDEO_MODE_TRY=2, VIDEO_MODE_KEEP, VIDEO_MODE_REVERT, VIDEO_MODE_REMAINING };
 /* Окно виртуально 64 МиБ, но физический BAR может подходить к границе 4 ГиБ. */
 static inline unsigned video_aperture(unsigned base) {
     return base>0u-VIDEO_BUFFER_BYTES?0u-base:VIDEO_BUFFER_BYTES;

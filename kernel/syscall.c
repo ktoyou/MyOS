@@ -662,6 +662,8 @@ static int sys_gfx_blit(u32 ubuf, u32 urect) {
 
 static int sys_gfx_mode(u32 w, u32 h, u32 check_only) {
     if (!fb_ready()) return -ENODEV;
+    if(check_only>=VIDEO_MODE_TRY)
+        return display_trial_ctl(check_only,w,h,task_process(task_current())->id);
     if (check_only==1) return fb_mode_ok(w,h)?0:-EINVAL;
     if (check_only) return -EINVAL;
     return display_set_mode(w, h) < 0 ? -EINVAL : 0;

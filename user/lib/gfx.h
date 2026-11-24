@@ -59,6 +59,11 @@ struct gfx_info2 {
 #define GFX_CAP_ALPHA_CURSOR 64      /* аппаратный курсор с прозрачностью */
 int  gfx_info2(struct gfx_info2 *gi);
 int  gfx_set_mode(int w, int h);    /* 0 или -EINVAL */
+/* Preview: token>0 требует подтверждения; 0 — геометрия не изменилась. */
+int gfx_try_mode(int w,int h);
+int gfx_keep_mode(unsigned token);
+int gfx_revert_mode(unsigned token);
+int gfx_mode_remaining(unsigned token); /* миллисекунды; отрицательное — preview завершён */
 int  gfx_check_mode(void);          /* 1 — разрешение сменилось, буфер пересоздан */
 /* Прямо на экране, минуя буфер: свой gfx_buf программа поправляет сама. */
 int  gfx_surface_upload(int slot, const color_t *pixels, int w, int h, bool alpha);

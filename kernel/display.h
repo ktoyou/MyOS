@@ -5,5 +5,6 @@
 int  display_set_mode(u32 w, u32 h);       /* 0 или -1 */
 bool display_parse(const char *s, u32 *w, u32 *h);
 void display_load_config(void);            /* /etc/display — после монтирования ФС */
+int display_trial_ctl(u32 operation,u32 w,u32 h,u32 owner);
 
 #endif

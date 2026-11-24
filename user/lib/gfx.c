@@ -55,6 +55,10 @@ int mouse_get(struct mouse *m) { return sc(SYS_MOUSE, (int)m, sizeof(*m)); }
 
 int gfx_info2(struct gfx_info2 *gi) { return sc(SYS_GFX_INFO2, (int)gi, 0); }
 int gfx_set_mode(int w, int h) { return sc(SYS_GFX_MODE, w, h); }
+int gfx_try_mode(int w,int h){return sc_flags(SYS_GFX_MODE,w,h,VIDEO_MODE_TRY);}
+int gfx_keep_mode(unsigned token){return sc_flags(SYS_GFX_MODE,token,0,VIDEO_MODE_KEEP);}
+int gfx_revert_mode(unsigned token){return sc_flags(SYS_GFX_MODE,token,0,VIDEO_MODE_REVERT);}
+int gfx_mode_remaining(unsigned token){return sc_flags(SYS_GFX_MODE,token,0,VIDEO_MODE_REMAINING);}
 
 int gfx_check_mode(void) {
     struct gfx_info2 gi;
