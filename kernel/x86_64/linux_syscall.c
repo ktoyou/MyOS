@@ -66,6 +66,32 @@ static long linux_getresid(u32 id, uptr real, uptr effective, uptr saved) {
     return 0;
 }
 
+static long linux_sysinfo(uptr address) {
+    struct linux_sysinfo {
+        long uptime;
+        u64 loads[3], totalram, freeram, sharedram, bufferram, totalswap, freeswap;
+        u16 procs, padding[3];
+        u64 totalhigh, freehigh;
+        u32 mem_unit, tail_padding;
+    };
+    _Static_assert(sizeof(struct linux_sysinfo) == 112, "Linux x86-64 sysinfo size");
+    _Static_assert(__builtin_offsetof(struct linux_sysinfo, procs) == 80, "Linux sysinfo procs");
+    _Static_assert(__builtin_offsetof(struct linux_sysinfo, mem_unit) == 104, "Linux sysinfo mem_unit");
+    u64 nanos = 0;
+    linux64_monotonic_ns(&nanos);
+    u32 total, free;
+    pmm64_page_counts(&total, &free);
+    const u64 second = 1000000000u;
+    const struct linux_sysinfo info = {
+        .uptime = (long)(nanos / second + (nanos % second != 0)),
+        .totalram = (u64)total * PMM_PAGE_SIZE,
+        .freeram = (u64)free * PMM_PAGE_SIZE,
+        .procs = linux64_task_count(),
+        .mem_unit = 1,
+    };
+    return paging64_copy_to_user(address, &info, sizeof(info)) == sizeof(info) ? 0 : -14;
+}
+
 __attribute__((noreturn)) void linux64_invalid_return(void) {
     linux64_task_exception(13);
     static const char message[] = "Linux x86-64 invalid syscall return\r\n";
@@ -88,6 +114,7 @@ long linux64_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2,
         return linux64_sockopt(number == 55, (i32)arg0, (i32)arg1, (i32)arg2, arg3, arg4);
     if (number == 63) return linux_uname(arg0);
     if (number == 96) return linux64_gettimeofday(arg0, arg1);
+    if (number == 99) return linux_sysinfo(arg0);
     const struct linux64_userns *ns = linux64_current->process->userns;
     if (number == 102 || number == 107) return linux64_visible_id(ns, false, LINUX64_UID);
     if (number == 104 || number == 108) return linux64_visible_id(ns, true, LINUX64_GID);

@@ -8,6 +8,7 @@ extern const u8 _start[], __kernel_end[];
 static u64 available[BITMAP_WORDS];
 static u16 references[PAGE_COUNT];
 static u32 next_page = PAGE_COUNT;
+static u32 total_pages, free_pages;
 static uptr physical_base;
 
 void *pmm64_pointer(uptr physical) {
@@ -53,6 +54,10 @@ bool pmm64_init(const struct boot_info *boot) {
     reserve(boot->arena_phys, (u64)boot->arena_phys + boot->arena_bytes);
     reserve(boot->root_phys, (u64)boot->root_phys + boot->root_bytes);
     reserve(boot->fb_phys, (u64)boot->fb_phys + (u64)boot->pitch * boot->height);
+    free_pages = 0;
+    for (u32 i = 0; i < BITMAP_WORDS; ++i)
+        for (u64 bits = available[i]; bits; bits &= bits - 1) ++free_pages;
+    total_pages = free_pages;
     next_page = find_available(0);
     return next_page < PAGE_COUNT;
 }
@@ -62,6 +67,7 @@ uptr pmm64_alloc(void) {
     if (page == PAGE_COUNT) return 0;
     u64 bit = page_bit(page);
     available[page / 64] &= ~bit;
+    --free_pages;
     references[page] = 1;
     next_page = find_available(page + 1);
 
@@ -94,6 +100,12 @@ bool pmm64_free(uptr physical) {
     if (--*count) return true;
     u32 page = (u32)(physical / PMM_PAGE_SIZE);
     available[page / 64] |= page_bit(page);
+    ++free_pages;
     if (page < next_page) next_page = page;
     return true;
+}
+
+void pmm64_page_counts(u32 *total, u32 *free) {
+    *total = total_pages;
+    *free = free_pages;
 }

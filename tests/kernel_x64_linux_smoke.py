@@ -176,6 +176,10 @@ def check_mmap(build):
     assert ('vector=0x000000000000000e error=0x0000000000000015' in serial and
             'cr2=0x0000001000000000 cpl=3' in serial), serial
     print('OVMF: mmap, memfd, mprotect, MADV_DONTNEED, RELRO and Linux futex wake: PASS', flush=True)
+    sysinfo = bytearray(elf)
+    struct.pack_into('<Q', sysinfo, 24, symbols['check_sysinfo'])
+    check_guest('sysinfo', sysinfo, 'Linux x86-64 exit status=0x00')
+    print('OVMF: Linux x86-64 sysinfo ABI, page accounting and task count: PASS', flush=True)
 
 
 def check_socket(build):
