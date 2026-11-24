@@ -177,6 +177,8 @@ static long walk(const struct linux64_directory *base, const char *input,
         if (count == 1 && start[0] == '.') continue;
         if (count == 2 && start[0] == '.' && start[1] == '.') {
             if (length == 1 || same_path(path, root->path)) continue;
+            if (file->proc_fd_owner && file->proc_fd_owner != linux64_current->process->pid)
+                return -EACCES;
             while (length > 1 && path[--length] != '/') {}
             path[length] = 0;
             if (same_path(path, root->path)) *file = root->file;
@@ -190,7 +192,15 @@ static long walk(const struct linux64_directory *base, const char *input,
         path[length] = 0;
         if (final && action == WALK_UNLINK && !file->writable_directory) return -EROFS;
         struct linux64_file child;
-        if (file->private_directory || !find_node(source, path, &child)) {
+        bool found;
+        if (file->proc_fd_owner && file->proc_fd_number < 0) {
+            long result = linux64_proc_fd_entry(file->proc_fd_owner, start, count, &child);
+            if (result && result != -ENOENT) return result;
+            found = !result;
+        } else {
+            found = !file->private_directory && find_node(source, path, &child);
+        }
+        if (!found) {
             if (!final || action != WALK_CREATE ||
                 (trailing && (create->mode & LINUX64_S_IFMT) != LINUX64_S_IFDIR)) return -ENOENT;
             if (!file->writable_directory) return -EROFS;
@@ -199,6 +209,14 @@ static long walk(const struct linux64_directory *base, const char *input,
         }
         if (final && action == WALK_CREATE) return -EEXIST;
         if (final && action == WALK_UNLINK) return unlink_node(file, &child, path, trailing);
+        if (child.proc_fd_owner && child.proc_fd_number >= 0) {
+            /* Ссылка ведёт к объекту дескриптора, а не к текстовому пути. */
+            if (!final) return -ENOTDIR;
+            if (trailing && !child.proc_fd_directory) return -ENOTDIR;
+            if (trailing) child.mode = LINUX64_S_IFDIR | 0555;
+            *file = child;
+            continue;
+        }
         u32 type = child.mode & LINUX64_S_IFMT;
         if (type == LINUX64_S_IFLNK && (trailing || action == WALK_FOLLOW)) {
             if (++links > LINK_LIMIT) return -ELOOP;

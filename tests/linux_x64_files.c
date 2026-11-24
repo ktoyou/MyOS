@@ -461,6 +461,109 @@ static long check_realtime(void) {
     return call(1, 1, (word)message, sizeof(message) - 1, 0) == sizeof(message) - 1 ? 0 : 67;
 }
 
+struct proc_dirent {
+    word inode, next;
+    unsigned short length;
+    unsigned char type;
+    char name[5];
+};
+
+static long proc_entries(long scanner, unsigned *seen, word *inode_29) {
+    long count = call(217, scanner, (word)buffer, 512, 0);
+    if (count <= 0) return count;
+    word next = 0;
+    for (long offset = 0; offset < count;) {
+        const struct proc_dirent *entry = (const void *)(buffer + offset);
+        if (count - offset < 24 || entry->length < 24 || entry->length % 8 ||
+            entry->length > count - offset) return -1;
+        offset += entry->length;
+        next = entry->next;
+        if (entry->name[0] == '.') {
+            if (entry->type != 4) return -1;
+            continue;
+        }
+        if (entry->type != 10) return -1;
+        unsigned number = 0, digits = 0;
+        while (digits < sizeof(entry->name) && entry->name[digits]) {
+            char digit = entry->name[digits++];
+            if (digit < '0' || digit > '9') return -1;
+            number = number * 10 + (unsigned)(digit - '0');
+        }
+        if (!digits || digits == sizeof(entry->name) || number >= 32 || (*seen & (1u << number)))
+            return -1;
+        *seen |= 1u << number;
+        if (number == 29) *inode_29 = entry->inode;
+    }
+    return call(8, scanner, 0, 1, 0) == (long)next ? count : -1;
+}
+
+static long check_proc_fds(void) {
+    long proc = call(2, (word)"/proc", 0x10000, 0, 0);
+    long dir = call(257, proc, (word)"self/fd/", 0x90000, 0);
+    long device = call(2, (word)"/dev/null", 0, 0, 0);
+    long outside = call(2, (word)"/tmp", 0x10000, 0, 0);
+    struct proc_dirent *entry = (void *)buffer;
+    if (proc < 3 || dir < 3 || device < 3 || outside < 3 ||
+        call(72, dir, 1, 0, 0) != 1 || call(217, -1, (word)buffer, 512, 0) != -9 ||
+        call(217, device, (word)buffer, 512, 0) != -20 ||
+        call(217, dir, (word)buffer, 23, 0) != -22 || call(217, dir, 0, 24, 0) != -14 ||
+        call(217, dir, (word)entry, 24, 0) != 24 || entry->type != 4 ||
+        entry->name[0] != '.' || entry->name[1]) return 83;
+    long dup = call(32, dir, 0, 0, 0);
+    if (dup < 3 || call(217, dup, (word)entry, 24, 0) != 24 ||
+        entry->name[0] != '.' || entry->name[1] != '.' || entry->name[2] ||
+        call(3, dup, 0, 0, 0) || call(8, dir, 0, 0, 0)) return 84;
+    if (call(10, (word)(buffer + 4096), 4096, 0, 0) ||
+        call(217, dir, (word)(buffer + 4096 - 24), 48, 0) != 24 ||
+        call(10, (word)(buffer + 4096), 4096, 3, 0) ||
+        call(217, dir, (word)entry, 24, 0) != 24 || entry->name[1] != '.' ||
+        call(8, dir, 0, 0, 0)) return 85;
+
+    for (long n = 8; n <= 31; ++n)
+        if (call(33, device, n, 0, 0) != n) return 86;
+    unsigned seen = 0;
+    word inode_29 = 0;
+    if (proc_entries(dir, &seen, &inode_29) <= 0 || (seen & (1u << 30)) ||
+        call(3, 30, 0, 0, 0) || call(33, outside, 29, 0, 0) != 29) return 87;
+    long count;
+    do { count = proc_entries(dir, &seen, &inode_29); } while (count > 0);
+    if (count || (seen & (1u << 30)) || !(seen & (1u << 31)) ||
+        !(seen & (1u << dir)) || !inode_29) return 88;
+
+    word followed[18], original[18], link[18];
+    if (call(262, dir, (word)"29", (word)followed, 0) ||
+        call(262, dir, (word)"29", (word)link, 0x100) ||
+        call(5, outside, (word)original, 0, 0) ||
+        (followed[3] & 0170000) != 0040000 || followed[1] != original[1] ||
+        (link[3] & 0170000) != 0120000 || link[1] != inode_29 ||
+        call(3, 29, 0, 0, 0) || call(262, dir, (word)"29", (word)followed, 0) != -2 ||
+        call(33, device, 29, 0, 0) != 29 || call(262, dir, (word)"29", (word)followed, 0) ||
+        (followed[3] & 0170000) != 0020000 || followed[5] != 0x103) return 89;
+    for (long n = 8; n <= 31; ++n)
+        if (n != 30 && call(3, n, 0, 0, 0)) return 90;
+    long memory = call(319, (word)"proc-fd", 0, 0, 0);
+    if (memory < 3 || memory >= 32 || call(77, memory, 1, 0, 0) ||
+        call(0, memory, (word)buffer, 1, 0) != 1) return 91;
+    char name[3] = {0};
+    if (memory >= 10) {
+        name[0] = (char)('0' + memory / 10);
+        name[1] = (char)('0' + memory % 10);
+    } else {
+        name[0] = (char)('0' + memory);
+    }
+    long saved = call(257, dir, (word)name, 0x80000, 0);
+    if (saved < 3 || (call(72, saved, 3, 0, 0) & 3) != 0 ||
+        call(0, saved, (word)buffer, 1, 0) != 1 || buffer[0] ||
+        call(0, memory, (word)buffer, 1, 0) || call(3, saved, 0, 0, 0) ||
+        call(3, memory, 0, 0, 0)) return 92;
+    long independent = call(257, proc, (word)"self/fd", 0x10000, 0);
+    if (independent < 3 || call(217, independent, (word)entry, 24, 0) != 24 ||
+        entry->name[0] != '.' || entry->name[1] || call(3, independent, 0, 0, 0) ||
+        call(3, outside, 0, 0, 0) || call(3, device, 0, 0, 0) ||
+        call(3, dir, 0, 0, 0) || call(3, proc, 0, 0, 0)) return 93;
+    return 0;
+}
+
 __attribute__((noreturn)) void _start(void) {
     long status = check_files();
     if (!status) status = check_signals();
@@ -472,6 +575,7 @@ __attribute__((noreturn)) void _start(void) {
     if (!status) status = check_urandom();
     if (!status) status = check_dup();
     if (!status) status = check_directories();
+    if (!status) status = check_proc_fds();
     if (!status) status = check_realtime();
     if (!status) {
         static const char message[] = "Linux ELF64 files probe\n";
