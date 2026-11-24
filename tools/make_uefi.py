@@ -51,14 +51,18 @@ def font():
     return bytes(glyphs)
 
 
-def esp(kernel,kernel_end,mode=2,disk_id=0,root_sectors=0,width=0,height=0,nasm='nasm'):
+def esp(kernel,kernel_end,mode=2,disk_id=0,root_sectors=0,width=0,height=0,nasm='nasm',*,arch='i386'):
     """Return only allocated FAT sectors; the remaining free data area is sparse.
     All files use 8.3 names, one-sector clusters, and deterministic chains.
     """
+    if arch not in ('i386','x86_64'):
+        raise ValueError(f'Unsupported UEFI kernel architecture: {arch}')
     app=loader(nasm)
     config=bytearray(512)
-    struct.pack_into('<8s10I',config,0,b'MYOSEFI1',1,mode,disk_id,ROOT_START,root_sectors,
+    struct.pack_into('<8s10I',config,0,b'MYOSEFI1',2 if arch=='x86_64' else 1,mode,disk_id,ROOT_START,root_sectors,
                      len(kernel),zlib.crc32(kernel),kernel_end,width,height)
+    if arch=='x86_64':
+        struct.pack_into('<I',config,48,1)
     files=[('BOOTX64 EFI',app),('KERNEL  BIN',kernel),('BOOT    CFG',bytes(config)),('FONT    BIN',font()),
            ('FONT    LIC',pathlib.Path('fonts/UFL.txt').read_bytes())]
     reserved=32;fat_sectors=1024;data_start=reserved+2*fat_sectors

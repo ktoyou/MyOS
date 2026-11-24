@@ -1,4 +1,4 @@
-; Position-independent x64 -> protected i386 handoff. Header patched by loader.
+; Позиционно-независимый переход UEFI в ядро, заголовок заполняет загрузчик.
 [bits 64]
 [org 0]
     jmp start
@@ -8,6 +8,7 @@ info_value: dd 0
 stack_value: dd 0
 compat_value: dq 0
 kernel_value: dd 0x100000
+kernel64: dd 0
 times 48-($-$$) db 0
 gdtr: dw 31
 gdt_value: dq 0
@@ -20,14 +21,45 @@ start:
     mov esp,[rel stack_value]
     mov rax,cr4
     btr rax,17                 ; PCIDE off before leaving IA-32e
+    btr rax,7                  ; не переносим глобальные записи TLB прошивки
     mov cr4,rax
     mov rax,[rel cr3_value]
     mov cr3,rax                ; private identity map, all addresses below 4 GiB
     lgdt [rel gdtr]
     lidt [rel idtr]
+    cmp dword [rel kernel64],0
+    je .protected32
+    push qword 0x08
+    lea rax,[rel long_entry]
+    push rax
+    retfq
+.protected32:
     push qword 0x18
     push qword [rel compat_value]
     retfq
+
+long_entry:
+    mov ax,0x10
+    mov ds,ax
+    mov es,ax
+    mov ss,ax
+    xor eax,eax
+    mov fs,ax
+    mov gs,ax
+    xor edx,edx
+    mov ecx,0xc0000100         ; базы FS, GS и KERNEL_GS_BASE
+    wrmsr
+    inc ecx
+    wrmsr
+    inc ecx
+    wrmsr
+    mov edi,[rel info_value]
+    mov esi,0x55454649
+    mov eax,[rel kernel_value]
+    and rsp,-16
+    push qword 0              ; выравнивание на входе в функцию SysV
+    jmp rax
+
 [bits 32]
 compat:
     mov ax,0x10
