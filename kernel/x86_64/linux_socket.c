@@ -2,7 +2,7 @@
 #include "paging.h"
 
 enum {
-    EBADF = 9, EAGAIN = 11, ENOMEM = 12, EFAULT = 14, EINVAL = 22, EMFILE = 24, EPIPE = 32,
+    EBADF = 9, EAGAIN = 11, ENOMEM = 12, EFAULT = 14, EINVAL = 22, ENFILE = 23, EPIPE = 32,
     EMSGSIZE = 90, EPROTONOSUPPORT = 93, ESOCKTNOSUPPORT = 94, EOPNOTSUPP = 95,
     EAFNOSUPPORT = 97, ENOPROTOOPT = 92, ECONNRESET = 104, EISCONN = 106, ENOTCONN = 107,
     ECONNREFUSED = 111,
@@ -79,8 +79,8 @@ struct linux64_socket {
 };
 
 /* Один конец может оставаться открытым после закрытия его пары. */
-static struct linux64_socket pairs[LINUX64_PROCESS_COUNT * LINUX64_FD_COUNT][2];
-static struct linux64_socket *scm_mark_queue[2 * LINUX64_PROCESS_COUNT * LINUX64_FD_COUNT];
+static struct linux64_socket pairs[LINUX64_OPEN_FILE_COUNT][2];
+static struct linux64_socket *scm_mark_queue[sizeof(pairs) / sizeof(pairs[0][0])];
 static unsigned scm_mark_count;
 
 static struct linux64_socket *free_pair(void) {
@@ -97,22 +97,20 @@ long linux64_socket_create(i32 domain, u32 type, i32 protocol, struct linux64_so
     if (protocol != 0 && protocol != AF_UNIX) return -EPROTONOSUPPORT;
     if (base != SOCK_STREAM) return -ESOCKTNOSUPPORT;
     struct linux64_socket *slot = free_pair();
-    if (!slot) return -EMFILE;
+    if (!slot) return -ENFILE;
     *slot = (struct linux64_socket){.type = SOCK_STREAM, .open = true};
     *socket = slot;
     return 0;
 }
 
 long linux64_socket_pair(i32 domain, u32 type, i32 protocol, struct linux64_socket *ends[2]) {
-    u32 base = type & SOCK_TYPE_MASK;
-    if (type & ~(SOCK_TYPE_MASK | SOCK_CLOEXEC | SOCK_NONBLOCK)) return -EINVAL;
     if (domain != AF_UNIX) return -EAFNOSUPPORT;
-    if (base != SOCK_STREAM && base != SOCK_SEQPACKET) return -ESOCKTNOSUPPORT;
+    if (type != SOCK_STREAM && type != SOCK_SEQPACKET) return -ESOCKTNOSUPPORT;
     if (protocol != 0 && protocol != AF_UNIX) return -EPROTONOSUPPORT;
     struct linux64_socket *pair = free_pair();
-    if (!pair) return -EMFILE;
-    pair[0] = (struct linux64_socket){.peer = &pair[1], .type = base, .open = true};
-    pair[1] = (struct linux64_socket){.peer = &pair[0], .type = base, .open = true};
+    if (!pair) return -ENFILE;
+    pair[0] = (struct linux64_socket){.peer = &pair[1], .type = type, .open = true};
+    pair[1] = (struct linux64_socket){.peer = &pair[0], .type = type, .open = true};
     ends[0] = &pair[0];
     ends[1] = &pair[1];
     return 0;
@@ -681,7 +679,7 @@ long linux64_socket_prepare_rights(uptr address, u32 flags, struct linux64_scm_r
 
 struct received_fds {
     struct cmsghdr header;
-    i32 descriptors[LINUX64_FD_COUNT];
+    i32 descriptors[SCM_MAX_FD];
     unsigned count;
 };
 _Static_assert(__builtin_offsetof(struct received_fds, descriptors) == sizeof(struct cmsghdr),
@@ -700,7 +698,7 @@ static void receive_ancillary(struct msghdr *message, const struct received_anci
     if (!rights) return;
     uptr available = capacity - message->control_length;
     uptr slots = available >= sizeof(fds->header) ? (available - sizeof(fds->header)) / sizeof(i32) : 0;
-    while (fds->count < rights->count && fds->count < slots && fds->count < LINUX64_FD_COUNT) {
+    while (fds->count < rights->count && fds->count < slots) {
         long fd = linux64_scm_install(rights->files[fds->count], (message->flags & MSG_CMSG_CLOEXEC) != 0);
         if (fd < 0) break;
         fds->descriptors[fds->count++] = (i32)fd;

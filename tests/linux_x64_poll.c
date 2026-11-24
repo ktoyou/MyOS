@@ -1,6 +1,7 @@
 typedef unsigned long word;
 
 enum {
+    FD_LIMIT = 256,
     IN = 0x001, OUT = 0x004, ERR = 0x008, HUP = 0x010, NVAL = 0x020,
     RDNORM = 0x040, WRNORM = 0x100, WRBAND = 0x200, RDHUP = 0x2000,
 };
@@ -84,7 +85,7 @@ static int check_socket(void) {
 static int check_copy(void) {
     word split = (word)(pages + 4096);
     struct pollfd *fds = (void *)(split - 6);
-    if (poll(0, 1, 0) != -14 || poll(0, 33, 0) != -22 || poll(0, 0, 0)) return 15;
+    if (poll(0, 1, 0) != -14 || poll(0, FD_LIMIT + 1, 0) != -22 || poll(0, 0, 0)) return 15;
     fds[0] = (struct pollfd){-2, IN, 0xffff};
     if (call(10, (word)pages, 4096, 1, 0) || poll(fds, 1, 0) ||
         fds[0].fd != -2 || fds[0].events != IN || fds[0].revents ||
@@ -376,6 +377,28 @@ static int check_ppoll(void) {
     return 0;
 }
 
+static int check_high_fd(void) {
+    const int high = FD_LIMIT - 1;
+    long fd = call(290, 0, 0, 0, 0), epoll = call(291, 0, 0, 0, 0);
+    if (fd < 3 || epoll < 3 || call(292, fd, high, 0x80000, 0) != high ||
+        call(72, high, 1, 0, 0) != 1 || call(33, high, FD_LIMIT, 0, 0) != -9 ||
+        close_fd(fd)) return 60;
+    struct pollfd fds[FD_LIMIT];
+    for (unsigned i = 0; i < FD_LIMIT; ++i) fds[i] = (struct pollfd){-1, IN, 0xffff};
+    fds[high].fd = high;
+    struct epoll_event event = {IN, 0xcdef0000abcdu}, out;
+    if (epoll_ctl(epoll, ADD, high, &event) || poll(fds, FD_LIMIT, 0) ||
+        fds[0].revents || fds[high].revents || event_write(high, 1) != 8) return 61;
+    long immediate[2] = {0, 0};
+    word value;
+    if (ppoll(fds, FD_LIMIT, immediate, 0) != 1 || fds[high].revents != IN ||
+        epoll_wait(epoll, &out, 1, 0) != 1 || out.events != IN || out.data != event.data ||
+        event_read(high, &value) != 8 || value != 1 || close_fd(high) ||
+        poll(fds, FD_LIMIT, 0) != 1 || fds[high].revents != NVAL ||
+        epoll_wait(epoll, &out, 1, 0) || close_fd(epoll)) return 62;
+    return 0;
+}
+
 void _start(void) {
     int error = check_pipe();
     if (!error) error = check_socket();
@@ -388,6 +411,7 @@ void _start(void) {
     if (!error) error = check_epoll_aliases();
     if (!error) error = check_epoll_blocking();
     if (!error) error = check_epoll_delivery();
+    if (!error) error = check_high_fd();
     if (error) finish(error);
     static const char marker[] = "Linux ELF64 poll probe\n";
     if (call(1, 1, (word)marker, sizeof(marker) - 1, 0) != sizeof(marker) - 1) finish(26);

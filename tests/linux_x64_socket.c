@@ -22,6 +22,7 @@ struct credentials {
 };
 
 enum {
+    FD_LIMIT = 256,
     AF_UNIX = 1, SOCK_STREAM = 1, SOCK_SEQPACKET = 5, SOCK_NONBLOCK = 0x800, SOCK_CLOEXEC = 0x80000,
     SOL_SOCKET = 1, SCM_RIGHTS = 1, SO_TYPE = 3, SO_PASSCRED = 16,
     MSG_PEEK = 2, MSG_CTRUNC = 8, MSG_TRUNC = 0x20, MSG_DONTWAIT = 0x40, MSG_NOSIGNAL = 0x4000,
@@ -129,7 +130,7 @@ static long check_stream(void) {
 }
 
 static long check_stream_fd_limit(void) {
-    int descriptors[29];
+    int descriptors[FD_LIMIT - 3];
     for (unsigned i = 0; i < sizeof(descriptors) / sizeof(*descriptors); ++i) {
         long fd = stream(0);
         if (fd < 3) return 37;
@@ -172,7 +173,7 @@ static long check_named(const struct unix_address *address) {
     struct { int fd; short events, revents; } pollfd = {(int)listener, 0x2255, 0};
     if (call(50, listener, 0, 0, 0, 0) || call(43, listener, 0, 0, 0, 0) != -11 ||
         call(7, (word)&pollfd, 1, 0, 0, 0) || pollfd.revents) return 46;
-    int extra[26];
+    int extra[FD_LIMIT - 6];
     for (unsigned i = 0; i < sizeof(extra) / sizeof(*extra); ++i) {
         long fd = stream(0);
         if (fd < 3) return 63;
@@ -376,13 +377,13 @@ static long check_shutdown(void) {
 }
 
 static long check_fd_limit(word type) {
-    int ends[14][2], spare[2];
-    for (unsigned i = 0; i < 14; ++i)
+    int ends[(FD_LIMIT - 3) / 2][2], spare[2];
+    for (unsigned i = 0; i < sizeof(ends) / sizeof(*ends); ++i)
         if (pair_type(ends[i], type)) return 9;
     if (pair_type(spare, type) != -24) return 10;
     long last = call(319, (word)"", 0, 0, 0, 0);
-    if (last != 31 || close_fd(last)) return 11;
-    for (unsigned i = 0; i < 14; ++i)
+    if (last != FD_LIMIT - 1 || close_fd(last)) return 11;
+    for (unsigned i = 0; i < sizeof(ends) / sizeof(*ends); ++i)
         if (close_fd(ends[i][0]) || close_fd(ends[i][1])) return 12;
     if (pair_type(spare, type) || spare[0] != 3 || spare[1] != 4 ||
         close_fd(spare[0]) || close_fd(spare[1])) return 13;
@@ -748,6 +749,82 @@ static long check_rights_gc(void) {
     return 0;
 }
 
+static long check_high_rights(void) {
+    const int high = FD_LIMIT - 1;
+    int ends[2];
+    if (pair(ends)) return 104;
+    long source = call(319, (word)"high-rights", 0, 0, 0, 0);
+    if (source != 5 || call(77, source, 1, 0, 0, 0)) return 104;
+    for (int fd = 6; fd < high; ++fd)
+        if (call(33, 0, fd, 0, 0, 0) != fd) return 105;
+    int sent = (int)source;
+    struct rights rights = {0};
+    unsigned flags;
+    char byte;
+    if (send_rights(ends[0], "x", 1, &sent, 1) != 1 ||
+        recv_rights(ends[1], &byte, 1, &rights, sizeof(rights), MSG_CMSG_CLOEXEC, &flags) != 1 ||
+        byte != 'x' || (flags & MSG_CTRUNC) || rights.length != 20 || rights.fds[0] != high ||
+        call(72, high, 1, 0, 0, 0) != 1 || call(0, high, (word)&byte, 1, 0, 0) != 1 ||
+        call(0, source, (word)&byte, 1, 0, 0) || close_fd((int)source)) return 106;
+    for (int fd = 6; fd <= high; ++fd)
+        if (close_fd(fd)) return 107;
+    return close_fd(ends[0]) || close_fd(ends[1]) ? 107 : 0;
+}
+
+static long check_global_fd_limit(void) {
+    char system[390];
+    if (call(63, (word)system, 0, 0, 0, 0)) return 108;
+    if (system[0] != 'M') return 0;
+    int ready[2], release[2];
+    if (call(22, (word)ready, 0, 0, 0, 0) || call(22, (word)release, 0, 0, 0, 0)) return 108;
+    long children[2];
+    for (unsigned i = 0; i < 2; ++i) {
+        long child = call(57, 0, 0, 0, 0, 0);
+        if (!child) {
+            char byte;
+            if (close_fd(ready[0]) || close_fd(release[1])) call(60, 1, 0, 0, 0, 0);
+            for (unsigned n = 0; n < 248; ++n)
+                if (call(319, (word)"pool", 0, 0, 0, 0) < 0) call(60, 2, 0, 0, 0, 0);
+            if (call(1, ready[1], (word)"y", 1, 0, 0) != 1 || close_fd(ready[1]) ||
+                call(0, release[0], (word)&byte, 1, 0, 0)) call(60, 3, 0, 0, 0, 0);
+            call(60, 0, 0, 0, 0, 0);
+            __builtin_trap();
+        }
+        if (child < 0) return 108;
+        children[i] = child;
+    }
+    char byte;
+    if (close_fd(ready[1]) || close_fd(release[0]) ||
+        call(0, ready[0], (word)&byte, 1, 0, 0) != 1 ||
+        call(0, ready[0], (word)&byte, 1, 0, 0) != 1) return 109;
+    int fds[32];
+    unsigned used = 0;
+    long next;
+    do {
+        next = call(319, (word)"pool", 0, 0, 0, 0);
+        if (next < 0) break;
+        fds[used++] = (int)next;
+    } while (used < sizeof(fds) / sizeof(*fds));
+    if (next != -23 || !used || stream(0) != -23) return 110;
+    long high = FD_LIMIT - 1;
+    for (long fd = fds[used - 1] + 1; fd < high; ++fd)
+        if (call(33, 0, fd, 0, 0, 0) != fd) return 112;
+    int ends[2];
+    if (pair(ends) != -24 || call(33, 0, high, 0, 0, 0) != high || close_fd(high)) return 112;
+    for (long fd = fds[used - 1] + 1; fd < high; ++fd)
+        if (close_fd(fd)) return 112;
+    if (close_fd(ready[0]) || close_fd(release[1])) return 111;
+    for (unsigned i = 0; i < 2; ++i) {
+        int status;
+        if (call(61, children[i], (word)&status, 0, 0, 0) != children[i] || status) return 111;
+    }
+    next = stream(0);
+    if (next < 3 || close_fd((int)next)) return 111;
+    for (unsigned i = 0; i < used; ++i)
+        if (close_fd(fds[i])) return 111;
+    return 0;
+}
+
 static long check(void) {
     long status = check_stream();
     if (!status) status = check_stream_fd_limit();
@@ -761,6 +838,8 @@ static long check(void) {
     if (!status) status = check_rights_metadata_fault();
     if (!status) status = check_rights_wait();
     if (!status) status = check_rights_gc();
+    if (!status) status = check_high_rights();
+    if (!status) status = check_global_fd_limit();
     struct unix_address address = {AF_UNIX, "/tmp/myos-socket-0000000000"};
     unsigned pid = (unsigned)call(39, 0, 0, 0, 0, 0);
     for (unsigned i = sizeof("/tmp/myos-socket-0000000000") - 2; pid; --i, pid /= 10)

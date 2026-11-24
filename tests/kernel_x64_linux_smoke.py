@@ -186,7 +186,7 @@ def check_socket(build):
     probe = (build / 'linux-socket.elf').resolve()
     marker = 'Linux ELF64 socket probe'
     host = subprocess.run([str(probe)], env={}, capture_output=True, timeout=5,
-                          preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_NOFILE, (32, 32)))
+                          preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_NOFILE, (256, 256)))
     assert (host.returncode, host.stdout, host.stderr) == (0, (marker + '\n').encode(), b''), host
     serial = check_guest('socket', probe.read_bytes(), 'Linux x86-64 exit status=0x00')
     assert marker in serial, serial
@@ -207,7 +207,7 @@ def check_poll(build):
     probe = (build / 'linux-poll.elf').resolve()
     marker = 'Linux ELF64 poll probe'
     host = subprocess.run([str(probe)], env={}, capture_output=True, timeout=5,
-                          preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_NOFILE, (32, 32)))
+                          preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_NOFILE, (256, 256)))
     assert (host.returncode, host.stdout, host.stderr) == (0, (marker + '\n').encode(), b''), host
     serial = check_guest('poll', probe.read_bytes(), 'Linux x86-64 exit status=0x00')
     assert marker in serial, serial
