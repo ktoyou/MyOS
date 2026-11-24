@@ -92,6 +92,7 @@ __attribute__((noreturn)) void linux64_invalid_return(void) {
 long linux64_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2,
                     uptr arg3, uptr arg4, uptr arg5) {
     if (number == 1 && (arg0 == 1 || arg0 == 2)) return linux_write(arg0, arg1, arg2);
+    if (number == 7) return linux64_poll(arg0, (u32)arg1, (i32)arg2);
     if (number == 9) return linux64_mmap(arg0, arg1, (u32)arg2, (u32)arg3, (i32)arg4, arg5);
     if (number == 10) return linux64_mprotect(arg0, arg1, arg2);
     if (number == 11) return linux64_munmap(arg0, arg1);

@@ -431,18 +431,31 @@ static long new_session(void) {
 
 static struct linux64_task *pick_task(const struct linux64_task *current) {
     unsigned index = (unsigned)(current - tasks);
-    for (unsigned i = 1; i <= LINUX64_TASK_COUNT; ++i) {
-        struct linux64_task *candidate = &tasks[(index + i) % LINUX64_TASK_COUNT];
-        if (candidate->state == TASK_RUNNABLE ||
-            (candidate->state == TASK_PIPE_WAIT && linux64_pipe_ready(&candidate->pipe_io)))
-            return candidate;
-    }
+    bool timed;
+    do {
+        timed = false;
+        for (unsigned i = 1; i <= LINUX64_TASK_COUNT; ++i) {
+            struct linux64_task *candidate = &tasks[(index + i) % LINUX64_TASK_COUNT];
+            if (candidate->state == TASK_RUNNABLE ||
+                (candidate->state == TASK_PIPE_WAIT && linux64_pipe_ready(&candidate->pipe_io)))
+                return candidate;
+            if (candidate->state != TASK_POLL_WAIT) continue;
+            if (linux64_poll_ready(candidate)) return candidate;
+            if (candidate->poll.deadline) timed = true;
+        }
+        /* Таймерных прерываний в этом режиме пока нет. */
+        if (timed) __asm__ volatile("pause");
+    } while (timed);
     static const char message[] = "Linux x86-64 scheduler has no runnable process\n";
     for (unsigned i = 0; message[i]; ++i) kernel64_serial_char(message[i]);
     for (;;) __asm__ volatile("cli; hlt");
 }
 
 static void resume_wait(struct linux64_task *task) {
+    if (task->state == TASK_POLL_WAIT) {
+        task->frame.rax = (u64)linux64_poll_resume(task);
+        task->state = TASK_RUNNABLE;
+    }
     if (task->state == TASK_PIPE_WAIT) {
         task->state = TASK_RUNNABLE;
         task->frame.rax = (u64)linux64_pipe_resume();
@@ -457,7 +470,13 @@ static void resume_wait(struct linux64_task *task) {
 static void schedule(struct linux64_frame *frame) {
     struct linux64_task *old = linux64_current;
     struct linux64_task *next = pick_task(old);
-    if (next == old) return;
+    if (next == old) {
+        if (old->state == TASK_POLL_WAIT) {
+            frame->rax = (u64)linux64_poll_resume(old);
+            old->state = TASK_RUNNABLE;
+        }
+        return;
+    }
     bool exited = old->state == TASK_DEAD;
     if (!exited) {
         old->frame = *frame;

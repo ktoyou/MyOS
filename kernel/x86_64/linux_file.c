@@ -2,7 +2,7 @@
 #include "paging.h"
 
 enum {
-    EPERM = 1, ENOENT = 2, EBADF = 9, ENOMEM = 12, EACCES = 13, EFAULT = 14,
+    EPERM = 1, ENOENT = 2, EIO = 5, EBADF = 9, ENOMEM = 12, EACCES = 13, EFAULT = 14,
     EBUSY = 16, ENOTDIR = 20, EINVAL = 22, EMFILE = 24, EFBIG = 27, EROFS = 30,
     ENODEV = 19, ESPIPE = 29, ENAMETOOLONG = 36, ENOSYS = 38, ELOOP = 40, ENOTSOCK = 88,
     AT_FDCWD = -100, AT_SYMLINK_NOFOLLOW = 0x100, AT_NO_AUTOMOUNT = 0x800,
@@ -55,6 +55,69 @@ static struct file_handle {
 
 static struct file_handle *file_at(i32 fd) {
     return linux64_current->process->fds[fd].file;
+}
+
+_Static_assert(sizeof(struct linux64_pollfd) == 8, "Linux x86-64 pollfd size");
+_Static_assert(__builtin_offsetof(struct linux64_pollfd, revents) == 6, "Linux x86-64 revents");
+
+static u16 poll_fd(const struct linux64_process *process, i32 fd, u16 events) {
+    if (fd < 0) return 0;
+    if (fd >= FD_COUNT) return LINUX64_POLLNVAL;
+    u16 ready;
+    if (fd < STDIO_COUNT) {
+        ready = fd == 0 ? 0 : LINUX64_POLL_WRITE;
+    } else {
+        const struct file_handle *file = process->fds[fd].file;
+        if (!file) return LINUX64_POLLNVAL;
+        if (file->pipe) ready = linux64_pipe_poll(file->pipe, (file->flags & O_ACCMODE) == O_WRONLY);
+        else if (file->socket) ready = linux64_socket_poll(file->socket);
+        else ready = LINUX64_POLL_READ | LINUX64_POLL_WRITE;
+    }
+    return ready & (events | LINUX64_POLLERR | LINUX64_POLLHUP);
+}
+
+bool linux64_poll_ready(struct linux64_task *task) {
+    struct linux64_poll_wait *poll = &task->poll;
+    poll->ready = 0;
+    /* Сохраняем номера, чтобы заново искать файлы после close в соседнем потоке. */
+    for (unsigned i = 0; i < poll->count; ++i) {
+        struct linux64_pollfd *entry = &poll->entries[i];
+        entry->revents = poll_fd(task->process, entry->fd, entry->events);
+        if (entry->revents) ++poll->ready;
+    }
+    if (poll->ready) return true;
+    u64 nanos;
+    return poll->deadline && linux64_monotonic_ns(&nanos) && nanos >= poll->deadline;
+}
+
+long linux64_poll_resume(const struct linux64_task *task) {
+    const struct linux64_poll_wait *poll = &task->poll;
+    for (unsigned i = 0; i < poll->count; ++i) {
+        uptr field = poll->address + i * sizeof(poll->entries[0]) +
+                     __builtin_offsetof(struct linux64_pollfd, revents);
+        if (!paging64_put_user_u16(field, poll->entries[i].revents)) return -EFAULT;
+    }
+    return poll->ready;
+}
+
+long linux64_poll(uptr address, u32 count, i32 timeout) {
+    if (count > FD_COUNT) return -EINVAL;
+    struct linux64_task *task = linux64_current;
+    struct linux64_poll_wait *poll = &task->poll;
+    u64 deadline = 0;
+    if (timeout > 0) {
+        if (!linux64_monotonic_ns(&deadline)) return -EIO;
+        deadline += (u64)timeout * 1000000ul;
+    }
+    uptr bytes = count * sizeof(poll->entries[0]);
+    if (address > X64_USER_TOP || bytes > X64_USER_TOP - address ||
+        paging64_copy_from_user(poll->entries, address, bytes) != bytes) return -EFAULT;
+    poll->address = address;
+    poll->count = count;
+    poll->deadline = deadline;
+    if (linux64_poll_ready(task) || timeout == 0) return linux64_poll_resume(task);
+    task->state = TASK_POLL_WAIT;
+    return 0;
 }
 
 static enum file_kind kind_of(const struct file_handle *file) {

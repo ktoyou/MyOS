@@ -107,6 +107,16 @@ long linux64_socket_shutdown(struct linux64_socket *socket, i32 how) {
     return 0;
 }
 
+u16 linux64_socket_poll(const struct linux64_socket *socket) {
+    bool read_closed = socket->read_shutdown || !socket->peer->open;
+    u16 ready = socket->reset ? LINUX64_POLLERR : 0;
+    if (read_closed) ready |= LINUX64_POLLRDHUP;
+    if (read_closed && (socket->write_shutdown || !socket->peer->open)) ready |= LINUX64_POLLHUP;
+    if (socket->head || read_closed) ready |= LINUX64_POLL_READ;
+    if (socket->peer->queued < MAX_QUEUED) ready |= LINUX64_POLL_WRITE | LINUX64_POLLWRBAND;
+    return ready;
+}
+
 long linux64_socket_option(struct linux64_socket *socket, bool get, i32 level, i32 option,
                            uptr value, uptr length) {
     if (level != SOL_SOCKET || (option != SO_PASSCRED && !(get && option == SO_TYPE)))

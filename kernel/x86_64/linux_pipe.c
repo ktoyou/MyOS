@@ -39,6 +39,13 @@ bool linux64_pipe_ready(const struct linux64_pipe_io *io) {
     return !pipe->reader || PMM_PAGE_SIZE - pipe->used >= required;
 }
 
+u16 linux64_pipe_poll(const struct linux64_pipe *pipe, bool writer) {
+    if (writer)
+        return (pipe->used < PMM_PAGE_SIZE ? LINUX64_POLL_WRITE : 0) |
+               (pipe->reader ? 0 : LINUX64_POLLERR);
+    return (pipe->used ? LINUX64_POLL_READ : 0) | (pipe->writer ? 0 : LINUX64_POLLHUP);
+}
+
 static bool copy_pipe(struct linux64_pipe_io *io, uptr index, uptr count) {
     u8 *buffer = pmm64_pointer(io->pipe->physical);
     uptr first = PMM_PAGE_SIZE - index;
