@@ -40,6 +40,10 @@ static bool open_file(i32 fd) {
     return fd >= STDIO_COUNT && fd < FD_COUNT && handles[fd].used;
 }
 
+const struct linux64_file *linux64_get_file(i32 fd) {
+    return open_file(fd) ? &handles[fd].file : NULL;
+}
+
 static uptr user_store(uptr address, const void *data, uptr size) {
     const u8 *source = data;
     uptr copied = 0;
