@@ -266,14 +266,17 @@ def main():
     check_guest('bad-stack', (build / 'linux-bad-stack.elf').read_bytes(),
                 'Linux x86-64 invalid syscall return')
     symbols = subprocess.check_output(['nm', str(probe)], text=True)
-    entry = next(int(line.split()[0], 16) for line in symbols.splitlines()
-                 if line.endswith(' guard_probe'))
-    guard = bytearray(elf)
-    struct.pack_into('<Q', guard, 24, entry)
-    serial = check_guest('guard', guard, 'x86-64 exception halted', fault=True)
-    assert ('vector=0x000000000000000e error=0x0000000000000004' in serial and
-            'cr2=0x00007fffffefb000 cpl=3' in serial), serial
-    print('OVMF: malformed ELF, noncanonical stack and stack guard: PASS', flush=True)
+    for name, address, error in (('guard', 0x7fffff6ff000, 4),
+                                 ('stack_noaccess', 0x7fffffee0000, 4),
+                                 ('stack_nx', 0x7fffffedf000, 20)):
+        entry = next(int(line.split()[0], 16) for line in symbols.splitlines()
+                     if line.endswith(f' {name}_probe'))
+        faulting = bytearray(elf)
+        struct.pack_into('<Q', faulting, 24, entry)
+        serial = check_guest(name, faulting, 'x86-64 exception halted', fault=True)
+        assert (f'vector=0x000000000000000e error=0x{error:016x}' in serial and
+                f'cr2=0x{address:016x} cpl=3' in serial), serial
+    print('OVMF: lazy stack growth, guard, PROT_NONE and NX: PASS', flush=True)
     check_interpreter(build)
     check_files(build)
     check_mmap(build)

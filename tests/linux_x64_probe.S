@@ -8,6 +8,33 @@ _start:
     syscall
     ud2
 #endif
+    # Стек прыгает сразу через несколько страниц. DF и регистры нужны после #PF.
+    mov rbp,rsp
+    sub rsp,0x18000
+    mov ecx,0x12345678
+    mov r10d,0x23456789
+    mov r11d,0x3456789a
+    std
+    mov [rsp-16],r11
+    pushfq
+    pop rax
+    cld
+    test eax,0x400
+    jz fail
+    cmp ecx,0x12345678
+    jne fail
+    cmp r10d,0x23456789
+    jne fail
+    cmp r11d,0x3456789a
+    jne fail
+    cmp qword ptr [rsp-16],0x3456789a
+    jne fail
+    call stack_grow_return
+    cmp eax,42
+    jne fail
+    lea rsi,[rsp-0x4000]
+    call monotonic_ns
+    mov rsp,rbp
     test rsp,15
     jnz fail
     cmp qword ptr [rsp],1
@@ -451,9 +478,30 @@ monotonic_ns:
 
 .global guard_probe
 guard_probe:
-    mov rax,0x00007fffffefb000
+    mov rax,0x00007fffff6ff000
     mov al,[rax]
     ud2
+
+stack_grow_return:
+    mov eax,42
+    ret
+
+.global stack_noaccess_probe
+stack_noaccess_probe:
+    movabs rdi,0x00007fffffee0000
+    mov esi,4096
+    xor edx,edx
+    mov eax,10
+    syscall
+    test rax,rax
+    jne fail
+    mov al,[rdi]
+    ud2
+
+.global stack_nx_probe
+stack_nx_probe:
+    movabs rax,0x00007fffffedf000
+    jmp rax
 
 .section .rodata
 message: .ascii " Linux ELF64 syscall probe\n"

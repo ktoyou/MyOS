@@ -259,13 +259,15 @@ static bool valid_boot_map(const struct boot_info *boot, u32 entry_magic) {
     return true;
 }
 
-__attribute__((noreturn)) void kernel64_exception(u64 vector, u64 error, u64 rip,
-                                                 u64 cs, uptr frame, uptr interrupted_sp) {
-#ifdef X64_TEST_LINUX
-    if ((cs & 3u) == 3) linux64_task_exception(vector);
-#endif
+void kernel64_exception(u64 vector, u64 error, u64 rip, u64 cs, uptr frame, uptr interrupted_sp) {
     uptr cr2 = 0;
     if (vector == 14) __asm__ volatile("mov %%cr2,%0" : "=r"(cr2));
+#ifdef X64_TEST_LINUX
+    if ((cs & 3u) == 3) {
+        if (vector == 14 && paging64_stack_fault(cr2, error)) return;
+        linux64_task_exception(vector);
+    }
+#endif
     serial_puts("x86-64 exception vector=");
     serial_hex(vector);
     serial_puts(" error=");

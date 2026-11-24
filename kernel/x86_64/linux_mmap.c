@@ -4,6 +4,7 @@
 /* MAP_FIXED меняет только страницы отдельной области mmap. */
 #define MAP_START 0x1000000000ul
 #define MAP_END   0x00007fff00000000ul
+_Static_assert(MAP_END <= LINUX64_STACK_FLOOR - PMM_PAGE_SIZE, "Linux mmap and stack overlap");
 #define PAGE_MASK (PMM_PAGE_SIZE - 1ul)
 
 enum {
