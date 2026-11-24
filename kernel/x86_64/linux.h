@@ -20,6 +20,8 @@ const struct linux64_file *linux64_get_file(i32 fd);
 long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg3);
 long linux64_mmap(uptr address, uptr length, u32 protection, u32 flags, i32 fd, uptr offset);
 long linux64_mprotect(uptr address, uptr length, uptr protection);
+uptr linux64_random_bytes(void *buffer, uptr length);
+long linux64_getrandom(uptr address, uptr length, u32 flags);
 bool linux64_enable_syscall(void);
 void kernel64_serial_char(char ch);
 
