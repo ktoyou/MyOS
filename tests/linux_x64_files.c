@@ -600,7 +600,7 @@ static long check_high_proc_fd(void) {
 }
 
 static long check_limits(void) {
-    enum { DATA = 2, NOFILE = 7, NICE = 13 };
+    enum { DATA = 2, NPROC = 6, NOFILE = 7, NICE = 13 };
     struct {
         word before, values[2], after;
     } out = {0x31415926, {0, 0}, 0x27182818};
@@ -632,6 +632,20 @@ static long check_limits(void) {
             call(97, NOFILE, address, 0, 0) || out.values[0] != 256 || out.values[1] != 256)
             return 101;
     }
+    if (call(97, NPROC, address, 0, 0)) return 102;
+    word nproc_soft = out.values[0], nproc_hard = out.values[1];
+    if (system[0] == 'M' && (nproc_soft != 256 || nproc_hard != 256)) return 102;
+    out.values[0] = out.values[1] = 0;
+    if (call(302, 0, NPROC, 0, address) || call(302, 0, NPROC, 0, 0) ||
+        out.values[0] != nproc_soft || out.values[1] != nproc_hard) return 102;
+    volatile unsigned char *protected = buffer + 4096;
+    for (unsigned i = 0; i < 16; ++i) protected[i] = 0xa5;
+    if (call(10, (word)protected, 4096, 1, 0) ||
+        call(97, NPROC, (word)protected, 0, 0) != -14 ||
+        call(302, 0, NPROC, 0, (word)protected) != -14 ||
+        call(10, (word)protected, 4096, 3, 0)) return 103;
+    for (unsigned i = 0; i < 16; ++i)
+        if (protected[i] != 0xa5) return 103;
     return 0;
 }
 

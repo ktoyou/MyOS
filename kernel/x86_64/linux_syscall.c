@@ -9,7 +9,7 @@
 #define ARCH_SET_FS  0x1002
 #define ARCH_GET_FS  0x1003
 
-enum { RLIMIT_DATA = 2, RLIMIT_NOFILE = 7, RLIMIT_COUNT = 16 };
+enum { RLIMIT_DATA = 2, RLIMIT_NPROC = 6, RLIMIT_NOFILE = 7, RLIMIT_COUNT = 16 };
 
 extern void linux64_syscall_entry(void);
 
@@ -88,10 +88,13 @@ static long linux_rlimit(u32 resource, uptr new_address, uptr old_address, bool 
             *data_limit = new_limit;
         }
         break;
-    case RLIMIT_NOFILE:
+    case RLIMIT_NPROC:
+    case RLIMIT_NOFILE: {
         if (new_address) return -38;
-        old_limit = (struct linux64_rlimit){LINUX64_FD_COUNT, LINUX64_FD_COUNT};
+        const u64 capacity = resource == RLIMIT_NPROC ? LINUX64_TASK_COUNT : LINUX64_FD_COUNT;
+        old_limit = (struct linux64_rlimit){capacity, capacity};
         break;
+    }
     default:
         return resource >= RLIMIT_COUNT ? -22 : -38;
     }
