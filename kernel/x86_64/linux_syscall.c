@@ -86,6 +86,7 @@ long linux64_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2,
     if (number == 54 || number == 55)
         return linux64_sockopt(number == 55, (i32)arg0, (i32)arg1, (i32)arg2, arg3, arg4);
     if (number == 63) return linux_uname(arg0);
+    if (number == 96) return linux64_gettimeofday(arg0, arg1);
     const struct linux64_userns *ns = linux64_current->process->userns;
     if (number == 102 || number == 107) return linux64_visible_id(ns, false, LINUX64_UID);
     if (number == 104 || number == 108) return linux64_visible_id(ns, true, LINUX64_GID);

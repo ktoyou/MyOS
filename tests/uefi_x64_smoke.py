@@ -31,13 +31,15 @@ def test_disk(image, payload, kernel_end, live_root_header):
         disk.truncate(512 * (ROOT_START + root_sectors))
 
 
-def boot_x64(directory, name, payload, kernel_end, markers, *, live_root_header=None, cpu='max'):
+def boot_x64(directory, name, payload, kernel_end, markers, *, live_root_header=None, cpu='max', rtc=None):
     image = directory / 'disk.img'
     test_disk(image, payload, kernel_end, live_root_header)
     args = uefi_firmware(directory, name) + [
         '-drive', f'if=none,id=root,format=raw,file={image}',
         '-device', 'nvme,drive=root,serial=UEFIX64,bootindex=1',
     ]
+    if rtc is not None:
+        args += ['-rtc', rtc]
     vm = VM(name, args, binary='qemu-system-x86_64', cpu=cpu)
     vm.boot_timeout = 45
     try:
