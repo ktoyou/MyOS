@@ -15,6 +15,7 @@ __asm__(
 
 __attribute__((noreturn)) void exec_target(const word *stack, word rcx, word r11) {
     if (((word)stack & 15) || rcx || r11) finish(31);
+    if (sys(157, 39, 0, 0, 0, 0, 0) != 1) finish(46);
     const char *const *p = (void *)(stack + 1);
     if (stack[0] == 2) {
         if (!equal(p[0], "alternate-name") || !equal(p[1], "argument") || p[2] ||
@@ -54,6 +55,9 @@ __attribute__((noreturn)) void exec_target(const word *stack, word rcx, word r11
     long shared = sys(9, 0, 4096, 3, 1, 3, 0);
     if (shared < 0) finish(40);
     struct exec_sync *sync = (void *)shared;
+    unsigned permitted[2];
+    if (exec_permitted_caps(permitted) || (permitted[0] & ~sync->permitted[0]) ||
+        (permitted[1] & ~sync->permitted[1])) finish(47);
     sync->pid = sys(39, 0, 0, 0, 0, 0, 0);
     sync->ready = 1;
     while (!sync->ack) sys(24, 0, 0, 0, 0, 0, 0);

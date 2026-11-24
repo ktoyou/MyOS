@@ -4,7 +4,7 @@ static char stack[16384] __attribute__((aligned(16)));
 static const word tls = 0x123456789abcdef0ul;
 static volatile unsigned ready, clear_tid, leader_tid;
 static volatile int parent_tid, result;
-static long pid, pipe_write;
+static long pid, pipe_write, inherited_no_new_privs;
 
 extern long clone_thread(word stack_top, volatile int *ptid, volatile unsigned *ctid, const word *fs);
 
@@ -63,6 +63,8 @@ __attribute__((noreturn)) void worker(void) {
     __asm__ volatile("mov %%fs:0,%0" : "=r"(value));
     if (value != tls || simple(39, 0) != pid || simple(186, 0) != parent_tid || parent_tid == pid)
         result = 1;
+    if (simple(157, 39) != inherited_no_new_privs ||
+        call(157, 38, 1, 0, 0, 0, 0) || simple(157, 39) != 1) result = 15;
     const word action[4] = {1, 0, 0, 0};
     if (simple(3, pipe_write) || call(13, 10, (word)action, 0, 8, 0, 0) ||
         call(14, 2, (word)&mask, 0, 8, 0, 0)) result = 2;
@@ -91,6 +93,7 @@ static int check_thread(void) {
         if (error && error != -11) return 8;
     }
     if (result) return result;
+    if (simple(157, 39) != inherited_no_new_privs) return 16;
     char byte;
     word action[4], mask;
     if (simple(3, pipe_write) != -9 || call(0, ends[0], (word)&byte, 1, 0, 0, 0) ||
@@ -119,10 +122,18 @@ static int check_process_exit(int test_mode) {
 
 void _start(void) {
     pid = simple(39, 0);
+    inherited_no_new_privs = simple(157, 39);
+    char system[390];
+    if (inherited_no_new_privs < 0 || inherited_no_new_privs > 1 || simple(63, (word)system) ||
+        (system[0] == 'M' && inherited_no_new_privs)) finish(231, 17);
     for (int i = 0; i < 10; ++i) {
         int status = check_thread();
         if (status) finish(231, status);
     }
+    if (call(157, 38, 1, 0, 0, 0, 0)) finish(231, 18);
+    inherited_no_new_privs = 1;
+    int inherited = check_thread();
+    if (inherited) finish(231, inherited);
     for (int i = 1; i <= 2; ++i) {
         int status = check_process_exit(i);
         if (status) finish(231, status);

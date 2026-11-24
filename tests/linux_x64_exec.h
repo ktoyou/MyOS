@@ -10,6 +10,7 @@ typedef unsigned long word;
 struct exec_sync {
     volatile unsigned ready, ack;
     volatile long pid;
+    unsigned permitted[2];
 };
 
 static inline long sys(word number, word a0, word a1, word a2, word a3, word a4, word a5) {
@@ -20,6 +21,15 @@ static inline long sys(word number, word a0, word a1, word a2, word a3, word a4,
                      : "D"(a0), "S"(a1), "d"(a2), "r"(fourth), "r"(fifth), "r"(sixth)
                      : "rcx", "r11", "memory");
     return (long)number;
+}
+
+static inline long exec_permitted_caps(unsigned permitted[2]) {
+    unsigned header[] = {0x20080522, 0};
+    struct { unsigned effective, permitted, inheritable; } caps[2];
+    long status = sys(125, (word)header, (word)caps, 0, 0, 0, 0);
+    if (status) return status;
+    for (unsigned i = 0; i < 2; ++i) permitted[i] = caps[i].permitted;
+    return 0;
 }
 
 static inline __attribute__((noreturn)) void finish(long status) {
