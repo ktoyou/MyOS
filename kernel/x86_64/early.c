@@ -1,5 +1,8 @@
 #include "paging.h"
 #include "segments.h"
+#ifdef X64_TEST_LINUX
+#include "linux.h"
+#endif
 
 #define COM1              0x3f8
 #define UEFI_ENTRY_MAGIC  0x55454649u
@@ -49,7 +52,7 @@ static void serial_init(void) {
     outb(COM1 + 4, 0x0b);
 }
 
-static void serial_char(char ch) {
+void kernel64_serial_char(char ch) {
     for (unsigned spin = 0; spin < 100000; ++spin) {
         if (inb(COM1 + 5) & 0x20) {
             outb(COM1, (u8)ch);
@@ -60,8 +63,8 @@ static void serial_char(char ch) {
 
 static void serial_puts(const char *text) {
     while (*text) {
-        if (*text == '\n') serial_char('\r');
-        serial_char(*text++);
+        if (*text == '\n') kernel64_serial_char('\r');
+        kernel64_serial_char(*text++);
     }
 }
 
@@ -69,7 +72,7 @@ static void serial_hex(u64 value) {
     static const char digits[] = "0123456789abcdef";
     serial_puts("0x");
     for (int shift = 60; shift >= 0; shift -= 4)
-        serial_char(digits[(value >> shift) & 15u]);
+        kernel64_serial_char(digits[(value >> shift) & 15u]);
 }
 
 static __attribute__((noreturn)) void halt(void) {
@@ -181,7 +184,7 @@ __attribute__((noreturn)) void kernel64_exception(u64 vector, u64 error, u64 rip
         serial_hex(cr2);
     }
     serial_puts(" cpl=");
-    serial_char((char)('0' + (cs & 3u)));
+    kernel64_serial_char((char)('0' + (cs & 3u)));
     if ((cs & 3u) == 3) {
         serial_puts(" user_rsp=");
         serial_hex(interrupted_sp);
@@ -227,6 +230,15 @@ __attribute__((noreturn)) void kernel64_main(const struct boot_info *boot, u32 e
 #endif
 #ifdef X64_TEST_RING3
     if (!ring3_check(X64_TEST_RING3)) serial_puts("x86-64 ring3 FAIL\n");
+#endif
+#ifdef X64_TEST_LINUX
+    /* Тест передаёт отдельный ELF-файл в начале Live RAM-диска. */
+    if (boot->root_bytes >= 16) {
+        const u64 *fixture = pmm64_pointer(boot->root_phys);
+        if (fixture[0] == 0x3436584c534f594dull && fixture[1] <= boot->root_bytes - 16)
+            linux64_run(fixture + 2, fixture[1]);
+    }
+    serial_puts("Linux x86-64 ELF rejected\n");
 #endif
 #endif
     halt();

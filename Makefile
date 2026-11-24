@@ -1628,7 +1628,21 @@ $(X64_PAGING_TESTS:.bin=.elf): $(X64BUILD)/kernel-paging-%.elf: $(X64_CORE) $(X6
 	$(LD) -m elf_x86_64 -T kernel/x86_64/linker.ld -nostdlib $(filter %.o,$^) -o $@
 $(X64_RING3_TESTS:.bin=.elf): $(X64BUILD)/kernel-ring3-%.elf: $(X64_CORE) $(X64BUILD)/early-ring3-%.o $(X64BUILD)/ring3-check.o $(X64BUILD)/ring3-code.o kernel/x86_64/linker.ld
 	$(LD) -m elf_x86_64 -T kernel/x86_64/linker.ld -nostdlib $(filter %.o,$^) -o $@
-$(X64BUILD)/kernel.bin $(X64BUILD)/kernel-6.bin $(X64BUILD)/kernel-13.bin $(X64BUILD)/kernel-pmm.bin $(X64_PAGING_TESTS) $(X64_RING3_TESTS): %.bin: %.elf
+$(X64BUILD)/early-linux.o: kernel/x86_64/early.c kernel/x86_64/linux.h $(X64_HEADERS) | $(X64BUILD)
+	$(CC) $(X64CFLAGS) -DX64_TEST_LINUX -c $< -o $@
+$(X64BUILD)/linux_elf.o $(X64BUILD)/linux_syscall.o: $(X64BUILD)/%.o: kernel/x86_64/%.c kernel/x86_64/linux.h $(X64_HEADERS) | $(X64BUILD)
+	$(CC) $(X64CFLAGS) -c $< -o $@
+$(X64BUILD)/linux-entry.o: kernel/x86_64/linux_syscall.asm | $(X64BUILD)
+	$(NASM) -f elf64 $< -o $@
+$(X64BUILD)/kernel-linux.elf: $(X64_CORE) $(X64BUILD)/early-linux.o $(X64BUILD)/linux_elf.o $(X64BUILD)/linux_syscall.o $(X64BUILD)/linux-entry.o kernel/x86_64/linker.ld
+	$(LD) -m elf_x86_64 -T kernel/x86_64/linker.ld -nostdlib $(filter %.o,$^) -o $@
+$(X64BUILD)/linux-probe.o: tests/linux_x64_probe.S | $(X64BUILD)
+	$(CC) -m64 -c $< -o $@
+$(X64BUILD)/linux-bad-stack.o: tests/linux_x64_probe.S | $(X64BUILD)
+	$(CC) -m64 -DBAD_STACK -c $< -o $@
+$(X64BUILD)/linux-probe.elf $(X64BUILD)/linux-bad-stack.elf: %.elf: %.o
+	$(LD) -m elf_x86_64 -static -no-pie $< -o $@
+$(X64BUILD)/kernel.bin $(X64BUILD)/kernel-6.bin $(X64BUILD)/kernel-13.bin $(X64BUILD)/kernel-pmm.bin $(X64BUILD)/kernel-linux.bin $(X64_PAGING_TESTS) $(X64_RING3_TESTS): %.bin: %.elf
 	$(OBJCOPY) -O binary $< $@
 
 .PHONY: kernel-x64 kernel-x64-smoke kernel-x64-pmm-smoke kernel-x64-paging-smoke kernel-x64-ring3-smoke
@@ -1641,6 +1655,9 @@ kernel-x64-paging-smoke: $(X64_PAGING_TESTS)
 	python3 tests/kernel_x64_smoke.py --paging
 kernel-x64-ring3-smoke: $(X64_RING3_TESTS)
 	python3 tests/kernel_x64_smoke.py --ring3
+.PHONY: kernel-x64-linux-smoke
+kernel-x64-linux-smoke: $(X64BUILD)/kernel-linux.bin $(X64BUILD)/linux-probe.elf $(X64BUILD)/linux-bad-stack.elf
+	python3 tests/kernel_x64_linux_smoke.py
 
 uefi-smoke: $(HWBUILD)/kernel.bin $(BUILD)/myfs $(BUILD)/ld.so $(BUILD)/user/libc.so $(addprefix $(BUILD)/user/,sh cat stat poweroff sync)
 	python3 tests/uefi_smoke.py
