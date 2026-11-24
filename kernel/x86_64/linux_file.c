@@ -5,9 +5,11 @@
 
 enum {
     EPERM = 1, ENOENT = 2, EIO = 5, EBADF = 9, EAGAIN = 11, ENOMEM = 12, EACCES = 13, EFAULT = 14,
-    EBUSY = 16, EEXIST = 17, ENOTDIR = 20, EISDIR = 21, EINVAL = 22, EMFILE = 24, EFBIG = 27, EROFS = 30,
+    EBUSY = 16, EEXIST = 17, ENOTDIR = 20, EISDIR = 21, EINVAL = 22, ENFILE = 23, EMFILE = 24,
+    EFBIG = 27, EROFS = 30,
     ENODEV = 19, ENXIO = 6, ESPIPE = 29, ENAMETOOLONG = 36, ENOSYS = 38, ELOOP = 40, ENOTSOCK = 88,
     EOPNOTSUPP = 95, EADDRINUSE = 98, ECONNREFUSED = 111, AF_UNIX = 1, MSG_DONTWAIT = 0x40,
+    SOCK_TYPE_MASK = 0xf,
     AT_FDCWD = -100, AT_SYMLINK_NOFOLLOW = 0x100, AT_REMOVEDIR = 0x200, AT_NO_AUTOMOUNT = 0x800,
     AT_EMPTY_PATH = 0x1000,
     O_ACCMODE = 3, O_WRONLY = 1, O_RDWR = 2, O_CREAT = 0x40, O_EXCL = 0x80,
@@ -24,7 +26,7 @@ enum {
     EPOLL_ONESHOT = 1u << 30, EPOLL_ET = 1u << 31,
     MEMFD_NAME_LIMIT = 249, MEMFD_CHUNKS = 128,
     FRAMES_PER_CHUNK = PMM_PAGE_SIZE / sizeof(uptr),
-    FD_COUNT = LINUX64_FD_COUNT, OPEN_FILE_COUNT = LINUX64_PROCESS_COUNT * FD_COUNT,
+    FD_COUNT = LINUX64_FD_COUNT, OPEN_FILE_COUNT = LINUX64_OPEN_FILE_COUNT,
 };
 
 enum file_kind {
@@ -766,7 +768,7 @@ static long new_handle(const struct linux64_file *file, struct memfd *memfd, u32
         linux64_current->process->fds[fd] = (struct linux64_fd_slot){description, (flags & O_CLOEXEC) != 0};
         return fd;
     }
-    return -EMFILE;
+    return -ENFILE;
 }
 
 static bool copy_fd_pair(uptr address, i32 left, i32 right) {
@@ -888,8 +890,11 @@ static long linux_socket(i32 domain, u32 type, i32 protocol) {
 }
 
 static long linux_socketpair(i32 domain, u32 type, i32 protocol, uptr address) {
+    if (type & ~(SOCK_TYPE_MASK | O_CLOEXEC | O_NONBLOCK)) return -EINVAL;
+    unsigned first = free_fd(0);
+    if (first == FD_COUNT || free_fd(first + 1) == FD_COUNT) return -EMFILE;
     struct linux64_socket *ends[2];
-    long error = linux64_socket_pair(domain, type, protocol, ends);
+    long error = linux64_socket_pair(domain, type & SOCK_TYPE_MASK, protocol, ends);
     if (error) return error;
     i32 fds[2];
     for (unsigned i = 0; i < 2; ++i) {
@@ -1035,6 +1040,7 @@ static long memfd_create(uptr name_address, u32 flags) {
     char name[MEMFD_NAME_LIMIT + 1];
     long result = linux64_user_string(name_address, name, sizeof(name));
     if (result < 0) return result == -ENAMETOOLONG ? -EINVAL : result;
+    if (free_fd(0) == FD_COUNT) return -EMFILE;
     for (unsigned i = 0; i < OPEN_FILE_COUNT; ++i) {
         struct memfd *memfd = &memfds[i];
         if (memfd->handles) continue;
@@ -1046,7 +1052,7 @@ static long memfd_create(uptr name_address, u32 flags) {
                        flags & MFD_ALLOW_SEALING ? 0 : F_SEAL_SEAL;
         return result;
     }
-    return -EMFILE;
+    return -ENFILE;
 }
 
 static bool memfd_grow(struct memfd *memfd, uptr first, uptr end) {

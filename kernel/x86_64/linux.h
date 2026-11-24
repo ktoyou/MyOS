@@ -4,7 +4,9 @@
 #include "../types.h"
 
 #define LINUX64_PATH_LIMIT 4096u
-#define LINUX64_FD_COUNT 32u
+#define LINUX64_FD_COUNT 256u
+/* Глобальные пулы не растут вместе с таблицей отдельного процесса. */
+#define LINUX64_OPEN_FILE_COUNT 512u
 #define LINUX64_PID 1
 #define LINUX64_UID 1000
 #define LINUX64_GID 1000

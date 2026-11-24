@@ -10,7 +10,7 @@ struct linux64_pipe {
     bool reader, writer;
 };
 
-static struct linux64_pipe pipes[LINUX64_PROCESS_COUNT * LINUX64_FD_COUNT];
+static struct linux64_pipe pipes[LINUX64_OPEN_FILE_COUNT];
 
 struct linux64_pipe *linux64_pipe_create(void) {
     for (unsigned i = 0; i < sizeof(pipes) / sizeof(*pipes); ++i) {

@@ -564,6 +564,41 @@ static long check_proc_fds(void) {
     return 0;
 }
 
+static long check_high_proc_fd(void) {
+    const long high = 255;
+    long dir = call(2, (word)"/proc/self/fd", 0x10000, 0, 0);
+    long device = call(2, (word)"/dev/null", 0, 0, 0);
+    if (dir < 3 || device < 3 || call(72, device, 1030, high, 0) != high ||
+        call(72, high, 1, 0, 0) != 1 || call(3, device, 0, 0, 0)) return 94;
+    long child = call(57, 0, 0, 0, 0);
+    if (!child) {
+        long error = call(72, high, 1, 0, 0) != 1 || call(3, high, 0, 0, 0);
+        call(60, error, 0, 0, 0);
+        __builtin_trap();
+    }
+    int status;
+    if (child < 0 || call(61, child, (word)&status, 0, 0) != child || status ||
+        call(72, high, 1, 0, 0) != 1) return 94;
+    word info[18];
+    if (call(262, dir, (word)"255", (word)info, 0) || (info[3] & 0170000) != 0020000 ||
+        info[5] != 0x103 || call(262, dir, (word)"256", (word)info, 0) != -2) return 95;
+    long size = call(217, dir, (word)buffer, 512, 0);
+    word inode = 0;
+    for (long offset = 0; offset < size;) {
+        const struct proc_dirent *entry = (const void *)(buffer + offset);
+        if (size - offset < 24 || entry->length < 24 || entry->length > size - offset) return 96;
+        if (entry->name[0] == '2' && entry->name[1] == '5' && entry->name[2] == '5' && !entry->name[3]) {
+            if (entry->type != 10 || inode) return 96;
+            inode = entry->inode;
+        }
+        offset += entry->length;
+    }
+    if (!inode || call(262, dir, (word)"255", (word)info, 0x100) || info[1] != inode ||
+        call(3, high, 0, 0, 0) || call(262, dir, (word)"255", (word)info, 0) != -2 ||
+        call(3, dir, 0, 0, 0)) return 97;
+    return 0;
+}
+
 __attribute__((noreturn)) void _start(void) {
     long status = check_files();
     if (!status) status = check_signals();
@@ -576,6 +611,7 @@ __attribute__((noreturn)) void _start(void) {
     if (!status) status = check_dup();
     if (!status) status = check_directories();
     if (!status) status = check_proc_fds();
+    if (!status) status = check_high_proc_fd();
     if (!status) status = check_realtime();
     if (!status) {
         static const char message[] = "Linux ELF64 files probe\n";
