@@ -73,7 +73,6 @@ void linux64_socket_close(struct linux64_socket *socket);
 long linux64_socket_shutdown(struct linux64_socket *socket, i32 how);
 long linux64_socket_option(struct linux64_socket *socket, bool get, i32 level, i32 option,
                            uptr value, uptr length);
-long linux64_socket_message(struct linux64_socket *socket, bool receive, uptr message, u32 flags);
 long linux64_socket_io(struct linux64_socket *socket, bool receive, uptr buffer, uptr length);
 u16 linux64_socket_poll(const struct linux64_socket *socket);
 long linux64_mmap(uptr address, uptr length, u32 protection, u32 flags, i32 fd, uptr offset);
