@@ -47,6 +47,22 @@ static long check_futex(word file_address) {
     return 0;
 }
 
+static long check_stack(void) {
+    const word size = 0x9000, stack_flags = 0x20022;
+    long base = mmap(0, size, 3, stack_flags, -1, 0);
+    if (base < 0 || (base & 0xfff)) return 62;
+    volatile unsigned char *bytes = (void *)base;
+    if (bytes[0] || bytes[size - 1]) return 63;
+    bytes[0] = 0x31;
+    bytes[size - 1] = 0x52;
+    if (bytes[0] != 0x31 || bytes[size - 1] != 0x52 ||
+        mmap(base, size, 3, stack_flags | 0x100000, -1, 0) != -17) return 64;
+    if (munmap(base, size) ||
+        mmap(base, size, 3, stack_flags | 0x100000, -1, 0) != base) return 65;
+    if (bytes[0] || bytes[size - 1] || munmap(base, size)) return 66;
+    return 0;
+}
+
 static long check_sparse(void) {
     const word size = 0x800000000ul;
     const word hint = 0x30000000000ul;
@@ -229,6 +245,7 @@ __attribute__((noreturn)) void _start(void) {
     if (!status) status = check_shared();
     if (!status) status = check_memfd();
     if (!status) status = check_memfd_resize();
+    if (!status) status = check_stack();
     if (!status) status = check_sparse();
     if (!status) {
         static const char message[] = "Linux ELF64 mmap and mprotect probe\n";
