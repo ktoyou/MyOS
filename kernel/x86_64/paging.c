@@ -5,6 +5,7 @@
 #define USER          (1ull << 2)
 #define MMAP_OWNED    (1ull << 9)
 #define MMAP_PENDING  (1ull << 10)
+#define FILE_BACKED   (1ull << 11)
 #define NO_EXECUTE    (1ull << 63)
 #define ADDRESS_MASK  0x000ffffffffff000ull
 #define CR0_WP        (1ul << 16)
@@ -304,7 +305,8 @@ bool paging64_map_private(uptr start, uptr end, const u8 *source, uptr file_byte
             for (uptr i = 0; i < count; ++i) target[i] = source[offset + i];
         }
         if (!writable) set_alias_write(root, physical, false);
-        *leaf = physical | MMAP_OWNED | USER | (accessible ? PRESENT : 0) |
+        *leaf = physical | MMAP_OWNED | USER | (anonymous ? 0 : FILE_BACKED) |
+                (accessible ? PRESENT : 0) |
                 (writable ? WRITE : 0) | (executable ? 0 : NO_EXECUTE);
         invalidate(address);
     }
@@ -343,7 +345,7 @@ static void *map_user_page(uptr address, const u8 *source, uptr offset, uptr len
         *alias &= ~WRITE;
         invalidate((uptr)direct);
     }
-    if (!map_page(root, address, page, USER | (writable ? WRITE : 0) |
+    if (!map_page(root, address, page, USER | (length ? FILE_BACKED : 0) | (writable ? WRITE : 0) |
                   (executable ? 0 : NO_EXECUTE))) {
         if (alias) {
             *alias |= WRITE;
@@ -384,6 +386,11 @@ static u8 *user_pointer(uptr address, u64 required) {
 
 const u8 *paging64_user_read(uptr address) {
     return user_pointer(address, PRESENT | USER);
+}
+
+bool paging64_shared_futex_address(uptr address) {
+    if (!paging64_user_read(address)) return false;
+    return (*find_leaf(active_root(), address) & (WRITE | FILE_BACKED)) != 0;
 }
 
 uptr paging64_copy_to_user(uptr address, const void *source, uptr length) {

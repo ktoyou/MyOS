@@ -133,7 +133,7 @@ def check_mmap(build):
     sparse_oom = bytearray(elf)
     struct.pack_into('<Q', sparse_oom, 24, symbols['mprotect_sparse_oom'])
     check_guest('mprotect-sparse-oom', sparse_oom, 'Linux x86-64 exit status=0x00', files=files)
-    print('OVMF: private and sparse mmap, mprotect, rollback, RELRO, W^X and past EOF: PASS', flush=True)
+    print('OVMF: mmap, mprotect, RELRO and Linux futex wake with no waiters: PASS', flush=True)
 
 
 def main():
