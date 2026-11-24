@@ -89,6 +89,7 @@ aux_done:
     jne fail
 
     call check_fs
+    call check_getrandom
 
     mov eax,1
     mov edi,7
@@ -229,6 +230,79 @@ check_fs:
 fs_fail:
     mov eax,60
     mov edi,13
+    syscall
+    ud2
+
+check_getrandom:
+    mov eax,318
+    xor edi,edi
+    xor esi,esi
+    xor edx,edx
+    syscall
+    test rax,rax
+    jne getrandom_fail
+    mov eax,318
+    mov edx,6
+    syscall
+    cmp rax,-22
+    jne getrandom_fail
+    mov eax,318
+    mov edx,8
+    syscall
+    cmp rax,-22
+    jne getrandom_fail
+    mov eax,318
+    mov rdi,0xffff800000000000
+    xor edx,edx
+    syscall
+    cmp rax,-14
+    jne getrandom_fail
+    mov eax,318
+    lea rdi,[rip+message]
+    mov esi,1
+    syscall
+    cmp rax,-14
+    jne getrandom_fail
+
+    mov eax,318
+    lea rdi,[rip+buffer+4093]
+    mov byte ptr [rdi-1],0x5a
+    mov byte ptr [rdi+257],0xa5
+    mov esi,257
+    mov rdx,0x100000001
+    syscall
+    cmp rax,257
+    jne getrandom_fail
+    cmp byte ptr [rdi-1],0x5a
+    jne getrandom_fail
+    cmp byte ptr [rdi+257],0xa5
+    jne getrandom_fail
+
+    mov eax,318
+    lea rdi,[rip+buffer+32]
+    mov esi,16
+    mov edx,4
+    syscall
+    cmp rax,16
+    jne getrandom_fail
+    mov r8,[rdi]
+    mov r9,[rdi+8]
+    xor r8,[rip+buffer+4093]
+    xor r9,[rip+buffer+4101]
+    or r8,r9
+    jz getrandom_fail
+
+    mov eax,318
+    lea rdi,[rip+buffer+8128]
+    mov esi,128
+    mov edx,2
+    syscall
+    cmp rax,64
+    jne getrandom_fail
+    ret
+getrandom_fail:
+    mov eax,60
+    mov edi,14
     syscall
     ud2
 

@@ -164,23 +164,6 @@ static bool map_image(const struct elf_image *elf) {
     return true;
 }
 
-static bool startup_entropy(u64 entropy[2]) {
-    u32 eax = 0, ebx, ecx, edx;
-    __asm__ volatile("cpuid" : "+a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx));
-    if (eax < 1) return false;
-    eax = 1;
-    __asm__ volatile("cpuid" : "+a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx));
-    if (!(ecx & (1u << 30))) return false;
-    for (unsigned i = 0; i < 2; ++i) {
-        bool ready = false;
-        for (unsigned attempt = 0; attempt < 10 && !ready; ++attempt)
-            __asm__ volatile("rdrand %0" : "=r"(entropy[i]), "=@ccc"(ready));
-        if (!ready) return false;
-    }
-    /* Некоторые неисправные реализации возвращают одну константу при CF=1. */
-    return entropy[0] != entropy[1];
-}
-
 static uptr make_stack(const struct elf_image *main, u64 interp_bias, const u64 entropy[2]) {
     u8 *top_page = NULL;
     for (uptr page = STACK_BOTTOM; page < STACK_TOP; page += PMM_PAGE_SIZE) {
@@ -217,7 +200,7 @@ bool linux64_run(const void *image, uptr size, const struct linux64_file_source 
             (main.first < interpreter.end && interpreter.first < main.end)) return false;
     }
     u64 entropy[2];
-    if (!startup_entropy(entropy)) {
+    if (linux64_random_bytes(entropy, sizeof(entropy)) != sizeof(entropy)) {
         static const char message[] = "Linux x86-64 AT_RANDOM entropy unavailable\n";
         for (unsigned i = 0; message[i]; ++i) kernel64_serial_char(message[i]);
         return false;
