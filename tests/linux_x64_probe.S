@@ -84,11 +84,20 @@ compare_pagesize:
     or r12d,2
 entry:
     cmp eax,9
-    jne random
+    jne secure
     lea rcx,[rip+_start]
     cmp rdx,rcx
     jne fail
     or r12d,4
+    jmp aux
+secure:
+    cmp eax,23
+    jne random
+    test rdx,rdx
+    jnz fail
+    test r12d,128
+    jnz fail
+    or r12d,128
     jmp aux
 random:
     cmp eax,25
@@ -105,7 +114,7 @@ execfn:
     or r12d,64
     jmp aux
 aux_done:
-    cmp r12d,127
+    cmp r12d,255
     jne fail
     cmp r13,rbx
     jb fail
