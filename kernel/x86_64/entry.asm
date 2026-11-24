@@ -31,8 +31,39 @@ exception_entry:
     mov rdi,[rsp]
     mov rsi,[rsp+8]
     mov rdx,[rsp+16]
+    mov rcx,[rsp+24]
+    mov r8,rsp
+    mov r9,[rsp+40]
     and rsp,-16
     call kernel64_exception
+
+global segments64_enter_user
+segments64_enter_user:
+    ; SS:RSP и CS:RIP берутся из кадра IRETQ, IOPL и IF сброшены.
+    push qword 0x1b
+    push rsi
+    push qword 2
+    push qword 0x23
+    push rdi
+    mov ax,0x1b
+    mov ds,ax
+    mov es,ax
+    xor eax,eax
+    xor ebx,ebx
+    xor ecx,ecx
+    xor edx,edx
+    xor ebp,ebp
+    xor esi,esi
+    xor edi,edi
+    xor r8d,r8d
+    xor r9d,r9d
+    xor r10d,r10d
+    xor r11d,r11d
+    xor r12d,r12d
+    xor r13d,r13d
+    xor r14d,r14d
+    xor r15d,r15d
+    iretq
 
 section .rodata
 global kernel64_vectors
