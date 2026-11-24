@@ -165,6 +165,47 @@ static long check_ids(word syscall, word get_real, word get_effective) {
     return 0;
 }
 
+static long check_null(void) {
+    static const char dev[] = "/dev/null";
+    const word bad = 0xffff800000000000ul;
+    if (call(21, (word)dev, 6, 0, 0) || call(21, (word)dev, 1, 0, 0) != -13 ||
+        call(2, (word)"/dev/null/", 0, 0, 0) != -20 ||
+        call(2, (word)"/dev/null/child", 0, 0, 0) != -20 ||
+        call(2, (word)dev, 0x10000, 0, 0) != -20 ||
+        call(2, (word)dev, 0xc0, 0600, 0) != -17) return 35;
+    long rd = call(257, (unsigned)-100, (word)dev, 0x80000, 0);
+    long wr = call(2, (word)dev, 1, 0, 0);
+    if (rd < 3 || wr < 3 || call(72, rd, 1, 0, 0) != 1 ||
+        call(0, rd, 0, 8, 0) || call(0, rd, bad, 8, 0) != -14 ||
+        call(1, rd, 0, 8, 0) != -9 || call(0, wr, 0, 8, 0) != -9 ||
+        call(1, wr, 0, 8, 0) != 8 || call(1, wr, bad, 8, 0) != -14) return 36;
+    if (call(17, rd, 0, 8, 12) || call(18, wr, 0, 8, 12) != 8 ||
+        call(17, rd, 0, 8, -1) != -22 || call(18, wr, 0, 8, -1) != -22 ||
+        call(8, rd, -12, 4, 0) || call(8, wr, 12, 1, 0) ||
+        call(8, rd, 0, 5, 0) != -22) return 37;
+    struct {
+        word dev, inode, links;
+        unsigned mode, uid, gid, padding;
+        word rdev, size, blksize, blocks, tail[9];
+    } stat, opened;
+    if (call(4, (word)dev, (word)&stat, 0, 0) || call(5, rd, (word)&opened, 0, 0) ||
+        (stat.mode & 0170777) != 0020666 || stat.rdev != 0x103 || stat.size || stat.blocks ||
+        opened.dev != stat.dev || opened.inode != stat.inode || opened.rdev != stat.rdev)
+        return 38;
+    struct pollfd { int fd; unsigned short events, revents; };
+    struct pollfd fds[2] = {{(int)rd, 5, 0}, {(int)wr, 5, 0}};
+    if (call(7, (word)fds, 2, 0, 0) != 2 || fds[0].revents != 5 || fds[1].revents != 5) return 39;
+    int status;
+    long child = call(57, 0, 0, 0, 0);
+    if (!child) {
+        call(60, call(0, rd, 0, 1, 0) || call(1, wr, 0, 1, 0) != 1, 0, 0, 0);
+        __builtin_trap();
+    }
+    if (child < 0 || call(61, child, (word)&status, 0, 0) != child || status ||
+        call(3, rd, 0, 0, 0) || call(3, wr, 0, 0, 0)) return 40;
+    return 0;
+}
+
 __attribute__((noreturn)) void _start(void) {
     long status = check_files();
     if (!status) status = check_signals();
@@ -172,6 +213,7 @@ __attribute__((noreturn)) void _start(void) {
     if (!status) status = check_uname();
     if (!status) status = check_ids(118, 102, 107);
     if (!status) status = check_ids(120, 104, 108);
+    if (!status) status = check_null();
     if (!status) {
         static const char message[] = "Linux ELF64 files probe\n";
         if (call(1, 1, (word)message, sizeof(message) - 1, 0) != sizeof(message) - 1)
