@@ -1580,9 +1580,11 @@ nvme-installer-smoke: $(HWBUILD)/kernel.bin $(BUILD)/myfs $(BUILD)/ld.so $(BUILD
 	python3 tests/disk_install_smoke.py --storage nvme
 nvme-boot-smoke: $(HWBUILD)/kernel.bin $(BUILD)/myfs $(BUILD)/ld.so $(BUILD)/user/libc.so $(addprefix $(BUILD)/user/,sh cat stat poweroff sync)
 	python3 tests/nvme_boot_smoke.py
-.PHONY: uefi-loader uefi-smoke uefi-installer-smoke
+.PHONY: uefi-loader uefi-smoke uefi-installer-smoke uefi-x64-smoke
 uefi-loader:
 	python3 tools/make_uefi.py
+uefi-x64-smoke:
+	python3 tests/uefi_x64_smoke.py
 uefi-smoke: $(HWBUILD)/kernel.bin $(BUILD)/myfs $(BUILD)/ld.so $(BUILD)/user/libc.so $(addprefix $(BUILD)/user/,sh cat stat poweroff sync)
 	python3 tests/uefi_smoke.py
 uefi-installer-smoke: $(HWBUILD)/kernel.bin $(BUILD)/myfs $(BUILD)/ld.so $(BUILD)/user/libc.so $(BUILD)/user/installercheck $(addprefix $(BUILD)/user/,sh setup cat mkdir sync stat poweroff)

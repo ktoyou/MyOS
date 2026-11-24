@@ -1,6 +1,6 @@
 /* x64 UEFI application. Firmware services are never called by the i386 kernel.
  * Own all pages before ExitBootServices, retry its map key without doing I/O,
- * then enter the existing protected-mode kernel using private identity tables.
+ * then enter the selected kernel using private identity tables.
  */
 #include <efi.h>
 #include <efilib.h>
@@ -17,7 +17,7 @@ struct boot_info {
 };
 struct config {
     char magic[8];u32 version,mode,disk_id,root_lba,root_sectors;
-    u32 kernel_bytes,kernel_crc,kernel_end,width,height;
+    u32 kernel_bytes,kernel_crc,kernel_end,width,height,kernel_abi;
 };
 struct region {UINT64 base,length;u32 type,attributes;} __attribute__((packed));
 _Static_assert(sizeof(struct boot_info)==100,"boot ABI v5");
@@ -128,11 +128,13 @@ EFI_STATUS efi_main(EFI_HANDLE image,EFI_SYSTEM_TABLE *st) {
     boot_root=root;
     u8 config_sector[512];struct config *cfg=(void *)config_sector;
     if(EFI_ERROR(read_file(root,L"\\EFI\\MYOS\\BOOT.CFG",config_sector,512)) ||
-       !equal(cfg->magic,"MYOSEFI1",8) || cfg->version!=1 || (cfg->mode!=1 && cfg->mode!=2) ||
+       !equal(cfg->magic,"MYOSEFI1",8) ||
+       (cfg->version!=1 && (cfg->version!=2 || cfg->kernel_abi!=1)) || (cfg->mode!=1 && cfg->mode!=2) ||
        !cfg->disk_id || cfg->root_lba<2048 || cfg->root_sectors<131072 || cfg->root_sectors>16777216 ||
        !cfg->kernel_bytes || cfg->kernel_bytes>0x400000 || cfg->kernel_end<0x100000+cfg->kernel_bytes || cfg->kernel_end>0x1000000) {
         return fail(EFI_LOAD_ERROR,"UEFI: invalid boot configuration\r\n");
     }
+    BOOLEAN kernel64=cfg->version==2;
     EFI_PHYSICAL_ADDRESS arena=0x3fffffff;
     if(EFI_ERROR(allocate(32,&arena,FALSE)))return fail(EFI_OUT_OF_RESOURCES,"UEFI: no bootstrap memory\r\n");
     memset((void *)(UINTN)arena,0,32*4096);
@@ -149,6 +151,7 @@ EFI_STATUS efi_main(EFI_HANDLE image,EFI_SYSTEM_TABLE *st) {
        EFI_ERROR(read_file(root,L"\\EFI\\MYOS\\FONT.BIN",(void *)(UINTN)boot->font_phys,4096))) {
         return fail(EFI_LOAD_ERROR,"UEFI: kernel/font load or allocation failed\r\n");
     }
+    if(kernel64)memset((void *)(UINTN)(kernel+cfg->kernel_bytes),0,cfg->kernel_end-kernel-cfg->kernel_bytes);
     EFI_BLOCK_IO *disk=boot_disk(loaded->DeviceHandle,cfg,(void *)(UINTN)(arena+45056));
     if(!disk)return fail(EFI_NOT_FOUND,"UEFI: boot disk identity mismatch\r\n");
     if(cfg->mode==1) {
@@ -179,6 +182,7 @@ EFI_STATUS efi_main(EFI_HANDLE image,EFI_SYSTEM_TABLE *st) {
     *(UINT64 *)(trampoline+8)=arena+16384;*(u32 *)(trampoline+16)=arena;
     *(u32 *)(trampoline+20)=arena+32*4096;
     *(UINT64 *)(trampoline+24)=arena+12288+get32(uefi_trampoline+sizeof(uefi_trampoline)-8);
+    *(u32 *)(trampoline+36)=kernel64;
     *(UINT64 *)(trampoline+50)=arena+12288+get32(uefi_trampoline+sizeof(uefi_trampoline)-4);
     UINT64 *pml4=(void *)(UINTN)(arena+16384),*pdpt=(void *)(UINTN)(arena+20480);
     pml4[0]=(arena+20480)|3;
@@ -189,7 +193,8 @@ EFI_STATUS efi_main(EFI_HANDLE image,EFI_SYSTEM_TABLE *st) {
     UINTN capacity=65536;void *map;
     if(EFI_ERROR(services->AllocatePool(EfiLoaderData,capacity,&map)))return fail(EFI_OUT_OF_RESOURCES,"UEFI: no memory map buffer\r\n");
     map_buffer=map;
-    message("UEFI: leaving boot services, entering i386 kernel\r\n");
+    message(kernel64?"UEFI: leaving boot services, entering x86-64 kernel\r\n":
+                     "UEFI: leaving boot services, entering i386 kernel\r\n");
     for(unsigned attempt=0;attempt<4;attempt++) {
         UINTN size=capacity,key,stride;u32 version;
         EFI_STATUS r=services->GetMemoryMap(&size,map,&key,&stride,&version);
