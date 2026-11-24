@@ -281,6 +281,7 @@ struct regs *schedule(struct regs *r) {
     if (next != current) {
         if (current->user && current->state != TASK_ZOMBIE) fpu_save(current);
         if (next->user) fpu_restore(next);
+        gdt_set_user_tls(next->tls_base);
     }
     current = next;
     slice = next->cpu_idle?TIME_SLICE:next->sched_left;
@@ -462,12 +463,22 @@ struct task *task_alloc_user(const char *name, u32 page_dir, u32 entry, u32 user
 
 /* ---------------------------------------------------------------- завершение */
 
-int task_thread_create(u32 entry,u32 fn,u32 arg,u32 sp,u32 base,u32 size) {
+int task_thread_create(u32 entry,u32 fn,u32 arg,u32 base,u32 size) {
     struct task *p=task_process(current);
     if (p->state == TASK_ZOMBIE || p->kill_pending) return -EINTR;
     if(task_stack_busy(p->page_dir,base,base+size))return -EBUSY;
     u32 guard=(base+PAGE_SIZE-1)&~(PAGE_SIZE-1),frame,page_flags;
     if(guard+2*PAGE_SIZE>base+size || !vmm_lookup(p->page_dir,guard,&frame,&page_flags))return -EINVAL;
+    u32 stack_top = base + size;
+    u32 tls_base = 0;
+    if (p->tls_size) {
+        /* TLS лежит в верхней части выделенного пользователем стека потока. */
+        tls_base = (stack_top - USER_TLS_TCB_SIZE) & ~(p->tls_align - 1);
+        if (tls_base < guard || tls_base - guard < p->tls_size) return -EINVAL;
+        stack_top = tls_base - p->tls_size;
+        if (stack_top < guard + 2 * PAGE_SIZE + 20) return -EINVAL;
+    }
+    u32 sp = (stack_top & ~15u) - 20; /* esp+4 выровнен на 16 по ABI i386 */
     struct task *t=task_alloc_user(p->name,p->page_dir,entry,sp);
     if (!t) return -ENOMEM;
     /* The process owns these defaults; this thread owns no file references. */
@@ -479,6 +490,13 @@ int task_thread_create(u32 entry,u32 fn,u32 arg,u32 sp,u32 base,u32 size) {
     u32 flags=irq_save();
     if (p->state==TASK_ZOMBIE || p->kill_pending || current->kill_pending) {
         free_task(t); irq_restore(flags); return -EINTR;
+    }
+    if (tls_base) {
+        memcpy((void *)(tls_base - p->tls_size), (const void *)USER_TLS_TEMPLATE, p->tls_size);
+        memset((void *)tls_base, 0, USER_TLS_TCB_SIZE);
+        *(u32 *)tls_base = tls_base;
+        t->tls_base = tls_base;
+        ((struct regs *)t->esp)->gs = USER_TLS;
     }
     u32 *s=(u32 *)sp; s[0]=0; s[1]=fn; s[2]=arg;
     u32 id=task_start(t);

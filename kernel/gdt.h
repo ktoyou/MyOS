@@ -8,8 +8,10 @@
 #define USER_CS   (0x18 | 3)
 #define USER_DS   (0x20 | 3)
 #define TSS_SEL   0x28
+#define USER_TLS  (0x38 | 3)
 
 void gdt_init(void);
 void tss_set_kernel_stack(u32 esp0);   /* куда переключать стек при прерывании из ring 3 */
+void gdt_set_user_tls(u32 base);
 
 #endif

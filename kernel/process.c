@@ -26,6 +26,7 @@
 #include "string.h"
 #include "vga.h"
 #include "file.h"
+#include "gdt.h"
 
 /* ---- формат ELF (только то, что нужно) ---- */
 struct elf_header {
@@ -41,6 +42,7 @@ struct elf_phdr {
 
 #define PT_LOAD   1
 #define PT_INTERP 3
+#define PT_TLS    7
 #define PF_W      2
 #define ET_EXEC   2
 #define ET_DYN    3
@@ -116,6 +118,7 @@ static const char *basename(const char *p) {
 
 struct image {
     u32 dir, entry, sp, brk, pages;
+    u32 tls_size, tls_align;
 };
 
 struct elfmap {
@@ -135,6 +138,46 @@ static u32 elf_bias(struct elf_phdr *ph, u32 nph, u32 preferred) {
 
 static int read_exact(u32 ino, u32 off, void *buf, u32 n) {
     return fs_read(ino, off, buf, n) == (int)n ? 0 : PROC_ENOEXEC;
+}
+
+static int load_static_tls(u32 ino, u32 file_size, const struct elf_phdr *ph, u32 nph,
+                           u32 dir, u32 *pages, struct image *im) {
+    const struct elf_phdr *tls = NULL;
+    for (u32 i = 0; i < nph; i++) {
+        if (ph[i].type != PT_TLS) continue;
+        if (tls) return PROC_ENOEXEC;
+        tls = &ph[i];
+    }
+    if (!tls) return 0;
+    u32 align = tls->align ? tls->align : 1;
+    if (align > PAGE_SIZE || (align & (align - 1)) || tls->memsz > USER_TLS_MAX ||
+        tls->filesz > tls->memsz || (tls->filesz &&
+        (tls->offset > file_size || tls->filesz > file_size - tls->offset)))
+        return PROC_ENOEXEC;
+    if (!tls->memsz) return 0;
+    /* Первый байт TLS сохраняет смещение p_vaddr относительно p_align. */
+    u32 size = tls->memsz + ((0u - tls->vaddr - tls->memsz) & (align - 1));
+    if (size > USER_TLS_MAX) return PROC_ENOEXEC;
+    u32 start = USER_TLS_BASE - size;
+
+    /* i386 TLS variant II: инициализаторы перед TCB, указатель на TCB в %gs:0. */
+    if (!map_zero_pages(dir, USER_TLS_TEMPLATE, USER_TLS_TEMPLATE + size, PG_USER, pages, false) ||
+        !map_zero_pages(dir, start, USER_TLS_BASE + USER_TLS_TCB_SIZE, PG_USER | PG_WRITE, pages, false))
+        return PROC_ENOMEM;
+    u8 chunk[512];
+    for (u32 pos = 0; pos < tls->filesz;) {
+        u32 n = tls->filesz - pos;
+        if (n > sizeof(chunk)) n = sizeof(chunk);
+        if (read_exact(ino, tls->offset + pos, chunk, n)) return PROC_ENOEXEC;
+        if (!copy_to_dir(dir, USER_TLS_TEMPLATE + pos, chunk, n) ||
+            !copy_to_dir(dir, start + pos, chunk, n)) return PROC_ENOMEM;
+        pos += n;
+    }
+    u32 base = USER_TLS_BASE;
+    if (!copy_to_dir(dir, base, &base, sizeof(base))) return PROC_ENOMEM;
+    im->tls_size = size;
+    im->tls_align = align < 16 ? 16 : align;
+    return 0;
 }
 
 /* Заголовки программы. Сам файл в кучу ядра не копируется. */
@@ -457,6 +500,8 @@ static int load_image_impl(const char *path, u32 cwd, int argc, char **argv, cha
     } else {
         err = build_user_stack(dir, argc, argv, envc, env, &prog, 0, 0, &sp);
         if (err) goto fail;
+        err = load_static_tls(ino, st.size, ph, eh.phnum, dir, &pages, im);
+        if (err) goto fail;
     }
 
     im->dir = dir;
@@ -507,6 +552,12 @@ static int spawn(const char *path, u32 cwd, int argc, char **argv, char **env, b
     }
     struct task *t = task_alloc_user(basename(path), im.dir, im.entry, im.sp);
     if (!t) { kfree(packed); vmm_destroy_dir(im.dir); return PROC_ENOMEM; }
+    t->tls_size = im.tls_size;
+    t->tls_align = im.tls_align;
+    if (im.tls_size) {
+        t->tls_base = USER_TLS_BASE;
+        ((struct regs *)t->esp)->gs = USER_TLS;
+    }
     task_process(t)->brk_start = task_process(t)->brk = im.brk;
     task_process(t)->user_pages = im.pages;
     task_process(t)->cwd = cwd;
@@ -603,6 +654,9 @@ int proc_fork(struct regs *r) {
     t->parent     = parent->id;
     t->pgid       = parent->pgid;
     t->tcb        = parent->tcb;
+    t->tls_base   = parent->tls_base;
+    t->tls_size   = parent->tls_size;
+    t->tls_align  = parent->tls_align;
     t->keep_zombie = true;                               /* родитель заберёт код в waitpid */
     fpu_copy_current(t);                                 /* и регистры FPU тоже копия */
     for (int i = 0; i < MAX_FDS; i++) task_process(t)->fds[i] = file_dup(task_process(parent)->fds[i]);
@@ -655,6 +709,12 @@ int proc_exec(struct regs *r, const char *path, int argc, char **argv, char **en
     task_process(t)->brk_start = task_process(t)->brk = im.brk;
     task_process(t)->user_pages = im.pages;
     t->tcb = 0;                                          /* старый блок errno указывал в прежнюю память */
+    t->tls_size = im.tls_size;
+    t->tls_align = im.tls_align;
+    u32 flags = irq_save();
+    t->tls_base = im.tls_size ? USER_TLS_BASE : 0;
+    gdt_set_user_tls(t->tls_base);
+    irq_restore(flags);
     fpu_reset_current();                                 /* новой программе — чистый FPU */
     const char *b = basename(path);
     u32 n = strlen(b);
@@ -667,6 +727,7 @@ int proc_exec(struct regs *r, const char *path, int argc, char **argv, char **en
     memset(r, 0, sizeof(*r));
     r->cs = cs; r->ss = ss;
     r->ds = r->es = r->fs = r->gs = ds;
+    if (im.tls_size) r->gs = USER_TLS;
     r->eip = im.entry;
     r->useresp = im.sp;
     r->eflags = 0x202;

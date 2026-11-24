@@ -65,6 +65,8 @@ struct task {
     bool  keep_zombie;              /* кто-то ждёт код выхода — не убирать раньше времени */
     bool  detached;                 /* pthread_detach: слот и mmap-стек освобождаются без join */
     u32   tcb;                      /* указатель программы: первое поле — её errno */
+    u32   tls_base;                 /* база %gs для текущего потока */
+    u32   tls_size, tls_align;      /* параметры шаблона PT_TLS у лидера */
     bool  in_syscall;               /* сейчас выполняет системный вызов */
     bool  kill_pending;             /* убить при выходе из системного вызова */
     int   pending_code;             /* exit status, including zero; kill sets 137 */
@@ -93,7 +95,7 @@ bool  tasking_ready(void);
 struct task *task_current(void);
 struct task *task_process(struct task *t);
 bool task_has_threads(struct task *t);
-int task_thread_create(u32 entry,u32 fn,u32 arg,u32 sp,u32 base,u32 size);
+int task_thread_create(u32 entry,u32 fn,u32 arg,u32 base,u32 size);
 bool task_stack_busy(u32 dir,u32 start,u32 end);
 bool task_same_identity(struct task *a,struct task *b);
 bool task_can_control(struct task *caller,struct task *target);
