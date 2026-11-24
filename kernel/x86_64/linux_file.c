@@ -489,6 +489,8 @@ static long linux_socketpair(i32 domain, u32 type, i32 protocol, uptr address) {
 }
 
 static long socket_write(struct linux64_socket_wait *wait) {
+    if (!linux64_socket_is_stream(wait->file->socket))
+        return linux64_socket_io(wait->file->socket, false, wait->address, wait->length);
     while (wait->blocking) {
         long result = linux64_socket_io(wait->file->socket, false,
                                        wait->address + wait->transferred, wait->length - wait->transferred);
@@ -542,8 +544,7 @@ static long socket_attempt(struct linux64_socket_wait *wait) {
 
 static long socket_run(struct linux64_socket_wait wait) {
     bool message = wait.operation == SOCKET_SENDMSG || wait.operation == SOCKET_RECVMSG;
-    wait.blocking = linux64_socket_is_stream(wait.file->socket) && !(wait.file->flags & O_NONBLOCK) &&
-                    !(message && (wait.flags & MSG_DONTWAIT));
+    wait.blocking = !(wait.file->flags & O_NONBLOCK) && !(message && (wait.flags & MSG_DONTWAIT));
     long result = socket_attempt(&wait);
     if (result == -EAGAIN && wait.blocking) {
         ++wait.file->references;
