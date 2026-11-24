@@ -36,11 +36,12 @@ struct linux64_fd_slot {
 };
 
 enum linux64_task_state {
-    TASK_FREE, TASK_RUNNABLE, TASK_WAITING, TASK_VFORK_WAIT, TASK_PIPE_WAIT, TASK_ZOMBIE, TASK_DEAD,
+    TASK_FREE, TASK_RUNNABLE, TASK_WAITING, TASK_VFORK_WAIT, TASK_PIPE_WAIT, TASK_FUTEX_WAIT, TASK_DEAD,
 };
 
 struct linux64_pipe_io {
     struct linux64_pipe *pipe;
+    struct file_handle *file;
     uptr address, length, transferred;
     bool write, nonblock;
 };
@@ -53,18 +54,32 @@ struct linux64_wait {
     bool signal_info;
 };
 
-struct linux64_task {
-    struct linux64_frame frame;
+struct linux64_process {
     struct linux64_fd_slot fds[LINUX64_FD_COUNT];
-    struct linux64_address_space *memory;
     struct linux64_sigaction actions[LINUX64_SIGNAL_COUNT];
     char executable_path[LINUX64_PATH_LIMIT];
     uptr executable_path_length;
+    i32 pid, ppid, sid, pgid, exit_status;
+    unsigned threads;
+};
+
+struct linux64_futex_wait {
+    const struct linux64_address_space *memory;
+    uptr address;
+    u32 bits;
+    bool private;
+};
+
+struct linux64_task {
+    struct linux64_frame frame;
+    struct linux64_address_space *memory;
+    struct linux64_process *process;
     u64 signal_mask, fs, gs;
     struct linux64_wait wait;
     struct linux64_pipe_io pipe_io;
-    uptr child_tid;
-    i32 pid, ppid, sid, pgid, vfork_child, exit_status;
+    struct linux64_futex_wait futex;
+    uptr child_tid, clear_child_tid;
+    i32 tid, vfork_child;
     u16 ds_selector, es_selector, fs_selector, gs_selector;
     enum linux64_task_state state;
     bool finish_wait;
@@ -75,9 +90,11 @@ extern struct linux64_task *linux64_current;
 
 void linux64_task_init(void);
 void linux64_task_syscall(struct linux64_frame *frame);
-void linux64_retain_files(struct linux64_task *task);
-void linux64_close_files(struct linux64_task *task);
-void linux64_close_on_exec(struct linux64_task *task);
+void linux64_retain_files(struct linux64_process *process);
+void linux64_close_files(struct linux64_process *process);
+void linux64_close_on_exec(struct linux64_process *process);
+void linux64_pipe_finish(struct linux64_task *task);
+long linux64_futex(uptr address, u32 operation, u32 value, uptr timeout, u32 bits);
 struct linux64_pipe *linux64_pipe_create(void);
 void linux64_pipe_close(struct linux64_pipe *pipe, bool writer);
 long linux64_pipe_io(struct linux64_pipe *pipe, bool write, bool nonblock, uptr address, uptr length);

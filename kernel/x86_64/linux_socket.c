@@ -148,7 +148,7 @@ static long send_packet(struct linux64_socket *socket, const struct iovec *iov, 
     packet->physical = physical;
     packet->length = (u32)length;
     if (socket->passcred || peer->passcred)
-        packet->sender = (struct identity){linux64_current->pid, LINUX64_UID, LINUX64_GID};
+        packet->sender = (struct identity){linux64_current->process->pid, LINUX64_UID, LINUX64_GID};
     else
         packet->sender = (struct identity){0, 65534, 65534};
     uptr copied = 0;
