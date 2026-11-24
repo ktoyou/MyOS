@@ -10,7 +10,7 @@ enum {
     SOCK_NONBLOCK = 0x800, SOCK_CLOEXEC = 0x80000,
     SHUT_RD = 0, SHUT_WR = 1, SHUT_RDWR = 2,
     SOL_SOCKET = 1, SO_TYPE = 3, SO_PASSCRED = 16, SCM_CREDENTIALS = 2,
-    MSG_PEEK = 2, MSG_CTRUNC = 8, MSG_TRUNC = 0x20, MSG_DONTWAIT = 0x40,
+    MSG_OOB = 1, MSG_PEEK = 2, MSG_CTRUNC = 8, MSG_TRUNC = 0x20, MSG_DONTWAIT = 0x40,
     MSG_EOR = 0x80, MSG_NOSIGNAL = 0x4000, MSG_CMSG_CLOEXEC = 0x40000000,
     MAX_IOV = 64, MAX_QUEUED = 32, MAX_BACKLOG = 31,
 };
@@ -177,6 +177,18 @@ void linux64_socket_dequeue(struct linux64_socket *socket) {
     if (!socket->accept_head) socket->accept_tail = NULL;
     accepted->accept_next = NULL;
     --socket->pending;
+}
+
+long linux64_socket_check_sendto(const struct linux64_socket *socket, u32 flags, uptr address, i32 length) {
+    if (address) {
+        u8 name[128];
+        if (length < 0 || (uptr)length > sizeof(name)) return -EINVAL;
+        if (paging64_copy_from_user(name, address, (uptr)length) != (uptr)length) return -EFAULT;
+        if (length && linux64_socket_is_stream(socket))
+            return socket->peer ? -EISCONN : -EOPNOTSUPP;
+    }
+    if (flags & MSG_OOB) return -EOPNOTSUPP;
+    return 0;
 }
 
 long linux64_socket_name(const struct linux64_socket *socket, bool peer, uptr address, uptr length) {

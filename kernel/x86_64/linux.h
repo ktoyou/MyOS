@@ -50,6 +50,7 @@ struct linux64_fd_view {
 };
 long linux64_get_file(i32 fd, struct linux64_fd_view *view);
 long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg3);
+long linux64_sendto(i32 fd, uptr buffer, uptr length, u32 flags, uptr address, i32 address_length);
 long linux64_sockopt(bool get, i32 fd, i32 level, i32 option, uptr value, uptr length);
 struct linux64_socket;
 #define LINUX64_UNIX_PATH_LIMIT 108u
@@ -66,6 +67,7 @@ bool linux64_socket_accept_ready(const struct linux64_socket *socket);
 long linux64_socket_pending(struct linux64_socket *socket, bool blocking, struct linux64_socket **accepted);
 void linux64_socket_dequeue(struct linux64_socket *socket);
 long linux64_socket_name(const struct linux64_socket *socket, bool peer, uptr address, uptr length);
+long linux64_socket_check_sendto(const struct linux64_socket *socket, u32 flags, uptr address, i32 length);
 bool linux64_socket_is_stream(const struct linux64_socket *socket);
 void linux64_socket_close(struct linux64_socket *socket);
 long linux64_socket_shutdown(struct linux64_socket *socket, i32 how);

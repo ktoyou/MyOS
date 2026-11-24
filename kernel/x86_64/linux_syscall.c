@@ -112,6 +112,7 @@ long linux64_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2,
         const struct linux64_process *process = linux64_current->process;
         return linux64_pid_number(process->pid_identity, process->pid_ns);
     }
+    if (number == 44) return linux64_sendto((i32)arg0, arg1, arg2, (u32)arg3, arg4, (i32)arg5);
     if (number == 186) return linux64_current->visible_tid; /* gettid */
     if (number == 54 || number == 55)
         return linux64_sockopt(number == 55, (i32)arg0, (i32)arg1, (i32)arg2, arg3, arg4);
