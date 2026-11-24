@@ -98,6 +98,7 @@ long linux64_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2,
     if (number == 9) return linux64_mmap(arg0, arg1, (u32)arg2, (u32)arg3, (i32)arg4, arg5);
     if (number == 10) return linux64_mprotect(arg0, arg1, arg2);
     if (number == 11) return linux64_munmap(arg0, arg1);
+    if (number == 13) return linux64_rt_sigaction((i32)arg0, arg1, arg2, arg3);
     if (number == 158) return linux_arch_prctl((i32)arg0, arg1);
     if (number == 202) return linux_futex(arg0, (u32)arg1);
     if (number == 228) return linux64_clock_gettime((i32)arg0, arg1);
