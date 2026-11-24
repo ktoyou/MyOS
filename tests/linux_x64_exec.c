@@ -28,11 +28,13 @@ static volatile unsigned failed_phase;
 __attribute__((noreturn)) void child_exec(unsigned empty_argv) {
     const char *argv[] = {"alternate-name", "argument", 0};
     const char *envp[] = {"EXEC_SMOKE=ready", 0};
+    if (sys(157, 39, 0, 0, 0, 0, 0) != 1) finish(45);
     if (empty_argv == 2) {
         word fs;
         if (sys(59, (word)"./linux-exec-bad.elf", (word)argv, 0, 0, 0, 0) != -8 ||
             sys(72, 4, 1, 0, 0, 0, 0) != 1 ||
-            sys(158, 0x1003, (word)&fs, 0, 0, 0, 0) || !fs) finish(42);
+            sys(158, 0x1003, (word)&fs, 0, 0, 0, 0) || !fs ||
+            sys(157, 39, 0, 0, 0, 0, 0) != 1) finish(42);
         failed_phase = 1;
         sys(24, 0, 0, 0, 0, 0, 0);
         failed_phase = 2;
@@ -61,6 +63,14 @@ static long bad_exec(void) {
 }
 
 static long probe(void) {
+    long initial = sys(157, 39, 0, 0, 0, 0, 0);
+    if (initial < 0 || initial > 1 || sys(157, 38, 1ul << 32 | 1, 0, 0, 0, 0) != -22 ||
+        sys(157, 38, 1, 1, 0, 0, 0) != -22 || sys(157, 38, 1, 0, 1, 0, 0) != -22 ||
+        sys(157, 38, 1, 0, 0, 1, 0) != -22 || sys(157, 39, 1, 0, 0, 0, 0) != -22 ||
+        sys(157, 39, 0, 1, 0, 0, 0) != -22 || sys(157, 39, 0, 0, 1, 0, 0) != -22 ||
+        sys(157, 39, 0, 0, 0, 1, 0) != -22 || sys(157, 39, 0, 0, 0, 0, 0) != initial ||
+        sys(157, 38, 1, 0, 0, 0, 0) || sys(157, 38, 1, 0, 0, 0, 0) ||
+        sys(157, 38, 0, 0, 0, 0, 0) != -22 || sys(157, 39, 0, 0, 0, 0, 0) != 1) return 14;
     const word stack_size = 0x9000, tls = 0x128892;
     word mask = 1ul << 9, caught[] = {0x401000, 0, 0, 0}, ignored[] = {1, 0, 0, 0};
     long fd = sys(319, (word)"exec-state", 0, 0, 0, 0, 0);
@@ -79,7 +89,8 @@ static long probe(void) {
     word fs;
     if (sys(72, cloexec, 1, 0, 0, 0, 0) != 1 ||
         sys(158, 0x1003, (word)&fs, 0, 0, 0, 0) || fs != (word)&tls ||
-        sys(13, 10, 0, (word)caught, 8, 0, 0) || caught[0] != 0x401000) return 4;
+        sys(13, 10, 0, (word)caught, 8, 0, 0) || caught[0] != 0x401000 ||
+        sys(157, 39, 0, 0, 0, 0, 0) != 1) return 4;
     long stack = sys(9, 0, stack_size, 3, 0x20022, -1, 0);
     long shared = sys(9, 0, 4096, 3, 1, fd, 0);
     if (stack < 0 || shared < 0 ||
@@ -87,6 +98,7 @@ static long probe(void) {
     volatile unsigned char *private = (void *)PRIVATE_ADDRESS;
     *private = 0x7a;
     struct exec_sync *sync = (void *)shared;
+    if (exec_permitted_caps(sync->permitted)) return 15;
     for (unsigned i = 0; i < 3; ++i) {
         sync->ready = sync->ack = 0;
         sync->pid = 0;

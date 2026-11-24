@@ -13,6 +13,7 @@ enum {
                     CLONE_SYSVSEM | CLONE_SETTLS | CLONE_PARENT_SETTID | CHILD_CLEARTID,
     FUTEX_WAIT = 0, FUTEX_WAKE = 1, FUTEX_WAIT_BITSET = 9, FUTEX_WAKE_BITSET = 10,
     FUTEX_PRIVATE_FLAG = 128, FUTEX_CLOCK_REALTIME = 256,
+    PR_SET_NO_NEW_PRIVS = 38, PR_GET_NO_NEW_PRIVS = 39,
     SA_NOCLDWAIT = 2, SIG_IGN = 1,
     WNOHANG = 1, WUNTRACED = 2, WEXITED = 4, WCONTINUED = 8, WNOWAIT = 0x01000000,
     P_ALL = 0, P_PID = 1, P_PGID = 2,
@@ -162,6 +163,7 @@ static long clone_task(struct linux64_frame *frame, uptr flags, uptr stack, uptr
     child->finish_wait = false;
     child->vfork_child = 0;
     child->signal_mask = parent->signal_mask;
+    child->no_new_privs = parent->no_new_privs;
     child->caps = parent->caps;
     if (new_user) linux64_userns_caps(child);
     if (!thread) {
@@ -332,6 +334,7 @@ bool linux64_commit_exec(struct linux64_frame *frame, uptr root, uptr entry, upt
     }
     task->child_tid = 0;
     task->clear_child_tid = 0;
+    /* ELF не получает полномочия файла. Необратимый флаг задачи переживает execve. */
     task->caps = (struct linux64_caps){0};
     task->tid = process->pid;
     process->executable_path_length = path_length;
@@ -565,6 +568,20 @@ void linux64_task_exception(u64 vector) {
     linux64_task_resume(&frame);
 }
 
+static long task_prctl(i32 option, uptr value, uptr third, uptr fourth, uptr fifth) {
+    switch (option) {
+    case PR_SET_NO_NEW_PRIVS:
+        if (value != 1 || third || fourth || fifth) return -EINVAL;
+        linux64_current->no_new_privs = true;
+        return 0;
+    case PR_GET_NO_NEW_PRIVS:
+        if (value || third || fourth || fifth) return -EINVAL;
+        return linux64_current->no_new_privs;
+    default:
+        return -ENOSYS;
+    }
+}
+
 void linux64_task_syscall(struct linux64_frame *frame) {
     uptr number = frame->rax;
     switch (number) {
@@ -603,6 +620,9 @@ void linux64_task_syscall(struct linux64_frame *frame) {
         break;
     case 112: /* setsid */
         frame->rax = (u64)new_session();
+        break;
+    case 157: /* prctl */
+        frame->rax = (u64)task_prctl((i32)frame->rdi, frame->rsi, frame->rdx, frame->r10, frame->r8);
         break;
     case 218: /* set_tid_address */
         linux64_current->clear_child_tid = frame->rdi;

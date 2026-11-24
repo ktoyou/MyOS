@@ -127,7 +127,7 @@ struct linux64_task {
     i32 tid, vfork_child;
     u16 ds_selector, es_selector, fs_selector, gs_selector;
     enum linux64_task_state state;
-    bool finish_wait;
+    bool finish_wait, no_new_privs;
     u8 xstate[LINUX64_XSTATE_SIZE] __attribute__((aligned(64)));
 };
 
