@@ -2,17 +2,17 @@
 #include "paging.h"
 
 enum {
-    EAGAIN = 11, ENOMEM = 12, EFAULT = 14, EINVAL = 22, EMFILE = 24, EPIPE = 32,
+    EBADF = 9, EAGAIN = 11, ENOMEM = 12, EFAULT = 14, EINVAL = 22, EMFILE = 24, EPIPE = 32,
     EMSGSIZE = 90, EPROTONOSUPPORT = 93, ESOCKTNOSUPPORT = 94, EOPNOTSUPP = 95,
     EAFNOSUPPORT = 97, ENOPROTOOPT = 92, ECONNRESET = 104, EISCONN = 106, ENOTCONN = 107,
     ECONNREFUSED = 111,
     AF_UNIX = 1, SOCK_STREAM = 1, SOCK_SEQPACKET = 5, SOCK_MAX = 11, SOCK_TYPE_MASK = 0xf,
     SOCK_NONBLOCK = 0x800, SOCK_CLOEXEC = 0x80000,
     SHUT_RD = 0, SHUT_WR = 1, SHUT_RDWR = 2,
-    SOL_SOCKET = 1, SO_TYPE = 3, SO_PASSCRED = 16, SCM_CREDENTIALS = 2,
+    SOL_SOCKET = 1, SO_TYPE = 3, SO_PASSCRED = 16, SCM_RIGHTS = 1, SCM_CREDENTIALS = 2,
     MSG_OOB = 1, MSG_PEEK = 2, MSG_CTRUNC = 8, MSG_TRUNC = 0x20, MSG_DONTWAIT = 0x40,
     MSG_EOR = 0x80, MSG_NOSIGNAL = 0x4000, MSG_CMSG_CLOEXEC = 0x40000000,
-    MAX_IOV = 64, MAX_QUEUED = 32, MAX_BACKLOG = 31,
+    MAX_IOV = 64, MAX_QUEUED = 32, MAX_BACKLOG = 31, SCM_MAX_FD = 253,
 };
 
 _Static_assert(__builtin_offsetof(struct linux64_sockaddr, path) == 2, "Linux sockaddr_un path");
@@ -33,6 +33,11 @@ struct identity {
     u32 uid, gid;
 };
 
+struct cmsghdr {
+    uptr length;
+    i32 level, type;
+};
+
 struct credentials {
     uptr length;
     i32 level, type;
@@ -42,11 +47,21 @@ struct credentials {
 #define CRED_LENGTH (__builtin_offsetof(struct credentials, sender) + sizeof(struct identity))
 _Static_assert(sizeof(struct msghdr) == 56 && sizeof(struct iovec) == 16, "Linux x86-64 msghdr");
 _Static_assert(CRED_LENGTH == 28 && sizeof(struct credentials) == 32, "Linux x86-64 credentials");
+_Static_assert(sizeof(struct cmsghdr) == 16, "Linux x86-64 cmsghdr");
+
+struct linux64_scm_rights {
+    struct linux64_scm_rights *next;
+    unsigned count;
+    bool queued;
+    struct file_handle *files[SCM_MAX_FD];
+};
+
+_Static_assert(sizeof(struct linux64_scm_rights) <= PMM_PAGE_SIZE, "SCM rights page");
 
 struct packet {
     struct packet *next;
     struct linux64_pid *sender;
-    u32 length, uid, gid;
+    u32 length, uid, gid, rights_phys;
     u8 bytes[];
 };
 
@@ -59,12 +74,14 @@ struct linux64_socket {
     u64 inode;
     unsigned queued, head_offset, backlog, pending;
     u8 type;
-    bool open, passcred, reset, read_shutdown, write_shutdown, listening;
+    bool open, passcred, reset, read_shutdown, write_shutdown, listening, scm_marked;
     char name[LINUX64_UNIX_PATH_LIMIT + 1];
 };
 
 /* Один конец может оставаться открытым после закрытия его пары. */
 static struct linux64_socket pairs[LINUX64_PROCESS_COUNT * LINUX64_FD_COUNT][2];
+static struct linux64_socket *scm_mark_queue[2 * LINUX64_PROCESS_COUNT * LINUX64_FD_COUNT];
+static unsigned scm_mark_count;
 
 static struct linux64_socket *free_pair(void) {
     for (unsigned i = 0; i < sizeof(pairs) / sizeof(*pairs); ++i)
@@ -212,8 +229,70 @@ long linux64_socket_name(const struct linux64_socket *socket, bool peer, uptr ad
     return 0;
 }
 
+static void rights_queued(struct linux64_scm_rights *rights, bool queued) {
+    if (!rights) return;
+    for (unsigned i = 0; i < rights->count; ++i) linux64_scm_set_inflight(rights->files[i], queued);
+    rights->queued = queued;
+}
+
+static struct linux64_scm_rights *packet_rights(const struct packet *packet) {
+    return packet->rights_phys ? pmm64_pointer(packet->rights_phys) : NULL;
+}
+
+void linux64_scm_release(struct linux64_scm_rights *rights) {
+    if (!rights) return;
+    if (rights->queued) rights_queued(rights, false);
+    for (unsigned i = 0; i < rights->count; ++i) linux64_scm_put_file(rights->files[i]);
+    pmm64_free((uptr)rights - (uptr)pmm64_pointer(0));
+}
+
+void linux64_scm_mark_socket(struct linux64_socket *socket) {
+    if (!socket || socket->scm_marked) return;
+    socket->scm_marked = true;
+    scm_mark_queue[scm_mark_count++] = socket;
+}
+
+void linux64_scm_collect_sockets(void) {
+    scm_mark_count = 0;
+    for (unsigned i = 0; i < sizeof(pairs) / sizeof(*pairs); ++i)
+        for (unsigned end = 0; end < 2; ++end) pairs[i][end].scm_marked = false;
+    linux64_scm_mark_roots();
+    for (unsigned i = 0; i < scm_mark_count; ++i) {
+        const struct linux64_socket *socket = scm_mark_queue[i];
+        for (struct linux64_socket *pending = socket->accept_head; pending; pending = pending->accept_next)
+            linux64_scm_mark_socket(pending);
+        for (const struct packet *packet = socket->head; packet; packet = packet->next) {
+            const struct linux64_scm_rights *rights = packet_rights(packet);
+            if (!rights) continue;
+            for (unsigned j = 0; j < rights->count; ++j)
+                linux64_scm_mark_socket(linux64_scm_file_socket(rights->files[j]));
+        }
+    }
+    struct linux64_scm_rights *garbage = NULL;
+    /* Сначала разрываем рёбра: освобождение ссылки может закрыть целую очередь. */
+    for (unsigned i = 0; i < sizeof(pairs) / sizeof(*pairs); ++i) {
+        for (unsigned end = 0; end < 2; ++end) {
+            struct linux64_socket *socket = &pairs[i][end];
+            if (socket->scm_marked) continue;
+            for (struct packet *packet = socket->head; packet; packet = packet->next) {
+                struct linux64_scm_rights *rights = packet_rights(packet);
+                if (!rights) continue;
+                rights->next = garbage;
+                garbage = rights;
+                packet->rights_phys = 0;
+            }
+        }
+    }
+    while (garbage) {
+        struct linux64_scm_rights *next = garbage->next;
+        linux64_scm_release(garbage);
+        garbage = next;
+    }
+}
+
 static void free_packet(struct packet *packet) {
     linux64_pid_release(packet->sender);
+    linux64_scm_release(packet_rights(packet));
     pmm64_free((uptr)packet - (uptr)pmm64_pointer(0));
 }
 
@@ -324,7 +403,24 @@ static void enqueue(struct linux64_socket *peer, struct packet *packet) {
     ++peer->queued;
 }
 
-static long send_packet(struct linux64_socket *socket, const struct iovec *iov, uptr count) {
+static void attach_rights(struct packet *packet, struct linux64_scm_rights **rights) {
+    if (!rights || !*rights) return;
+    packet->rights_phys = (u32)((uptr)*rights - (uptr)pmm64_pointer(0));
+    rights_queued(*rights, true);
+    *rights = NULL;
+}
+
+static struct linux64_scm_rights *take_rights(struct packet *packet, bool peek) {
+    struct linux64_scm_rights *rights = packet_rights(packet);
+    if (!peek && rights) {
+        packet->rights_phys = 0;
+        rights_queued(rights, false);
+    }
+    return rights;
+}
+
+static long send_packet(struct linux64_socket *socket, const struct iovec *iov, uptr count,
+                        struct linux64_scm_rights **rights) {
     if (socket->reset) {
         socket->reset = false;
         return -ECONNRESET;
@@ -350,6 +446,7 @@ static long send_packet(struct linux64_socket *socket, const struct iovec *iov, 
         }
         copied += size;
     }
+    attach_rights(packet, rights);
     enqueue(peer, packet);
     return (long)length;
 }
@@ -360,6 +457,12 @@ static struct identity packet_identity(const struct packet *packet) {
         .uid = packet->uid, .gid = packet->gid,
     };
 }
+
+struct received_ancillary {
+    struct identity sender;
+    struct linux64_scm_rights *rights;
+    bool credentials;
+};
 
 static void receive_credentials(struct identity sender, struct msghdr *message) {
     uptr available = message->control ? message->control_length : 0;
@@ -379,13 +482,13 @@ static void receive_credentials(struct identity sender, struct msghdr *message) 
 }
 
 static long receive_packet(struct linux64_socket *socket, const struct iovec *iov, uptr count,
-                           struct msghdr *message, u32 flags) {
+                           struct msghdr *message, u32 flags, struct received_ancillary *ancillary) {
     if (!socket->peer) return -EINVAL;
     if (socket->reset) {
         socket->reset = false;
         return -ECONNRESET;
     }
-    const struct packet *packet = socket->head;
+    struct packet *packet = socket->head;
     if (!packet) {
         if (message) message->control_length = 0;
         return socket->peer->open && !socket->read_shutdown ? -EAGAIN : 0;
@@ -404,8 +507,9 @@ static long receive_packet(struct linux64_socket *socket, const struct iovec *io
     if (!result) {
         if (message) {
             if (copied < packet->length) message->flags |= MSG_TRUNC;
-            if (socket->passcred) receive_credentials(packet_identity(packet), message);
-            else message->control_length = 0;
+            ancillary->credentials = socket->passcred;
+            if (ancillary->credentials) ancillary->sender = packet_identity(packet);
+            ancillary->rights = take_rights(packet, (flags & MSG_PEEK) != 0);
         }
         result = (long)(flags & MSG_TRUNC ? packet->length : copied);
     }
@@ -444,7 +548,8 @@ static uptr stream_copy(struct iov_cursor *cursor, u8 *bytes, uptr length, bool 
     return copied;
 }
 
-static long send_stream(struct linux64_socket *socket, const struct iovec *iov, uptr count) {
+static long send_stream(struct linux64_socket *socket, const struct iovec *iov, uptr count,
+                        struct linux64_scm_rights **rights) {
     struct linux64_socket *peer = socket->peer;
     if (!peer) return -ENOTCONN;
     if (!peer->open || socket->write_shutdown) return -EPIPE;
@@ -458,6 +563,7 @@ static long send_stream(struct linux64_socket *socket, const struct iovec *iov, 
         packet->length = (u32)stream_copy(&cursor, packet->bytes, MAX_PACKET, false, &fault);
         if (packet->length) {
             done += packet->length;
+            attach_rights(packet, rights);
             enqueue(peer, packet);
         } else free_packet(packet);
         if (fault) return done ? (long)done : -EFAULT;
@@ -466,12 +572,11 @@ static long send_stream(struct linux64_socket *socket, const struct iovec *iov, 
 }
 
 static long receive_stream(struct linux64_socket *socket, const struct iovec *iov, uptr count,
-                           struct msghdr *message, u32 flags) {
+                           u32 flags, struct received_ancillary *ancillary) {
     if (!socket->peer) return -EINVAL;
     struct iov_cursor cursor = {iov, iov + count, 0};
     struct packet *packet = socket->head;
     if (!packet) {
-        if (message) message->control_length = 0;
         if (socket->reset) {
             socket->reset = false;
             return -ECONNRESET;
@@ -490,19 +595,25 @@ static long receive_stream(struct linux64_socket *socket, const struct iovec *io
         uptr available = packet->length - offset;
         uptr copied = stream_copy(&cursor, packet->bytes + offset, available, true, &fault);
         done += copied;
+        struct linux64_scm_rights *rights = copied ? take_rights(packet, (flags & MSG_PEEK) != 0) : NULL;
         if (flags & MSG_PEEK) packet = packet->next;
         else {
             socket->head_offset += (unsigned)copied;
             if (copied == available) drop_packet(socket);
             packet = socket->head;
         }
+        if (rights) {
+            if (ancillary) ancillary->rights = rights;
+            else linux64_scm_release(rights);
+            break;
+        }
         if (fault) break;
     }
     linux64_pid_release(first_sender);
     if (fault && !done) return -EFAULT;
-    if (message) {
-        if (socket->passcred && done) receive_credentials(sender, message);
-        else message->control_length = 0;
+    if (ancillary && socket->passcred && done) {
+        ancillary->credentials = true;
+        ancillary->sender = sender;
     }
     return (long)done;
 }
@@ -511,14 +622,105 @@ long linux64_socket_io(struct linux64_socket *socket, bool receive, uptr buffer,
     if (buffer >= X64_USER_TOP || length > X64_USER_TOP - buffer) return -EFAULT;
     const struct iovec iov = {buffer, length};
     if (linux64_socket_is_stream(socket)) {
-        if (!receive) return send_stream(socket, &iov, 1);
-        return length ? receive_stream(socket, &iov, 1, NULL, 0) : 0;
+        if (!receive) return send_stream(socket, &iov, 1, NULL);
+        return length ? receive_stream(socket, &iov, 1, 0, NULL) : 0;
     }
-    if (!receive) return send_packet(socket, &iov, 1);
-    return length ? receive_packet(socket, &iov, 1, NULL, 0) : 0;
+    if (!receive) return send_packet(socket, &iov, 1, NULL);
+    return length ? receive_packet(socket, &iov, 1, NULL, 0, NULL) : 0;
 }
 
-long linux64_socket_message(struct linux64_socket *socket, bool receive, uptr address, u32 flags) {
+static uptr control_align(uptr length) {
+    return (length + 7) & ~7ul;
+}
+
+static long parse_rights(uptr control, uptr size, struct linux64_scm_rights **out) {
+    if (!size) return 0;
+    if (control >= X64_USER_TOP || size > X64_USER_TOP - control) return -EFAULT;
+    if (size > 0x7fffffffu) return -EINVAL;
+    while (size >= sizeof(struct cmsghdr)) {
+        struct cmsghdr header;
+        if (paging64_copy_from_user(&header, control, sizeof(header)) != sizeof(header)) return -EFAULT;
+        if (header.length < sizeof(header) || header.length > size) return -EINVAL;
+        if (header.level == SOL_SOCKET) {
+            if (header.type != SCM_RIGHTS) return -EINVAL;
+            uptr count = (header.length - sizeof(header)) / sizeof(i32);
+            if (count > SCM_MAX_FD - (*out ? (*out)->count : 0)) return -EINVAL;
+            if (count && !*out) {
+                uptr page = pmm64_alloc();
+                if (!page) return -ENOMEM;
+                *out = pmm64_pointer(page);
+            }
+            for (uptr i = 0; i < count; ++i) {
+                i32 fd;
+                if (paging64_copy_from_user(&fd, control + sizeof(header) + i * sizeof(fd), sizeof(fd)) !=
+                    sizeof(fd)) return -EFAULT;
+                struct file_handle *file = linux64_scm_get_file(fd);
+                if (!file) return -EBADF;
+                (*out)->files[(*out)->count++] = file;
+            }
+        }
+        uptr step = control_align(header.length);
+        if (step >= size) break;
+        control += step;
+        size -= step;
+    }
+    return 0;
+}
+
+long linux64_socket_prepare_rights(uptr address, u32 flags, struct linux64_scm_rights **rights) {
+    if (flags & ~(MSG_DONTWAIT | MSG_EOR | MSG_NOSIGNAL)) return -EOPNOTSUPP;
+    struct msghdr message;
+    if (paging64_copy_from_user(&message, address, sizeof(message)) != sizeof(message)) return -EFAULT;
+    long result = parse_rights(message.control, message.control_length, rights);
+    if (result) {
+        linux64_scm_release(*rights);
+        *rights = NULL;
+    }
+    return result;
+}
+
+struct received_fds {
+    struct cmsghdr header;
+    i32 descriptors[LINUX64_FD_COUNT];
+    unsigned count;
+};
+_Static_assert(__builtin_offsetof(struct received_fds, descriptors) == sizeof(struct cmsghdr),
+               "SCM_RIGHTS descriptor alignment");
+
+static void close_received(struct received_fds *fds) {
+    while (fds->count) linux64_scm_close(fds->descriptors[--fds->count]);
+}
+
+static void receive_ancillary(struct msghdr *message, const struct received_ancillary *ancillary,
+                              struct received_fds *fds) {
+    uptr capacity = message->control ? message->control_length : 0;
+    if (ancillary->credentials) receive_credentials(ancillary->sender, message);
+    else message->control_length = 0;
+    const struct linux64_scm_rights *rights = ancillary->rights;
+    if (!rights) return;
+    uptr available = capacity - message->control_length;
+    uptr slots = available >= sizeof(fds->header) ? (available - sizeof(fds->header)) / sizeof(i32) : 0;
+    while (fds->count < rights->count && fds->count < slots && fds->count < LINUX64_FD_COUNT) {
+        long fd = linux64_scm_install(rights->files[fds->count], (message->flags & MSG_CMSG_CLOEXEC) != 0);
+        if (fd < 0) break;
+        fds->descriptors[fds->count++] = (i32)fd;
+    }
+    if (fds->count) {
+        uptr length = sizeof(fds->header) + fds->count * sizeof(i32);
+        fds->header = (struct cmsghdr){length, SOL_SOCKET, SCM_RIGHTS};
+        uptr address = message->control + message->control_length;
+        if (paging64_copy_to_user(address, fds, length) == length) {
+            uptr padded = control_align(length);
+            message->control_length += available < padded ? available : padded;
+        } else close_received(fds);
+    }
+    if (fds->count < rights->count) message->flags |= MSG_CTRUNC;
+}
+
+long linux64_socket_message(struct linux64_socket *socket, struct linux64_socket_wait *wait) {
+    bool receive = wait->operation == SOCKET_RECVMSG;
+    uptr address = wait->address;
+    u32 flags = wait->flags;
     u32 allowed = receive ? MSG_PEEK | MSG_TRUNC | MSG_DONTWAIT | MSG_CMSG_CLOEXEC
                           : MSG_DONTWAIT | MSG_EOR | MSG_NOSIGNAL;
     if (flags & ~allowed) return -EOPNOTSUPP;
@@ -534,14 +736,20 @@ long linux64_socket_message(struct linux64_socket *socket, bool receive, uptr ad
             (iov[i].base >= X64_USER_TOP || iov[i].length > X64_USER_TOP - iov[i].base))
             return -EFAULT;
     if (!receive) {
-        if (message.control_length) return -EOPNOTSUPP;
-        return linux64_socket_is_stream(socket) ? send_stream(socket, iov, message.iov_count) :
-                                                  send_packet(socket, iov, message.iov_count);
+        return linux64_socket_is_stream(socket) ? send_stream(socket, iov, message.iov_count, &wait->rights) :
+                                                  send_packet(socket, iov, message.iov_count, &wait->rights);
     }
     message.flags = flags & MSG_CMSG_CLOEXEC;
-    long result = linux64_socket_is_stream(socket) ? receive_stream(socket, iov, message.iov_count, &message, flags) :
-                                                    receive_packet(socket, iov, message.iov_count, &message, flags);
+    if (message.control && message.control_length &&
+        (message.control >= X64_USER_TOP || message.control_length > X64_USER_TOP - message.control))
+        return -EFAULT;
+    struct received_ancillary ancillary = {0};
+    long result = linux64_socket_is_stream(socket) ? receive_stream(socket, iov, message.iov_count, flags, &ancillary) :
+                                                    receive_packet(socket, iov, message.iov_count, &message, flags, &ancillary);
     if (result < 0) return result;
+    struct received_fds fds = {0};
+    receive_ancillary(&message, &ancillary, &fds);
+    if (!(flags & MSG_PEEK)) linux64_scm_release(ancillary.rights);
     message.name_length = 0;
     if ((message.name && paging64_copy_to_user(address + __builtin_offsetof(struct msghdr, name_length),
                                               &message.name_length, sizeof(message.name_length)) !=
@@ -549,7 +757,9 @@ long linux64_socket_message(struct linux64_socket *socket, bool receive, uptr ad
         paging64_copy_to_user(address + __builtin_offsetof(struct msghdr, flags),
                               &message.flags, sizeof(message.flags)) != sizeof(message.flags) ||
         !paging64_put_user_u64(address + __builtin_offsetof(struct msghdr, control_length),
-                               message.control_length))
+                               message.control_length)) {
+        close_received(&fds);
         return -EFAULT;
+    }
     return result;
 }

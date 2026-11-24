@@ -710,6 +710,7 @@ static void resume_wait(struct linux64_task *task) {
 }
 
 static void schedule(struct linux64_frame *frame) {
+    linux64_scm_collect_pending();
     struct linux64_task *old = linux64_current;
     struct linux64_task *next = pick_task(old);
     if (next == old && old->state != TASK_SOCKET_WAIT && old->state != TASK_EVENTFD_WAIT &&
@@ -734,6 +735,7 @@ static void schedule(struct linux64_frame *frame) {
     }
     for (;;) {
         resume_wait(next);
+        linux64_scm_collect_pending();
         if (next->state == TASK_RUNNABLE) break;
         /* Другой поток мог забрать статус потомка, а длинная запись снова заполнить трубу. */
         struct linux64_task *ready = pick_task(next);

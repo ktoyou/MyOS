@@ -23,9 +23,9 @@ struct credentials {
 
 enum {
     AF_UNIX = 1, SOCK_STREAM = 1, SOCK_SEQPACKET = 5, SOCK_NONBLOCK = 0x800, SOCK_CLOEXEC = 0x80000,
-    SOL_SOCKET = 1, SO_TYPE = 3, SO_PASSCRED = 16,
+    SOL_SOCKET = 1, SCM_RIGHTS = 1, SO_TYPE = 3, SO_PASSCRED = 16,
     MSG_PEEK = 2, MSG_CTRUNC = 8, MSG_TRUNC = 0x20, MSG_DONTWAIT = 0x40, MSG_NOSIGNAL = 0x4000,
-    SHUT_RD = 0, SHUT_WR = 1, SHUT_RDWR = 2,
+    MSG_CMSG_CLOEXEC = 0x40000000, SHUT_RD = 0, SHUT_WR = 1, SHUT_RDWR = 2,
 };
 
 static long call6(word number, word a0, word a1, word a2, word a3, word a4, word a5) {
@@ -552,11 +552,215 @@ static long check_sendto(void) {
     return 0;
 }
 
+struct rights {
+    word length;
+    int level, type;
+    int fds[4];
+};
+
+static long send_rights(int fd, const char *bytes, word length, const int *fds, unsigned count) {
+    struct rights rights = {16 + 4 * count, SOL_SOCKET, SCM_RIGHTS, {0}};
+    for (unsigned i = 0; i < count; ++i) rights.fds[i] = fds[i];
+    struct iovec data = {(void *)bytes, length};
+    struct msghdr message = {.iov = &data, .iov_count = 1, .control = &rights,
+                             .control_length = rights.length};
+    return send(fd, &message);
+}
+
+static long recv_rights(int fd, char *bytes, word length, struct rights *control, word capacity,
+                        unsigned flags, unsigned *received_flags) {
+    struct iovec data = {bytes, length};
+    struct msghdr message = {.iov = &data, .iov_count = 1, .control = control, .control_length = capacity};
+    long result = receive(fd, &message, flags);
+    if (received_flags) *received_flags = message.flags;
+    return result;
+}
+
+static long check_rights_fork(word type) {
+    int ends[2], gate[2];
+    if (call(53, AF_UNIX, type, 0, (word)ends, 0) || call(22, (word)gate, 0, 0, 0, 0)) return 85;
+    long child = call(57, 0, 0, 0, 0, 0);
+    if (!child) {
+        int peer = ends[1];
+        struct rights rights = {0};
+        char byte;
+        if (close_fd(ends[0]) || close_fd(gate[1]) || call(0, gate[0], (word)&byte, 1, 0, 0) ||
+            close_fd(gate[0]) || recv_rights(peer, &byte, 1, &rights, sizeof(rights),
+                                             MSG_CMSG_CLOEXEC, 0) != 1 || byte != 'X' ||
+            rights.length != 28 || rights.level != SOL_SOCKET || rights.type != SCM_RIGHTS)
+            call(60, 1, 0, 0, 0, 0);
+        if (call(72, rights.fds[0], 1, 0, 0, 0) != 1 ||
+            call(72, rights.fds[2], 1, 0, 0, 0) != 1 ||
+            call(0, rights.fds[0], (word)&byte, 1, 0, 0) != 1 || byte != 'A' ||
+            call(0, rights.fds[1], (word)&byte, 1, 0, 0) != 1 || byte != 'B' ||
+            call(1, rights.fds[2], (word)"K", 1, 0, 0) != 1)
+            call(60, 2, 0, 0, 0, 0);
+        call(60, 0, 0, 0, 0, 0);
+        __builtin_trap();
+    }
+    if (child < 0 || close_fd(ends[1]) || close_fd(gate[0])) return 85;
+    int sockets[2];
+    long memfd = call(319, (word)"rights", 0, 0, 0, 0);
+    if (memfd < 3 || call(77, memfd, 4096, 0, 0, 0) ||
+        call(53, AF_UNIX, SOCK_STREAM, 0, (word)sockets, 0)) return 86;
+    long address = call6(9, 0, 4096, 3, 1, memfd, 0);
+    if (address < 0) return 86;
+    char *memory = (char *)(word)address;
+    memory[0] = 'A';
+    memory[1] = 'B';
+    int fds[] = {(int)memfd, (int)memfd, sockets[0]};
+    int status = 0;
+    char byte;
+    if (send_rights(ends[0], "X", 1, fds, 3) != 1 || close_fd((int)memfd) || close_fd(sockets[0]) ||
+        call(11, address, 4096, 0, 0, 0) || close_fd(gate[1]) ||
+        call(61, child, (word)&status, 0, 0, 0) != child || status ||
+        call(0, sockets[1], (word)&byte, 1, 0, 0) != 1 || byte != 'K' ||
+        close_fd(sockets[1]) || close_fd(ends[0])) return 87 + ((status >> 8) & 3);
+    return 0;
+}
+
+static long check_rights_stream(void) {
+    int ends[2], pipe_fds[2];
+    if (pair_type(ends, SOCK_STREAM) || call(22, (word)pipe_fds, 0, 0, 0, 0) ||
+        call(1, ends[0], (word)"X", 1, 0, 0) != 1 ||
+        send_rights(ends[0], "AB", 2, &pipe_fds[1], 1) != 2 ||
+        send_rights(ends[0], "CD", 2, &pipe_fds[1], 1) != 2 ||
+        call(1, ends[0], (word)"Z", 1, 0, 0) != 1 || close_fd(pipe_fds[1])) return 91;
+    struct rights peek = {0}, first = {0}, second = {0};
+    char bytes[8];
+    if (recv_rights(ends[1], bytes, sizeof(bytes), &peek, 20, MSG_PEEK, 0) != 3 ||
+        bytes[0] != 'X' || bytes[1] != 'A' || bytes[2] != 'B' || peek.length != 20 ||
+        recv_rights(ends[1], bytes, 2, &first, sizeof(first), 0, 0) != 2 ||
+        bytes[0] != 'X' || bytes[1] != 'A' || first.length != 20 || first.fds[0] == peek.fds[0] ||
+        recv_rights(ends[1], bytes, sizeof(bytes), &second, sizeof(second), 0, 0) != 3 ||
+        bytes[0] != 'B' || bytes[1] != 'C' || bytes[2] != 'D' || second.length != 20) return 92;
+    if (call(0, ends[1], (word)bytes, sizeof(bytes), 0, 0) != 1 || bytes[0] != 'Z' ||
+        close_fd(peek.fds[0]) || close_fd(first.fds[0]) || close_fd(second.fds[0]) ||
+        call(0, pipe_fds[0], (word)bytes, 1, 0, 0) || close_fd(pipe_fds[0]) ||
+        close_fd(ends[0]) || close_fd(ends[1])) return 93;
+    return 0;
+}
+
+static long check_rights_discard(void) {
+    int ends[2], pipe_fds[2], invalid = -1;
+    if (pair_type(ends, SOCK_STREAM) || call(22, (word)pipe_fds, 0, 0, 0, 0) ||
+        send_rights(ends[0], "x", 1, &invalid, 1) != -9) return 94;
+    int fds[] = {pipe_fds[1], pipe_fds[1]};
+    if (send_rights(ends[0], "ab", 2, fds, 2) != 2 ||
+        send_rights(ends[0], "cd", 2, fds, 2) != 2 || close_fd(pipe_fds[1])) return 94;
+    struct rights control = {0};
+    unsigned flags;
+    char bytes[4];
+    if (recv_rights(ends[1], bytes, 2, &control, 20, 0, &flags) != 2 ||
+        !(flags & MSG_CTRUNC) || control.length != 20 || close_fd(control.fds[0]) ||
+        call(0, ends[1], (word)bytes, 1, 0, 0) != 1 || bytes[0] != 'c' ||
+        call(0, pipe_fds[0], (word)bytes, 1, 0, 0) || close_fd(pipe_fds[0]) ||
+        close_fd(ends[0]) || close_fd(ends[1])) return 95;
+    return 0;
+}
+
+static long check_rights_fault(void) {
+    int ends[2], pipe_fds[2];
+    if (pair(ends) || call(293, (word)pipe_fds, SOCK_NONBLOCK, 0, 0, 0)) return 98;
+    struct iovec data = {(void *)"x", 1};
+    struct msghdr bad = {.iov = &data, .iov_count = 1, .control = (void *)1, .control_length = 20};
+    if (send(ends[0], &bad) != -14 || send_rights(ends[0], "x", 1, &pipe_fds[1], 1) != 1 ||
+        close_fd(pipe_fds[1])) return 98;
+    char byte;
+    unsigned flags;
+    if (recv_rights(ends[1], &byte, 1, (struct rights *)1, 20, 0, &flags) != 1 ||
+        byte != 'x' || !(flags & MSG_CTRUNC) || call(0, pipe_fds[0], (word)&byte, 1, 0, 0) ||
+        close_fd(pipe_fds[0]) || close_fd(ends[0]) || close_fd(ends[1])) return 99;
+    return 0;
+}
+
+static long check_rights_metadata_fault(void) {
+    int ends[2], pipe_fds[2];
+    if (pair(ends) || call(293, (word)pipe_fds, SOCK_NONBLOCK, 0, 0, 0)) return 102;
+    static unsigned char page[4096] __attribute__((aligned(4096)));
+    struct msghdr *message = (void *)page;
+    char byte;
+    struct iovec data = {&byte, 1};
+    struct rights rights = {.fds = {-1}};
+    *message = (struct msghdr){.iov = &data, .iov_count = 1, .control = &rights,
+                               .control_length = sizeof(rights)};
+    if (send_rights(ends[0], "x", 1, &pipe_fds[1], 1) != 1 || close_fd(pipe_fds[1]) ||
+        call(10, (word)page, sizeof(page), 1, 0, 0) || receive(ends[1], message, 0) != -14 ||
+        call(10, (word)page, sizeof(page), 3, 0, 0) || byte != 'x' ||
+        rights.length != 20 || rights.fds[0] < 3) return 102;
+    char system[390];
+    if (call(63, (word)system, 0, 0, 0, 0)) return 103;
+    long closed = close_fd(rights.fds[0]);
+    /* Linux может оставить установленный FD, если заголовок recvmsg недоступен для записи. */
+    if ((system[0] == 'M' ? closed != -9 : closed && closed != -9) ||
+        call(0, pipe_fds[0], (word)&byte, 1, 0, 0) ||
+        close_fd(pipe_fds[0]) || close_fd(ends[0]) || close_fd(ends[1])) return 103;
+    return 0;
+}
+
+static long check_rights_wait(void) {
+    int ends[2];
+    if (pair(ends)) return 100;
+    unsigned filled = 0;
+    for (;;) {
+        long result = call(1, ends[0], (word)"p", 1, 0, 0);
+        if (result == -11) break;
+        if (result != 1 || ++filled > 4096) return 100;
+    }
+    if (call(72, ends[0], 4, 0, 0, 0) || call(72, ends[1], 4, 0, 0, 0)) return 100;
+    long child = call(57, 0, 0, 0, 0, 0);
+    if (!child) {
+        char byte;
+        if (close_fd(ends[0]) || call(7, 0, 0, 20, 0, 0)) call(60, 1, 0, 0, 0, 0);
+        for (unsigned i = 0; i < filled; ++i)
+            if (call(0, ends[1], (word)&byte, 1, 0, 0) != 1 || byte != 'p')
+                call(60, 2, 0, 0, 0, 0);
+        struct rights rights = {0};
+        if (recv_rights(ends[1], &byte, 1, &rights, sizeof(rights), 0, 0) != 1 ||
+            byte != 'r' || rights.length != 20 || call(1, rights.fds[0], (word)"w", 1, 0, 0) != 1)
+            call(60, 3, 0, 0, 0, 0);
+        call(60, 0, 0, 0, 0, 0);
+        __builtin_trap();
+    }
+    int pipe_fds[2], status;
+    char byte;
+    if (child < 0 || close_fd(ends[1]) || call(22, (word)pipe_fds, 0, 0, 0, 0) ||
+        send_rights(ends[0], "r", 1, &pipe_fds[1], 1) != 1 || close_fd(pipe_fds[1]) ||
+        call(61, child, (word)&status, 0, 0, 0) != child || status ||
+        call(0, pipe_fds[0], (word)&byte, 1, 0, 0) != 1 || byte != 'w' ||
+        close_fd(pipe_fds[0]) || close_fd(ends[0])) return 101;
+    return 0;
+}
+
+static long check_rights_gc(void) {
+    int left[2], right[2], pipe_fds[2];
+    if (pair_type(left, SOCK_STREAM) || pair(right) || call(22, (word)pipe_fds, 0, 0, 0, 0)) return 96;
+    int fds[] = {right[1], pipe_fds[1]};
+    if (send_rights(left[0], "x", 1, fds, 2) != 1 ||
+        send_rights(right[0], "y", 1, &left[1], 1) != 1 ||
+        close_fd(pipe_fds[1]) || close_fd(left[0]) || close_fd(right[0]) ||
+        close_fd(left[1])) return 96;
+    struct { int fd; short events, revents; } ready = {pipe_fds[0], 1, 0};
+    char byte;
+    if (call(7, (word)&ready, 1, 0, 0, 0) || close_fd(right[1]) ||
+        call(7, (word)&ready, 1, 500, 0, 0) != 1 || !(ready.revents & 16) ||
+        call(0, pipe_fds[0], (word)&byte, 1, 0, 0) || close_fd(pipe_fds[0])) return 97;
+    return 0;
+}
+
 static long check(void) {
     long status = check_stream();
     if (!status) status = check_stream_fd_limit();
     if (!status) status = check_stream_pair();
     if (!status) status = check_sendto();
+    if (!status) status = check_rights_fork(SOCK_STREAM);
+    if (!status) status = check_rights_fork(SOCK_SEQPACKET);
+    if (!status) status = check_rights_stream();
+    if (!status) status = check_rights_discard();
+    if (!status) status = check_rights_fault();
+    if (!status) status = check_rights_metadata_fault();
+    if (!status) status = check_rights_wait();
+    if (!status) status = check_rights_gc();
     struct unix_address address = {AF_UNIX, "/tmp/myos-socket-0000000000"};
     unsigned pid = (unsigned)call(39, 0, 0, 0, 0, 0);
     for (unsigned i = sizeof("/tmp/myos-socket-0000000000") - 2; pid; --i, pid /= 10)

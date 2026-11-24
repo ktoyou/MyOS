@@ -91,9 +91,10 @@ static struct file_handle {
     uptr directory_path;
     uptr offset;
     struct epoll_watch *watches, *epoll_next;
+    struct file_handle *released_next;
     u64 event_count;
     u32 flags;
-    unsigned references, watched_by;
+    unsigned references, watched_by, scm_inflight;
     bool event_semaphore;
 } open_files[OPEN_FILE_COUNT];
 
@@ -312,8 +313,10 @@ static void epoll_remove_target(struct file_handle *target) {
     }
 }
 
-static void release_file(struct file_handle *file) {
-    if (!file || --file->references) return;
+static struct file_handle *released_files;
+static bool draining_files, scm_collection_needed;
+
+static void destroy_file(struct file_handle *file) {
     epoll_remove_target(file);
     while (file->watches) epoll_remove(file, &file->watches);
     if (file->socket) linux64_socket_close(file->socket);
@@ -329,6 +332,53 @@ static void release_file(struct file_handle *file) {
     *file = (struct file_handle){0};
 }
 
+static void release_file(struct file_handle *file) {
+    if (!file) return;
+    if (--file->references) {
+        if (file->socket && file->references == file->scm_inflight) scm_collection_needed = true;
+        return;
+    }
+    file->released_next = released_files;
+    released_files = file;
+    /* Закрытие сокета может высвободить следующее звено цепочки SCM_RIGHTS. */
+    if (draining_files) return;
+    draining_files = true;
+    while (released_files) {
+        file = released_files;
+        released_files = file->released_next;
+        destroy_file(file);
+    }
+    draining_files = false;
+}
+
+void linux64_scm_mark_roots(void) {
+    for (unsigned i = 0; i < OPEN_FILE_COUNT; ++i) {
+        struct file_handle *file = &open_files[i];
+        if (file->references > file->scm_inflight) linux64_scm_mark_socket(file->socket);
+    }
+}
+
+void linux64_scm_collect_pending(void) {
+    while (scm_collection_needed) {
+        scm_collection_needed = false;
+        linux64_scm_collect_sockets();
+    }
+}
+
+void linux64_scm_set_inflight(struct file_handle *file, bool inflight) {
+    if (inflight) {
+        if (++file->scm_inflight == file->references && file->socket) scm_collection_needed = true;
+    } else --file->scm_inflight;
+}
+
+struct linux64_socket *linux64_scm_file_socket(const struct file_handle *file) {
+    return file->socket;
+}
+
+void linux64_scm_put_file(struct file_handle *file) {
+    release_file(file);
+}
+
 static void close_slot(struct linux64_fd_slot *slot) {
     release_file(slot->file);
     *slot = (struct linux64_fd_slot){0};
@@ -340,6 +390,8 @@ void linux64_pipe_finish(struct linux64_task *task) {
 }
 
 void linux64_socket_wait_finish(struct linux64_task *task) {
+    linux64_scm_release(task->socket_wait.rights);
+    task->socket_wait.rights = NULL;
     release_file(task->socket_wait.file);
     task->socket_wait.file = NULL;
 }
@@ -661,13 +713,32 @@ static unsigned free_fd(unsigned fd) {
     return fd;
 }
 
-static long copy_fd(i32 source, unsigned target, bool cloexec) {
-    struct file_handle *file = file_at(source);
+struct file_handle *linux64_scm_get_file(i32 fd) {
+    if (!open_file(fd)) return NULL;
+    struct file_handle *file = file_at(fd);
+    ++file->references;
+    return file;
+}
+
+void linux64_scm_close(i32 fd) {
+    close_slot(&linux64_current->process->fds[fd]);
+}
+
+static long install_file(struct file_handle *file, unsigned target, bool cloexec) {
     struct linux64_fd_slot *slot = &linux64_current->process->fds[target];
     ++file->references;
     close_slot(slot);
     *slot = (struct linux64_fd_slot){file, cloexec};
     return target;
+}
+
+long linux64_scm_install(struct file_handle *file, bool cloexec) {
+    unsigned target = free_fd(0);
+    return target == FD_COUNT ? -EMFILE : install_file(file, target, cloexec);
+}
+
+static long copy_fd(i32 source, unsigned target, bool cloexec) {
+    return install_file(file_at(source), target, cloexec);
 }
 
 static long dup_fd(i32 source, u32 minimum, bool cloexec) {
@@ -886,7 +957,7 @@ static long socket_attempt(struct linux64_socket_wait *wait) {
         return socket_write(wait);
     case SOCKET_SENDMSG:
     case SOCKET_RECVMSG:
-        return linux64_socket_message(socket, wait->operation == SOCKET_RECVMSG, wait->address, wait->flags);
+        return linux64_socket_message(socket, wait);
     }
     return -EINVAL;
 }
@@ -895,12 +966,16 @@ static long socket_run(struct linux64_socket_wait wait) {
     bool per_call = wait.operation == SOCKET_WRITE || wait.operation == SOCKET_SENDMSG ||
                     wait.operation == SOCKET_RECVMSG;
     wait.blocking = !(wait.file->flags & O_NONBLOCK) && !(per_call && (wait.flags & MSG_DONTWAIT));
+    if (wait.operation == SOCKET_SENDMSG) {
+        long result = linux64_socket_prepare_rights(wait.address, wait.flags, &wait.rights);
+        if (result) return result;
+    }
     long result = socket_attempt(&wait);
     if (result == -EAGAIN && wait.blocking) {
         ++wait.file->references;
         linux64_current->socket_wait = wait;
         linux64_current->state = TASK_SOCKET_WAIT;
-    }
+    } else linux64_scm_release(wait.rights);
     return result;
 }
 

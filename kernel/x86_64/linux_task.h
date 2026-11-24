@@ -67,9 +67,11 @@ struct linux64_pipe_io {
 
 enum linux64_socket_operation { SOCKET_CONNECT, SOCKET_ACCEPT, SOCKET_READ, SOCKET_WRITE,
                                 SOCKET_SENDMSG, SOCKET_RECVMSG };
+struct linux64_scm_rights;
 
 struct linux64_socket_wait {
     struct file_handle *file;
+    struct linux64_scm_rights *rights;
     uptr address, length, transferred;
     u64 inode;
     u32 flags;
@@ -227,6 +229,19 @@ long linux64_read_signal_mask(uptr set, uptr sigset_size, u64 *mask);
 bool linux64_socket_wait_ready(const struct linux64_task *task);
 void linux64_socket_wait_finish(struct linux64_task *task);
 long linux64_socket_wait_resume(void);
+long linux64_socket_prepare_rights(uptr message, u32 flags, struct linux64_scm_rights **rights);
+long linux64_socket_message(struct linux64_socket *socket, struct linux64_socket_wait *wait);
+void linux64_scm_release(struct linux64_scm_rights *rights);
+struct file_handle *linux64_scm_get_file(i32 fd);
+void linux64_scm_put_file(struct file_handle *file);
+struct linux64_socket *linux64_scm_file_socket(const struct file_handle *file);
+void linux64_scm_set_inflight(struct file_handle *file, bool inflight);
+long linux64_scm_install(struct file_handle *file, bool cloexec);
+void linux64_scm_close(i32 fd);
+void linux64_scm_collect_pending(void);
+void linux64_scm_collect_sockets(void);
+void linux64_scm_mark_socket(struct linux64_socket *socket);
+void linux64_scm_mark_roots(void);
 bool linux64_eventfd_ready(const struct linux64_eventfd_wait *wait);
 long linux64_eventfd_resume(void);
 void linux64_eventfd_wait_finish(struct linux64_task *task);
