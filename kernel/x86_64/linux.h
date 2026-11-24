@@ -75,6 +75,7 @@ u16 linux64_socket_poll(const struct linux64_socket *socket);
 long linux64_mmap(uptr address, uptr length, u32 protection, u32 flags, i32 fd, uptr offset);
 long linux64_mprotect(uptr address, uptr length, uptr protection);
 long linux64_munmap(uptr address, uptr length);
+long linux64_madvise(uptr address, uptr length, i32 advice);
 uptr linux64_random_bytes(void *buffer, uptr length);
 long linux64_getrandom(uptr address, uptr length, u32 flags);
 void linux64_clock_init(void);

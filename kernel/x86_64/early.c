@@ -288,7 +288,7 @@ void kernel64_exception(u64 vector, u64 error, u64 rip, u64 cs, uptr frame, uptr
     if (vector == 14) __asm__ volatile("mov %%cr2,%0" : "=r"(cr2));
 #ifdef X64_TEST_LINUX
     if ((cs & 3u) == 3) {
-        if (vector == 14 && paging64_stack_fault(cr2, error)) return;
+        if (vector == 14 && paging64_zero_fault(cr2, error)) return;
         linux64_task_exception(vector);
     }
 #endif
