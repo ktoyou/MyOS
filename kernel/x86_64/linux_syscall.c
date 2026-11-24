@@ -8,8 +8,6 @@
 #define FMASK  0xc0000084u
 #define ARCH_SET_FS  0x1002
 #define ARCH_GET_FS  0x1003
-#define FUTEX_WAKE 1u
-#define FUTEX_PRIVATE_FLAG 128u
 
 extern void linux64_syscall_entry(void);
 
@@ -30,16 +28,6 @@ static long linux_arch_prctl(i32 operation, uptr value) {
         return paging64_put_user_u64(value, linux64_rdmsr(LINUX64_FS_BASE)) ? 0 : -14;
     }
     return -22;
-}
-
-static long linux_futex(uptr address, u32 operation) {
-    if ((operation & ~FUTEX_PRIVATE_FLAG) != FUTEX_WAKE) return -38;
-    if (address & (sizeof(u32) - 1)) return -22;
-    if (address > X64_USER_TOP - sizeof(u32)) return -14;
-    if (!(operation & FUTEX_PRIVATE_FLAG) && !paging64_shared_futex_address(address))
-        return -14;
-    /* В тестовом процессе один поток, поэтому очередь ожидания пуста. */
-    return 0;
 }
 
 bool linux64_enable_syscall(void) {
@@ -102,14 +90,15 @@ long linux64_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2,
     if (number == 11) return linux64_munmap(arg0, arg1);
     if (number == 13) return linux64_rt_sigaction((i32)arg0, arg1, arg2, arg3);
     if (number == 14) return linux64_rt_sigprocmask((i32)arg0, arg1, arg2, arg3);
-    if (number == 39 || number == 186) return linux64_current->pid; /* getpid, gettid */
+    if (number == 39) return linux64_current->process->pid; /* getpid */
+    if (number == 186) return linux64_current->tid; /* gettid */
     if (number == 54 || number == 55)
         return linux64_sockopt(number == 55, (i32)arg0, (i32)arg1, (i32)arg2, arg3, arg4);
     if (number == 63) return linux_uname(arg0);
     if (number == 102 || number == 107) return LINUX64_UID; /* getuid, geteuid */
     if (number == 104 || number == 108) return LINUX64_GID; /* getgid, getegid */
     if (number == 158) return linux_arch_prctl((i32)arg0, arg1);
-    if (number == 202) return linux_futex(arg0, (u32)arg1);
+    if (number == 202) return linux64_futex(arg0, (u32)arg1, (u32)arg2, arg3, (u32)arg5);
     if (number == 228) return linux64_clock_gettime((i32)arg0, arg1);
     if (number == 318) return linux64_getrandom(arg0, arg1, (u32)arg2);
     return linux64_file_syscall(number, arg0, arg1, arg2, arg3);

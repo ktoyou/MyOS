@@ -12,7 +12,7 @@ _Static_assert(sizeof(struct linux64_sigaction) == 32, "Linux x86-64 sigaction s
 
 void linux64_reset_signals(void) {
     for (unsigned i = 0; i < LINUX64_SIGNAL_COUNT; ++i)
-        linux64_current->actions[i] = (struct linux64_sigaction){0};
+        linux64_current->process->actions[i] = (struct linux64_sigaction){0};
     linux64_current->signal_mask = 0;
 }
 
@@ -23,7 +23,7 @@ long linux64_rt_sigaction(i32 signal, uptr action, uptr previous, uptr sigset_si
         return -14;
     if (signal < 1 || signal > (i32)LINUX64_SIGNAL_COUNT ||
         (action && (signal == SIGKILL || signal == SIGSTOP))) return -22;
-    struct linux64_sigaction *slot = &linux64_current->actions[signal - 1];
+    struct linux64_sigaction *slot = &linux64_current->process->actions[signal - 1];
     const struct linux64_sigaction old = *slot;
     if (action) {
         input.flags &= SA_USER_FLAGS;

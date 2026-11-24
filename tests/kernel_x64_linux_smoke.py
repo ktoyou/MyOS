@@ -166,6 +166,16 @@ def check_pipe(build):
     print('OVMF: Linux pipes, FIFO, descriptor cleanup and blocking I/O: PASS', flush=True)
 
 
+def check_pthread(build):
+    probe = (build / 'linux-pthread.elf').resolve()
+    marker = 'Linux ELF64 pthread probe'
+    host = subprocess.run([str(probe)], env={}, capture_output=True, timeout=5)
+    assert (host.returncode, host.stdout, host.stderr) == (0, (marker + '\n').encode(), b''), host
+    serial = check_guest('pthread', probe.read_bytes(), 'Linux x86-64 exit status=0x00')
+    assert marker in serial, serial
+    print('OVMF: Linux pthread TLS, shared process state, futex and group exit: PASS', flush=True)
+
+
 def check_fork(build):
     probe = (build / 'linux-fork.elf').resolve()
     marker = 'Linux ELF64 fork probe'
@@ -259,6 +269,7 @@ def main():
     check_socket(build)
     check_pipe(build)
     check_fork(build)
+    check_pthread(build)
     check_vfork(build)
     check_exec(build)
 

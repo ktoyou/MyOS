@@ -54,7 +54,7 @@ static struct file_handle {
 } open_files[OPEN_FILE_COUNT];
 
 static struct file_handle *file_at(i32 fd) {
-    return linux64_current->fds[fd].file;
+    return linux64_current->process->fds[fd].file;
 }
 
 static enum file_kind kind_of(const struct file_handle *file) {
@@ -85,9 +85,7 @@ static void memfd_trim(struct memfd *memfd, uptr first, uptr end) {
     }
 }
 
-static void close_slot(struct linux64_fd_slot *slot) {
-    struct file_handle *file = slot->file;
-    *slot = (struct linux64_fd_slot){0};
+static void release_file(struct file_handle *file) {
     if (!file || --file->references) return;
     if (file->socket) linux64_socket_close(file->socket);
     if (file->pipe) linux64_pipe_close(file->pipe, (file->flags & O_ACCMODE) == O_WRONLY);
@@ -99,29 +97,49 @@ static void close_slot(struct linux64_fd_slot *slot) {
     *file = (struct file_handle){0};
 }
 
+static void close_slot(struct linux64_fd_slot *slot) {
+    release_file(slot->file);
+    *slot = (struct linux64_fd_slot){0};
+}
+
+void linux64_pipe_finish(struct linux64_task *task) {
+    release_file(task->pipe_io.file);
+    task->pipe_io.file = NULL;
+}
+
+static long pipe_io(struct file_handle *file, bool write, uptr address, uptr length) {
+    long result = linux64_pipe_io(file->pipe, write, (file->flags & O_NONBLOCK) != 0,
+                                  address, length);
+    if (linux64_current->state == TASK_PIPE_WAIT) {
+        ++file->references;
+        linux64_current->pipe_io.file = file;
+    }
+    return result;
+}
+
 static void close_file(i32 fd) {
-    close_slot(&linux64_current->fds[fd]);
+    close_slot(&linux64_current->process->fds[fd]);
 }
 
-void linux64_close_files(struct linux64_task *task) {
-    for (unsigned fd = STDIO_COUNT; fd < FD_COUNT; ++fd) close_slot(&task->fds[fd]);
+void linux64_close_files(struct linux64_process *process) {
+    for (unsigned fd = STDIO_COUNT; fd < FD_COUNT; ++fd) close_slot(&process->fds[fd]);
 }
 
-void linux64_close_on_exec(struct linux64_task *task) {
+void linux64_close_on_exec(struct linux64_process *process) {
     for (unsigned fd = STDIO_COUNT; fd < FD_COUNT; ++fd)
-        if (task->fds[fd].cloexec) close_slot(&task->fds[fd]);
+        if (process->fds[fd].cloexec) close_slot(&process->fds[fd]);
 }
 
-void linux64_retain_files(struct linux64_task *task) {
+void linux64_retain_files(struct linux64_process *process) {
     for (unsigned fd = STDIO_COUNT; fd < FD_COUNT; ++fd)
-        if (task->fds[fd].file) ++task->fds[fd].file->references;
+        if (process->fds[fd].file) ++process->fds[fd].file->references;
 }
 
 void linux64_use_files(const struct linux64_file_source *source, const char *path, uptr path_length) {
     files = source ? *source : (struct linux64_file_source){0};
-    linux64_current->executable_path_length = path_length;
-    for (uptr i = 0; i <= path_length; ++i) linux64_current->executable_path[i] = path[i];
-    linux64_close_files(linux64_current);
+    linux64_current->process->executable_path_length = path_length;
+    for (uptr i = 0; i <= path_length; ++i) linux64_current->process->executable_path[i] = path[i];
+    linux64_close_files(linux64_current->process);
 }
 
 const struct linux64_file_source *linux64_file_source(void) {
@@ -212,7 +230,7 @@ static long new_handle(const struct linux64_file *file, struct memfd *memfd, u32
                                             .references = 1};
         if (file) description->file = *file;
         if (memfd) ++memfd->handles;
-        linux64_current->fds[fd] = (struct linux64_fd_slot){description, (flags & O_CLOEXEC) != 0};
+        linux64_current->process->fds[fd] = (struct linux64_fd_slot){description, (flags & O_CLOEXEC) != 0};
         return fd;
     }
     return -EMFILE;
@@ -341,9 +359,9 @@ static long linux_ftruncate(i32 fd, uptr size) {
 static long linux_fcntl(i32 fd, i32 command, u32 value) {
     if (!open_file(fd)) return -EBADF;
     struct memfd *memfd = file_at(fd)->memfd;
-    if (command == F_GETFD) return linux64_current->fds[fd].cloexec;
+    if (command == F_GETFD) return linux64_current->process->fds[fd].cloexec;
     if (command == F_SETFD) {
-        linux64_current->fds[fd].cloexec = (value & 1) != 0;
+        linux64_current->process->fds[fd].cloexec = (value & 1) != 0;
         return 0;
     }
     if (command == F_GETFL) return file_at(fd)->flags;
@@ -411,10 +429,10 @@ static long linux_readlink(uptr path_address, uptr destination, i32 size) {
         struct linux64_file file;
         return files.lookup && files.lookup(files.context, absolute, &file) ? -EINVAL : -ENOENT;
     }
-    uptr length = linux64_current->executable_path_length;
+    uptr length = linux64_current->process->executable_path_length;
     if (!length) return -ENOENT;
     if (length > (uptr)size) length = (uptr)size;
-    return paging64_copy_to_user(destination, linux64_current->executable_path, length) == length
+    return paging64_copy_to_user(destination, linux64_current->process->executable_path, length) == length
         ? (long)length : -EFAULT;
 }
 
@@ -451,7 +469,7 @@ static long linux_read(i32 fd, uptr buffer, uptr count, uptr offset, bool positi
     if (handle->pipe) {
         if (positioned) return -ESPIPE;
         if ((handle->flags & O_ACCMODE) == O_WRONLY) return -EBADF;
-        return linux64_pipe_io(handle->pipe, false, (handle->flags & O_NONBLOCK) != 0, buffer, count);
+        return pipe_io(handle, false, buffer, count);
     }
     if (handle->socket)
         return positioned ? -ESPIPE : linux64_socket_io(handle->socket, true, buffer, count);
@@ -516,8 +534,7 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
         if (!open_file(fd)) return -EBADF;
         if (file_at(fd)->socket) return linux64_socket_io(file_at(fd)->socket, false, arg1, arg2);
         if (!file_at(fd)->pipe || (file_at(fd)->flags & O_ACCMODE) != O_WRONLY) return -EBADF;
-        return linux64_pipe_io(file_at(fd)->pipe, true, (file_at(fd)->flags & O_NONBLOCK) != 0,
-                               arg1, arg2);
+        return pipe_io(file_at(fd), true, arg1, arg2);
     case 2: /* open */
         return linux_open(AT_FDCWD, arg0, (u32)arg1);
     case 3: /* close */
