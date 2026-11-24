@@ -1,0 +1,52 @@
+--- a/frontends/framebuffer/gui.c
++++ b/frontends/framebuffer/gui.c
+@@ -1158,6 +1158,31 @@
+ 	return 0;
+ }
+ 
++static nserror
++myos_address_url(const char *text, nsurl **url)
++{
++	while (*text == ' ' || *text == '\t')
++		text++;
++	size_t end = strcspn(text, ":/?#");
++	bool port = text[end] == ':' && text[end + 1] >= '0' && text[end + 1] <= '9';
++	if (port) {
++		const char *rest = text + end + 1;
++		rest += strspn(rest, "0123456789");
++		port = *rest == 0 || *rest == '/' || *rest == '?' || *rest == '#';
++	}
++	if (*text == 0 || *text == '/' || (text[end] == ':' && !port && *text != '['))
++		return nsurl_create(text, url);
++
++	char *address = malloc(strlen(text) + sizeof("https://"));
++	if (address == NULL)
++		return NSERROR_NOMEM;
++	strcpy(address, "https://");
++	strcat(address, text);
++	nserror error = nsurl_create(address, url);
++	free(address);
++	return error;
++}
++
+ static int
+ fb_url_enter(void *pw, char *text)
+ {
+@@ -1165,7 +1190,7 @@
+ 	nsurl *url;
+ 	nserror error;
+ 
+-	error = nsurl_create(text, &url);
++	error = myos_address_url(text, &url);
+ 	if (error != NSERROR_OK) {
+ 		fb_warn_user("Errorcode:", messages_get_errorcode(error));
+ 	} else {
+@@ -2254,7 +2279,7 @@
+ 
+ 	NSLOG(netsurf, INFO, "calling browser_window_create");
+ 
+-	ret = nsurl_create(feurl, &url);
++	ret = myos_address_url(feurl, &url);
+ 	if (ret == NSERROR_OK) {
+ 		ret = browser_window_create(BW_CREATE_HISTORY,
+ 					      url,

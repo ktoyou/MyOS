@@ -1191,6 +1191,8 @@ dhcptest: | $(BUILD)
 ethernet-smoke: usb-image
 	python3 tests/ethernet_smoke.py
 ethernettest: | $(BUILD)
+	$(HOSTCC) -m32 -std=gnu11 -g -O1 -fsanitize=address,undefined -fno-builtin -ffunction-sections -fdata-sections tests/tcp_segments.c -Wl,--gc-sections -o $(BUILD)/tcp-segments-test
+	./$(BUILD)/tcp-segments-test
 	$(HOSTCC) -m32 -std=gnu11 -g -O1 -fsanitize=address,undefined -fno-builtin tests/e1000_driver.c -o $(BUILD)/e1000-driver-test
 	./$(BUILD)/e1000-driver-test
 consoleloadtest: usb-image $(BUILD)/user/consoleload

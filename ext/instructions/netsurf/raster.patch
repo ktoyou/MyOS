@@ -1,0 +1,33 @@
+--- a/content/handlers/image/Makefile
++++ b/content/handlers/image/Makefile
+@@ -1,7 +1,7 @@
+ # Image content handlers sources
+ 
+ # S_IMAGE are sources related to image management
+-S_IMAGE_YES := image.c image_cache.c
++S_IMAGE_YES := image.c image_cache.c myos-image.c
+ S_IMAGE_NO :=
+ S_IMAGE_$(NETSURF_USE_BMP) += bmp.c
+ S_IMAGE_$(NETSURF_USE_GIF) += gif.c
+--- a/content/handlers/image/image.c
++++ b/content/handlers/image/image.c
+@@ -40,6 +40,8 @@
+ #include "image/webp.h"
+ #include "image/image.h"
+ 
++nserror myos_raster_init(void);
++
+ /**
+  * Initialise image content handlers
+  *
+@@ -47,7 +49,9 @@
+  */
+ nserror image_init(void)
+ {
+-	nserror error = NSERROR_OK;
++	nserror error = myos_raster_init();
++	if (error != NSERROR_OK)
++		return error;
+ 
+ #ifdef WITH_BMP
+ 	error = nsbmp_init();

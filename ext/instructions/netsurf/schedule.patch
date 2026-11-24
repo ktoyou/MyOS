@@ -1,0 +1,45 @@
+--- a/frontends/framebuffer/schedule.c
++++ b/frontends/framebuffer/schedule.c
+@@ -23,6 +23,15 @@
+ #include "utils/log.h"
+ 
+ #include "framebuffer/schedule.h"
++
++/* Интервалы событий отсчитываются от монотонных часов MyOS. */
++static void schedule_now(struct timeval *tv)
++{
++	struct timespec ts;
++	clock_gettime(CLOCK_MONOTONIC, &ts);
++	tv->tv_sec = ts.tv_sec;
++	tv->tv_usec = ts.tv_nsec / 1000;
++}
+ 
+ /* linked list of scheduled callbacks */
+ static struct nscallback *schedule_list = NULL;
+@@ -111,7 +120,7 @@
+ 
+ 	nscb = calloc(1, sizeof(struct nscallback));
+ 
+-	gettimeofday(&nscb->tv, NULL);
++	schedule_now(&nscb->tv);
+ 	timeradd(&nscb->tv, &tv, &nscb->tv);
+ 
+ 	nscb->callback = callback;
+@@ -142,7 +151,7 @@
+         prev_nscb = NULL;
+ 	nexttime = cur_nscb->tv;
+ 
+-	gettimeofday(&tv, NULL);
++	schedule_now(&tv);
+ 
+         while (cur_nscb != NULL) {
+                 if (timercmp(&tv, &cur_nscb->tv, >)) {
+@@ -198,7 +207,7 @@
+ 	struct timeval tv;
+         struct nscallback *cur_nscb;
+ 
+-	gettimeofday(&tv, NULL);
++	schedule_now(&tv);
+ 
+         NSLOG(netsurf, INFO, "schedule list at %ld:%ld", tv.tv_sec,
+               tv.tv_usec);

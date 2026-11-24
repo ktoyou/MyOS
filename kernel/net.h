@@ -81,6 +81,7 @@ struct sock {
     /* TCP */
     enum tcp_state state;
     u32  iss, snd_una, snd_nxt, snd_wnd, rcv_nxt;
+    u16  snd_mss;
     u8  *rxbuf; u32 rx_head, rx_len;       /* кольцо принятых, ещё не прочитанных байт */
     u8  *txbuf; u32 tx_len;                /* отправленные-но-не-подтверждённые + ещё не отправленные; txbuf[0] = snd_una */
     bool fin_pending, fin_sent, fin_acked, peer_fin;

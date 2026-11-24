@@ -59,9 +59,21 @@ endif
 netsurf-browser-smoke: netsurf-browser $(BUILD)/os.img $(BUILD)/myfs $(BUILD)/ld.so $(BUILD)/user/libc.so $(BUILD)/user/libgfx.so $(addprefix $(BUILD)/user/,sh desktop sleep tar ext)
 	python3 tests/netsurf_browser_smoke.py
 
-netsurf-browser: netsurf-libs $(BUILD)/netsurf-src/.browser-patched $(BUILD)/libnsfb-myos.a $(ULIB) $(BUILD)/user/libcurl.so $(MLIBS)
+netsurf-browser: netsurf-libs $(BUILD)/netsurf-src/.browser-patched $(BUILD)/netsurf-src/.raster-patched $(BUILD)/netsurf-src/.https-patched $(BUILD)/netsurf-src/.schedule-patched $(BUILD)/libnsfb-myos.a $(ULIB) $(BUILD)/user/libcurl.so $(MLIBS)
 	+sh $(NS_PORT)/build-browser.sh "$(abspath $(NS_ROOT)/..)" "$(abspath $(BUILD))/netsurf-sdk"
 
 $(BUILD)/netsurf-src/.browser-patched: $(BUILD)/netsurf-src/.unpacked $(NS_PORT)/browser.patch
 	patch -d $(NS_ROOT)/../netsurf -p1 < $(NS_PORT)/browser.patch
+	touch $@
+
+$(BUILD)/netsurf-src/.raster-patched: $(BUILD)/netsurf-src/.unpacked $(NS_PORT)/raster.patch
+	patch -d $(NS_ROOT)/../netsurf -p1 < $(NS_PORT)/raster.patch
+	touch $@
+
+$(BUILD)/netsurf-src/.https-patched: $(NS_PORT)/https.patch | $(BUILD)/netsurf-src/.browser-patched
+	patch -d $(NS_ROOT)/../netsurf -p1 < $(NS_PORT)/https.patch
+	touch $@
+
+$(BUILD)/netsurf-src/.schedule-patched: $(BUILD)/netsurf-src/.unpacked $(NS_PORT)/schedule.patch
+	patch -d $(NS_ROOT)/../netsurf -p1 < $(NS_PORT)/schedule.patch
 	touch $@

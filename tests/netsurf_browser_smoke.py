@@ -4,18 +4,25 @@ from disk_install_smoke import VM,run
 from hardware_inventory_smoke import login
 
 B=pathlib.Path('build')
+IMAGES = pathlib.Path(__file__).parent / 'fixtures' / 'netsurf'
 
-def main():
+def check_browser(local_start):
     with tempfile.TemporaryDirectory(prefix='myos-netsurf-') as directory:
         temp=pathlib.Path(directory);root=temp/'root.img'
         class Fixture(http.server.BaseHTTPRequestHandler):
             protocol_version = 'HTTP/1.1'
             def do_GET(self):
-                if self.path == '/next':
+                if self.path == '/start':
+                    mime, body = 'text/html', page.read_bytes()
+                elif self.path == '/next':
                     mime = 'text/html'
                     body = (b'<!doctype html><body><script>document.write('
                             b'\'<div style="background:#2e679b;height:80px">HTTPS and JS</div>\''
-                            b');</script></body>')
+                            b');</script><img src="/tile.png"><img src="/tile.jpg">' +
+                            b'<span>x</span>' * 1500 + b'</body>')
+                elif self.path in ('/tile.png', '/tile.jpg'):
+                    mime = 'image/png' if self.path.endswith('.png') else 'image/jpeg'
+                    body = (IMAGES / self.path[1:]).read_bytes()
                 elif self.path == '/test.css':
                     mime, body = 'text/css', b'h1 {background-color:#ad42ce}'
                 else:
@@ -53,7 +60,8 @@ def main():
                         f'<body style="background:#12ab34"><a href="{origin}/next"><h1>Open HTTPS</h1></a></body>')
         run(B/'myfs',root,'put',page,'/tmp/page.html')
         script=temp/'ns.sh'
-        script.write_text('ext install netsurf\ndesktop &\nsleep 2\necho starting browser\n/ext/bin/netsurf -v file:///tmp/page.html\n')
+        address = 'file:///tmp/page.html' if local_start else f'10.0.2.2:{server.server_port}/start'
+        script.write_text(f'ext install netsurf\ndesktop &\nsleep 2\necho starting browser\n/ext/bin/netsurf -v {address}\n')
         run(B/'myfs',root,'put',script,'/tmp/ns.sh')
         vm=VM('netsurf-https',['-drive',f'format=raw,file={B}/os.img,index=0,snapshot=on','-drive',f'format=raw,file={root},index=1','-netdev','user,id=ns','-device','e1000,netdev=ns'],memory='512M')
         try:
@@ -83,8 +91,9 @@ def main():
                     monitor('mouse_button 1')
                     monitor('mouse_button 0')
                     clicked = True
-                if clicked and bytes([0x2e,0x67,0x9b])*400 in pixels:
-                    print('NetSurf port: local HTML, HTTPS CSS, link navigation and JavaScript: PASS')
+                tiles = bytes([21, 153, 217]) * 32 + bytes([107, 107, 107]) * 32
+                if clicked and bytes([0x2e,0x67,0x9b])*400 in pixels and tiles in pixels:
+                    print(f'NetSurf {address}: HTTPS, CSS, JS, PNG and JPEG pixels: PASS')
                     return
                 time.sleep(.3)
             raise AssertionError('window pixels missing')
@@ -92,4 +101,5 @@ def main():
             vm.stop()
             server.shutdown()
             server.server_close()
-main()
+check_browser(local_start=True)
+check_browser(local_start=False)

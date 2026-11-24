@@ -18,10 +18,11 @@ Version: $(awk '/^#define LIBCURL_VERSION "/ {gsub(/"/,"",$3);print $3}' "$root/
 Libs: -L$root/build/curl -lcurl
 Cflags: -I$root/user/lib/curl/include
 EOF
+cp "$port/myos-image.c" "$src/netsurf/content/handlers/image/myos-image.c"
 make -C "$src/netsurf" -f Makefile -f "$port/link.mk" myos-link \
     TARGET=framebuffer MYOS_ROOT="$root" NS_PREFIX="$prefix" \
     NETSURF_FB_RESPATH=/ext/share/netsurf NETSURF_FB_FONTLIB=internal \
-    NETSURF_USE_DUKTAPE=YES NETSURF_USE_JPEG=NO BUILD_CC="${BUILD_CC:-gcc}" \
+    NETSURF_USE_DUKTAPE=YES NETSURF_USE_JPEG=NO NETSURF_USE_PNG=NO BUILD_CC="${BUILD_CC:-gcc}" \
     CC="$target_cc -include $port/compat/prelude.h"
 mkdir -p "$root/build/netsurf-res"
 for resource in Messages default.css internal.css quirks.css adblock.css welcome.html; do

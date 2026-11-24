@@ -32,6 +32,21 @@ static inline bool seq_le(u32 a, u32 b)  { return (i32)(a - b) <= 0; }
 
 static u32 rx_free(struct sock *s) { return SOCK_RXBUF - s->rx_len; }
 
+static u16 peer_mss(const u8 *opt, u32 len) {
+    while (len && opt[0]) {
+        if (opt[0] == 1) { opt++; len--; continue; }
+        if (len < 2 || opt[1] < 2 || opt[1] > len) break;
+        u32 size = opt[1];
+        if (opt[0] == 2 && size == 4) {
+            u16 value = (opt[2] << 8) | opt[3];
+            if (value) return value < MSS ? value : MSS;
+        }
+        opt += size;
+        len -= size;
+    }
+    return 536; /* MSS по умолчанию для IPv4, если узел его не объявил. */
+}
+
 /* ------------------------------------------------------------ отправка сегмента */
 
 struct pseudo { u32 src, dst; u8 zero, proto; u16 len; } __attribute__((packed));
@@ -91,7 +106,7 @@ static void output(struct sock *s) {
         u32 wnd = s->snd_wnd ? s->snd_wnd : 1;
         if (sent >= wnd) break;
         u32 n = s->tx_len - sent;
-        if (n > MSS) n = MSS;
+        if (n > s->snd_mss) n = s->snd_mss;
         if (n > wnd - sent) n = wnd - sent;
         send_segment(s, F_ACK | F_PSH, s->snd_nxt, s->txbuf + sent, n);
         s->snd_nxt += n;
@@ -177,6 +192,7 @@ void tcp_input(u32 src, u32 dst, const u8 *seg, u32 len) {
         c->snd_una = c->iss;
         c->snd_nxt = c->iss + 1;
         c->snd_wnd = ntohs(h->win);
+        c->snd_mss = peer_mss(seg + sizeof(*h), hlen - sizeof(*h));
         c->state = TCP_SYN_RCVD;
         send_segment(c, F_SYN | F_ACK, c->iss, NULL, 0);
         arm_timer(c);
@@ -189,6 +205,7 @@ void tcp_input(u32 src, u32 dst, const u8 *seg, u32 len) {
             s->rcv_nxt = seq + 1;
             s->snd_una = ack;
             s->snd_wnd = ntohs(h->win);
+            s->snd_mss = peer_mss(seg + sizeof(*h), hlen - sizeof(*h));
             s->state = TCP_ESTABLISHED;
             s->rtx_deadline = 0;
             s->retries = 0;
@@ -237,6 +254,14 @@ void tcp_input(u32 src, u32 dst, const u8 *seg, u32 len) {
     bool can_recv = s->state == TCP_ESTABLISHED || s->state == TCP_FIN_WAIT1 || s->state == TCP_FIN_WAIT2;
     u32 taken = 0;
     if (dlen && can_recv) {
+        /* Повтор после потери ACK может включать уже принятый префикс. */
+        if (seq_lt(seq, s->rcv_nxt)) {
+            u32 skip = s->rcv_nxt - seq;
+            if (skip > dlen) skip = dlen;
+            seq += skip;
+            data += skip;
+            dlen -= skip;
+        }
         if (seq == s->rcv_nxt) {                            /* ровно следующий кусок — берём */
             taken = dlen < rx_free(s) ? dlen : rx_free(s);
             for (u32 i = 0; i < taken; i++)
