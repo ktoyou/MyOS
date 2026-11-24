@@ -166,6 +166,17 @@ def check_pipe(build):
     print('OVMF: Linux pipes, FIFO, descriptor cleanup and blocking I/O: PASS', flush=True)
 
 
+def check_poll(build):
+    probe = (build / 'linux-poll.elf').resolve()
+    marker = 'Linux ELF64 poll probe'
+    host = subprocess.run([str(probe)], env={}, capture_output=True, timeout=5,
+                          preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_NOFILE, (32, 32)))
+    assert (host.returncode, host.stdout, host.stderr) == (0, (marker + '\n').encode(), b''), host
+    serial = check_guest('poll', probe.read_bytes(), 'Linux x86-64 exit status=0x00')
+    assert marker in serial, serial
+    print('OVMF: Linux poll readiness, copyout and blocking wakeup: PASS', flush=True)
+
+
 def check_pthread(build):
     probe = (build / 'linux-pthread.elf').resolve()
     marker = 'Linux ELF64 pthread probe'
@@ -268,6 +279,7 @@ def main():
     check_mmap(build)
     check_socket(build)
     check_pipe(build)
+    check_poll(build)
     check_fork(build)
     check_pthread(build)
     check_vfork(build)

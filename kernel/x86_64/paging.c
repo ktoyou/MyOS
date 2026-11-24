@@ -601,6 +601,10 @@ static bool put_user_scalar(uptr address, const void *value, uptr size) {
     return paging64_copy_to_user(address, value, size) == size;
 }
 
+bool paging64_put_user_u16(uptr address, u16 value) {
+    return put_user_scalar(address, &value, sizeof(value));
+}
+
 bool paging64_put_user_u32(uptr address, u32 value) {
     return put_user_scalar(address, &value, sizeof(value));
 }

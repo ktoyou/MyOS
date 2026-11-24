@@ -65,16 +65,20 @@ void linux64_clock_init(void) {
     last_elapsed = 0;
 }
 
-long linux64_clock_gettime(i32 clock, uptr address) {
-    if (clock != 1) return -22; /* CLOCK_MONOTONIC */
-    if (!tsc_hz) return -5;
+bool linux64_monotonic_ns(u64 *nanos) {
+    if (!tsc_hz) return false;
     u64 current = read_tsc();
     u64 elapsed = current >= tsc_start ? current - tsc_start : 0;
     if (elapsed < last_elapsed) elapsed = last_elapsed;
     last_elapsed = elapsed;
-    const u64 timespec[2] = {
-        elapsed / tsc_hz,
-        (elapsed % tsc_hz) * NS_PER_SECOND / tsc_hz,
-    };
+    *nanos = (elapsed / tsc_hz) * NS_PER_SECOND + (elapsed % tsc_hz) * NS_PER_SECOND / tsc_hz;
+    return true;
+}
+
+long linux64_clock_gettime(i32 clock, uptr address) {
+    if (clock != 1) return -22; /* CLOCK_MONOTONIC */
+    u64 nanos;
+    if (!linux64_monotonic_ns(&nanos)) return -5;
+    const u64 timespec[2] = {nanos / NS_PER_SECOND, nanos % NS_PER_SECOND};
     return paging64_copy_to_user(address, timespec, sizeof(timespec)) == sizeof(timespec) ? 0 : -14;
 }

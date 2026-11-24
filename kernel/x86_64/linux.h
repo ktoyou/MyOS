@@ -9,6 +9,14 @@
 #define LINUX64_UID 1000
 #define LINUX64_GID 1000
 
+enum linux64_poll_events {
+    LINUX64_POLLIN = 0x001, LINUX64_POLLOUT = 0x004, LINUX64_POLLERR = 0x008,
+    LINUX64_POLLHUP = 0x010, LINUX64_POLLNVAL = 0x020, LINUX64_POLLRDNORM = 0x040,
+    LINUX64_POLLWRNORM = 0x100, LINUX64_POLLWRBAND = 0x200, LINUX64_POLLRDHUP = 0x2000,
+    LINUX64_POLL_READ = LINUX64_POLLIN | LINUX64_POLLRDNORM,
+    LINUX64_POLL_WRITE = LINUX64_POLLOUT | LINUX64_POLLWRNORM,
+};
+
 struct linux64_file {
     const u8 *bytes;
     uptr size;
@@ -40,12 +48,14 @@ long linux64_socket_option(struct linux64_socket *socket, bool get, i32 level, i
                            uptr value, uptr length);
 long linux64_socket_message(struct linux64_socket *socket, bool receive, uptr message, u32 flags);
 long linux64_socket_io(struct linux64_socket *socket, bool receive, uptr buffer, uptr length);
+u16 linux64_socket_poll(const struct linux64_socket *socket);
 long linux64_mmap(uptr address, uptr length, u32 protection, u32 flags, i32 fd, uptr offset);
 long linux64_mprotect(uptr address, uptr length, uptr protection);
 long linux64_munmap(uptr address, uptr length);
 uptr linux64_random_bytes(void *buffer, uptr length);
 long linux64_getrandom(uptr address, uptr length, u32 flags);
 void linux64_clock_init(void);
+bool linux64_monotonic_ns(u64 *nanos);
 long linux64_clock_gettime(i32 clock, uptr address);
 void linux64_reset_signals(void);
 long linux64_rt_sigaction(i32 signal, uptr action, uptr previous, uptr sigset_size);

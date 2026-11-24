@@ -36,7 +36,8 @@ struct linux64_fd_slot {
 };
 
 enum linux64_task_state {
-    TASK_FREE, TASK_RUNNABLE, TASK_WAITING, TASK_VFORK_WAIT, TASK_PIPE_WAIT, TASK_FUTEX_WAIT, TASK_DEAD,
+    TASK_FREE, TASK_RUNNABLE, TASK_WAITING, TASK_VFORK_WAIT, TASK_PIPE_WAIT, TASK_FUTEX_WAIT,
+    TASK_POLL_WAIT, TASK_DEAD,
 };
 
 struct linux64_pipe_io {
@@ -70,6 +71,18 @@ struct linux64_futex_wait {
     bool private;
 };
 
+struct linux64_pollfd {
+    i32 fd;
+    u16 events, revents;
+};
+
+struct linux64_poll_wait {
+    struct linux64_pollfd entries[LINUX64_FD_COUNT];
+    uptr address;
+    u64 deadline;
+    unsigned count, ready;
+};
+
 struct linux64_task {
     struct linux64_frame frame;
     struct linux64_address_space *memory;
@@ -78,6 +91,7 @@ struct linux64_task {
     struct linux64_wait wait;
     struct linux64_pipe_io pipe_io;
     struct linux64_futex_wait futex;
+    struct linux64_poll_wait poll;
     uptr child_tid, clear_child_tid;
     i32 tid, vfork_child;
     u16 ds_selector, es_selector, fs_selector, gs_selector;
@@ -100,6 +114,10 @@ void linux64_pipe_close(struct linux64_pipe *pipe, bool writer);
 long linux64_pipe_io(struct linux64_pipe *pipe, bool write, bool nonblock, uptr address, uptr length);
 bool linux64_pipe_ready(const struct linux64_pipe_io *io);
 long linux64_pipe_resume(void);
+u16 linux64_pipe_poll(const struct linux64_pipe *pipe, bool writer);
+long linux64_poll(uptr address, u32 count, i32 timeout);
+bool linux64_poll_ready(struct linux64_task *task);
+long linux64_poll_resume(const struct linux64_task *task);
 const struct linux64_file_source *linux64_file_source(void);
 long linux64_user_string(uptr address, char *string, uptr limit);
 long linux64_execve(struct linux64_frame *frame, uptr filename, uptr argv, uptr envp);
