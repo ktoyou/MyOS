@@ -4,7 +4,10 @@
 #define SIGNAL_COUNT 64
 #define SIGKILL 9
 #define SIGSTOP 19
+#define UNBLOCKABLE_SIGNALS ((1ull << (SIGKILL - 1)) | (1ull << (SIGSTOP - 1)))
 #define SA_USER_FLAGS 0xdc000807ull
+
+enum { SIG_BLOCK = 0, SIG_UNBLOCK = 1, SIG_SETMASK = 2 };
 
 struct linux_sigaction {
     u64 handler, flags, restorer, mask;
@@ -13,10 +16,12 @@ struct linux_sigaction {
 _Static_assert(sizeof(struct linux_sigaction) == 32, "Linux x86-64 sigaction size");
 
 static struct linux_sigaction actions[SIGNAL_COUNT];
+static u64 blocked_signals;
 
 void linux64_reset_signals(void) {
     for (unsigned i = 0; i < SIGNAL_COUNT; ++i)
         actions[i] = (struct linux_sigaction){0};
+    blocked_signals = 0;
 }
 
 long linux64_rt_sigaction(i32 signal, uptr action, uptr previous, uptr sigset_size) {
@@ -30,10 +35,36 @@ long linux64_rt_sigaction(i32 signal, uptr action, uptr previous, uptr sigset_si
     const struct linux_sigaction old = *slot;
     if (action) {
         input.flags &= SA_USER_FLAGS;
-        input.mask &= ~((1ull << (SIGKILL - 1)) | (1ull << (SIGSTOP - 1)));
+        input.mask &= ~UNBLOCKABLE_SIGNALS;
         *slot = input;
     }
     /* Ошибка при копировании прежнего действия не отменяет установку нового. */
+    if (previous && paging64_copy_to_user(previous, &old, sizeof(old)) != sizeof(old))
+        return -14;
+    return 0;
+}
+
+long linux64_rt_sigprocmask(i32 how, uptr set, uptr previous, uptr sigset_size) {
+    u64 input;
+    if (sigset_size != sizeof(input)) return -22;
+    const u64 old = blocked_signals;
+    if (set) {
+        if (paging64_copy_from_user(&input, set, sizeof(input)) != sizeof(input)) return -14;
+        input &= ~UNBLOCKABLE_SIGNALS;
+        switch (how) {
+        case SIG_BLOCK:
+            blocked_signals |= input;
+            break;
+        case SIG_UNBLOCK:
+            blocked_signals &= ~input;
+            break;
+        case SIG_SETMASK:
+            blocked_signals = input;
+            break;
+        default:
+            return -22;
+        }
+    }
     if (previous && paging64_copy_to_user(previous, &old, sizeof(old)) != sizeof(old))
         return -14;
     return 0;
