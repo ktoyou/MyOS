@@ -12,22 +12,30 @@ from kernel_x64_smoke import image
 from uefi_x64_smoke import boot_x64
 
 
-def linux_root(elf, files, exec_path='/myos/test.elf'):
+def linux_root(elf, files, exec_path='/myos/test.elf', *, aligned=True):
     executable = os.fsencode(exec_path) + b'\0'
-    root = bytearray(b'MYOSLX65' + struct.pack('<QQQ', len(elf), len(files), len(executable)))
+    tag = b'MYOSLX66' if aligned else b'MYOSLX65'
+    root = bytearray(tag + struct.pack('<QQQ', len(elf), len(files), len(executable)))
+
+    def append_payload(contents):
+        if aligned:
+            root.extend(b'\0' * (-len(root) % 4096))
+        root.extend(contents)
+
     root.extend(executable)
-    root.extend(elf)
+    append_payload(elf)
     for path, contents in files.items():
         encoded = os.fsencode(path) + b'\0'
         root.extend(struct.pack('<QQ', len(encoded), len(contents)))
         root.extend(encoded)
-        root.extend(contents)
+        append_payload(contents)
     return root
 
 
-def check_guest(name, elf, marker, *, fault=False, files=None, cpu='max', exec_path='/myos/test.elf', rtc=None):
+def check_guest(name, elf, marker, *, fault=False, files=None, cpu='max', exec_path='/myos/test.elf',
+                rtc=None, aligned=True):
     payload, kernel_end = image('kernel-linux')
-    root_header = linux_root(elf, files or {}, exec_path)
+    root_header = linux_root(elf, files or {}, exec_path, aligned=aligned)
     with tempfile.TemporaryDirectory(prefix='myos-linux-x64-') as temp:
         serial = boot_x64(pathlib.Path(temp), 'x64-linux-' + name, payload,
                           kernel_end, [marker], live_root_header=root_header, cpu=cpu, rtc=rtc)
@@ -41,6 +49,24 @@ def program_headers(elf):
     phentsize, phnum = struct.unpack_from('<HH', elf, 54)
     for i in range(phnum):
         yield phoff + i * phentsize
+
+
+def check_shared_elf(build):
+    probe = build / 'linux-exec.elf'
+    elf = bytearray(probe.read_bytes())
+    symbols = subprocess.check_output(['nm', str(probe)], text=True).splitlines()
+    entry = next(int(line.split()[0], 16) for line in symbols if line.endswith(' exec_shared_entry'))
+    struct.pack_into('<Q', elf, 24, entry)
+    header = next(offset for offset in program_headers(elf)
+                  if struct.unpack_from('<I', elf, offset)[0] == 0x6474e551)
+    elf.extend(b'\0' * (-len(elf) % 4096))
+    length = 52 * 1024 * 1024 + 1
+    struct.pack_into('<II6Q', elf, header, 1, 4, len(elf), 0x50000000, 0, length, length + 4096, 4096)
+    elf.extend(bytearray(length))
+    elf[-length], elf[-1] = 0x29, 0x63
+    # В госте с 256 МиБ четыре копии сегмента плюс Live-образ не помещаются в RAM.
+    check_guest('elf-shared', elf, 'Linux x86-64 exit status=0x00')
+    print('OVMF: concurrent execve shares read-only ELF pages and keeps writes private: PASS', flush=True)
 
 
 def check_interpreter(build):
@@ -274,7 +300,7 @@ def main():
     assert 'OK Linux ELF64 syscall probe' in serial and 'Linux x86-64 ELF rejected' not in serial, serial
     print('OVMF: same Linux ELF64, same output and exit status: PASS', flush=True)
     longest_path = '/' + 'bin/' * 1023 + 'el'
-    check_guest('long-exe', elf, 'Linux x86-64 exit status=0x2a', exec_path=longest_path)
+    check_guest('long-exe', elf, 'Linux x86-64 exit status=0x2a', exec_path=longest_path, aligned=False)
     check_guest('bad-exe', elf, 'Linux x86-64 ELF rejected', exec_path='relative.elf')
     print('OVMF: executable path, AT_EXECFN and readlink: PASS', flush=True)
     serial = check_guest('no-rdrand', elf, 'Linux x86-64 ELF rejected', cpu='max,-rdrand')
@@ -313,6 +339,7 @@ def main():
     check_userns(build)
     check_vfork(build)
     check_exec(build)
+    check_shared_elf(build)
 
 
 if __name__ == '__main__':

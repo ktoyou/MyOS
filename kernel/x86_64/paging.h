@@ -17,6 +17,7 @@ bool paging64_zero_fault(uptr address, u64 error);
 bool paging64_user_code(uptr address, const u8 *code, uptr length);
 bool paging64_user_load(uptr address, const u8 *source, uptr offset, uptr length,
                         bool writable, bool executable);
+bool paging64_user_live_elf(uptr address, const u8 *source, bool executable);
 const u8 *paging64_user_read(uptr address);
 uptr paging64_copy_from_user(void *destination, uptr address, uptr length);
 bool paging64_shared_futex_address(uptr address);

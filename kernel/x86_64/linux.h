@@ -28,7 +28,7 @@ struct linux64_file {
     uptr size;
     u64 inode;
     u32 mode, uid, gid;
-    bool writable_directory;
+    bool writable_directory, live_pages;
 };
 
 struct linux64_file_source {
@@ -37,7 +37,7 @@ struct linux64_file_source {
     u64 (*directory)(const void *context, const char *path);
 };
 
-bool linux64_run(const void *image, uptr size, const char *path, uptr path_length,
+bool linux64_run(const struct linux64_file *file, const char *path, uptr path_length,
                  const struct linux64_file_source *source);
 void linux64_use_files(const struct linux64_file_source *source, const char *path, uptr path_length);
 struct linux64_fd_view {
