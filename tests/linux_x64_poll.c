@@ -123,6 +123,80 @@ static int check_blocking(void) {
     return 0;
 }
 
+static long event_write(int fd, word value) {
+    return call(1, fd, (word)&value, sizeof(value), 0);
+}
+
+static long event_read(int fd, word *value) {
+    return call(0, fd, (word)value, sizeof(*value), 0);
+}
+
+static int check_eventfd(void) {
+    const word maximum = (word)-2;
+    if (call(290, 0, 2, 0, 0) != -22) return 36;
+    long fd = call(290, 0, 0x80800, 0, 0);
+    if (fd < 3 || call(72, fd, 1, 0, 0) != 1 || call(72, fd, 3, 0, 0) != 0x802)
+        return 36;
+    long alias = call(32, fd, 0, 0, 0);
+    struct pollfd ready = {fd, IN | OUT | RDNORM | WRNORM, 0};
+    word value[2] = {0, 1};
+    if (alias < 3 || call(72, alias, 1, 0, 0) || event_read(fd, value) != -11 ||
+        poll(&ready, 1, 0) != 1 || ready.revents != OUT ||
+        call(1, alias, (word)value, 7, 0) != -22 || call(0, fd, (word)value, 7, 0) != -22 ||
+        call(1, alias, 1, 8, 0) != -14 || event_write(fd, (word)-1) != -22) return 37;
+    if (event_write(alias, maximum) != 8 || event_write(fd, 0) != 8 ||
+        event_write(alias, 1) != -11 || poll(&ready, 1, 0) != 1 || ready.revents != IN ||
+        call(0, fd, (word)value, sizeof(value), 0) != 8 || value[0] != maximum || value[1] != 1 ||
+        event_write(alias, 3) != 8 || call(0, fd, 1, 8, 0) != -14 ||
+        event_read(alias, value) != -11) return 38;
+    word split = (word)(pages + 4096);
+    if (call(10, split, 4096, 0, 0) || event_write(alias, 1) != 8 ||
+        call(0, fd, split - 4, 8, 0) != -14 || event_read(alias, value) != -11 ||
+        call(10, split, 4096, 3, 0)) return 38;
+    if (call(72, alias, 4, 0, 0) || call(72, fd, 3, 0, 0) != 2 ||
+        call(17, fd, (word)value, 8, 0) != -29 || call(18, fd, (word)value, 8, 0) != -29 ||
+        close_fd(fd) || event_write(alias, 7) != 8 || event_read(alias, value) != 8 ||
+        value[0] != 7 || close_fd(alias)) return 39;
+
+    fd = call(290, 2, 0x801, 0, 0);
+    if (fd < 3 || call(72, fd, 3, 0, 0) != 0x802 || event_read(fd, value) != 8 || value[0] != 1 ||
+        event_read(fd, value) != 8 || value[0] != 1 || event_read(fd, value) != -11 ||
+        close_fd(fd)) return 40;
+    return 0;
+}
+
+static int check_eventfd_blocking(void) {
+    long fd = call(284, 0, 0, 0, 0);
+    int ack[2];
+    if (fd < 3 || call(22, (word)ack, 0, 0, 0)) return 41;
+    long child = call(57, 0, 0, 0, 0);
+    if (child < 0) return 41;
+    if (!child) {
+        char byte;
+        if (poll(0, 0, 20) || event_write(fd, 3) != 8 ||
+            call(0, ack[0], (word)&byte, 1, 0) != 1 || poll(0, 0, 20) ||
+            event_write(fd, 5) != 8) finish(42);
+        finish(0);
+    }
+    struct pollfd ready = {fd, IN, 0};
+    word value;
+    int status;
+    if (event_read(fd, &value) != 8 || value != 3 || call(1, ack[1], (word)"x", 1, 0) != 1 ||
+        poll(&ready, 1, 1000) != 1 ||
+        ready.revents != IN || event_read(fd, &value) != 8 || value != 5 ||
+        call(61, child, (word)&status, 0, 0) != child || status ||
+        close_fd(ack[0]) || close_fd(ack[1])) return 43;
+
+    if (event_write(fd, (word)-2) != 8) return 44;
+    child = call(57, 0, 0, 0, 0);
+    if (child < 0) return 44;
+    if (!child) finish(event_write(fd, 9) != 8 ? 45 : 0);
+    if (poll(0, 0, 20) || event_read(fd, &value) != 8 || value != (word)-2 ||
+        event_read(fd, &value) != 8 || value != 9 ||
+        call(61, child, (word)&status, 0, 0) != child || status || close_fd(fd)) return 45;
+    return 0;
+}
+
 static long ppoll(struct pollfd *fds, unsigned count, long *timeout, const word *mask) {
     return call5(271, (word)fds, count, (word)timeout, (word)mask, sizeof(*mask));
 }
@@ -194,6 +268,8 @@ void _start(void) {
     if (!error) error = check_copy();
     if (!error) error = check_blocking();
     if (!error) error = check_ppoll();
+    if (!error) error = check_eventfd();
+    if (!error) error = check_eventfd_blocking();
     if (error) finish(error);
     static const char marker[] = "Linux ELF64 poll probe\n";
     if (call(1, 1, (word)marker, sizeof(marker) - 1, 0) != sizeof(marker) - 1) finish(26);
