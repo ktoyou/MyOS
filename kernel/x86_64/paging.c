@@ -449,7 +449,7 @@ enum paging64_protect_result paging64_protect(uptr start, uptr end, bool accessi
     if (writable && executable) return PAGING64_PROTECT_DENIED;
     uptr root = paging64_active_root(), next;
     uptr usage = *data_bytes;
-    bool needs_backing = false;
+    bool needs_tables = false;
     for (uptr address = start; address < end; address = next) {
         next = address + PMM_PAGE_SIZE;
         const u64 *leaf = find_leaf(root, address);
@@ -457,7 +457,7 @@ enum paging64_protect_result paging64_protect(uptr start, uptr end, bool accessi
             next = reserved_end(address);
             if (!next) return PAGING64_PROTECT_UNMAPPED;
             if (writable) usage += (next < end ? next : end) - address;
-            needs_backing = accessible;
+            needs_tables = accessible;
             continue;
         }
         if (!(*leaf & ZERO_LAZY) &&
@@ -472,13 +472,11 @@ enum paging64_protect_result paging64_protect(uptr start, uptr end, bool accessi
         }
     }
     if (usage > *data_bytes && usage > data_limit) return PAGING64_PROTECT_UNMAPPED;
-    if (needs_backing) {
+    if (needs_tables) {
         for (uptr address = start; address < end; address += PMM_PAGE_SIZE) {
             const u64 *leaf = find_leaf(root, address);
             if (leaf && *leaf) continue;
-            uptr physical = pmm64_alloc();
-            if (physical && map_entry(root, address, physical | MMAP_PENDING | USER | DATA_MAPPING)) continue;
-            if (physical) pmm64_free(physical);
+            if (map_entry(root, address, MMAP_PENDING | USER)) continue;
             clear_mappings(root, start, address, MMAP_PENDING);
             return PAGING64_PROTECT_UNMAPPED;
         }
@@ -497,9 +495,11 @@ enum paging64_protect_result paging64_protect(uptr start, uptr end, bool accessi
     for (uptr address = start; address < end; address = next) {
         u64 *leaf = find_leaf_span(root, address, &next);
         if (!leaf) continue;
-        if (*leaf & ZERO_LAZY) {
+        if (*leaf & (ZERO_LAZY | MMAP_PENDING)) {
             /* Для отсутствующей страницы USER хранит разрешение доступа до выделения. */
-            *leaf = (*leaf & ~(USER | WRITE | NO_EXECUTE)) |
+            u64 kind = *leaf & MMAP_PENDING ? MMAP_OWNED | DATA_MAPPING | ZERO_LAZY
+                                           : *leaf & ~(USER | WRITE | NO_EXECUTE);
+            *leaf = kind |
                     (accessible ? USER : 0) | (writable ? WRITE : 0) |
                     (executable ? 0 : NO_EXECUTE);
             continue;
@@ -510,10 +510,9 @@ enum paging64_protect_result paging64_protect(uptr start, uptr end, bool accessi
             *leaf = (*leaf & ~WRITE) | (writable ? WRITE : 0);
             continue;
         }
-        u64 value = (*leaf & ~(PRESENT | WRITE | NO_EXECUTE | MMAP_PENDING)) |
+        u64 value = (*leaf & ~(PRESENT | WRITE | NO_EXECUTE)) |
                     (accessible ? PRESENT : 0) | (writable ? WRITE : 0) |
                     (executable ? 0 : NO_EXECUTE);
-        if (*leaf & MMAP_PENDING) value |= MMAP_OWNED;
         if (writable && needs_private_copy(*leaf)) {
             u64 old = *leaf;
             uptr copy = copies;
@@ -541,7 +540,7 @@ fail_copies:
         copies = *(uptr *)pmm64_pointer(physical);
         pmm64_free(physical);
     }
-    if (needs_backing) clear_mappings(root, start, end, MMAP_PENDING);
+    if (needs_tables) clear_mappings(root, start, end, MMAP_PENDING);
     return PAGING64_PROTECT_UNMAPPED;
 }
 

@@ -168,6 +168,9 @@ def check_mmap(build):
     serial = check_guest('mprotect-relro', relro, 'x86-64 exception halted', fault=True, files=files)
     assert ('vector=0x000000000000000e error=0x0000000000000007' in serial and
             f'cr2=0x{symbols["relro"]:016x} cpl=3' in serial), serial
+    lazy = bytearray(elf)
+    struct.pack_into('<Q', lazy, 24, symbols['mprotect_lazy'])
+    check_guest('mprotect-lazy', lazy, 'Linux x86-64 exit status=0x00', files=files)
     sparse_oom = bytearray(elf)
     struct.pack_into('<Q', sparse_oom, 24, symbols['mprotect_sparse_oom'])
     check_guest('mprotect-sparse-oom', sparse_oom, 'Linux x86-64 exit status=0x00', files=files)
