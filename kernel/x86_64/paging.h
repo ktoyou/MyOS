@@ -12,6 +12,8 @@ uptr paging64_fork_root(void);
 uptr paging64_exec_root(void);
 void paging64_drop_root(uptr root);
 void *paging64_user_page(uptr address);
+bool paging64_reserve_stack(uptr start, uptr end);
+bool paging64_stack_fault(uptr address, u64 error);
 bool paging64_user_code(uptr address, const u8 *code, uptr length);
 bool paging64_user_load(uptr address, const u8 *source, uptr offset, uptr length,
                         bool writable, bool executable);

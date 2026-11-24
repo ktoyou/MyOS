@@ -6,7 +6,8 @@
 #define MMAP_OWNED    (1ull << 9)
 #define MMAP_PENDING  (1ull << 10)
 #define FILE_BACKED   (1ull << 11)
-/* Бит 57 доступен ПО в листе x86-64 и не входит в физический адрес. */
+/* Эти биты доступны ПО в листе x86-64 и не входят в физический адрес. */
+#define STACK_LAZY    (1ull << 56)
 #define MMAP_NO_WRITE (1ull << 57)
 #define MMAP_SHARED_FRAME (1ull << 58)
 #define NO_EXECUTE    (1ull << 63)
@@ -192,6 +193,28 @@ static void set_alias_write(uptr root, uptr physical, bool writable) {
     invalidate(direct);
 }
 
+static bool materialize_stack(uptr root, uptr address, u64 *leaf, bool write, bool execute) {
+    const u64 value = *leaf;
+    if (!(value & STACK_LAZY) || !(value & USER) || (write && !(value & WRITE)) ||
+        (execute && (value & NO_EXECUTE))) return false;
+    uptr physical = pmm64_alloc();
+    if (!physical) return false;
+    if (!(value & WRITE)) set_alias_write(root, physical, false);
+    *leaf = physical | (value & ~STACK_LAZY) | PRESENT;
+    invalidate(address);
+    return true;
+}
+
+bool paging64_stack_fault(uptr address, u64 error) {
+    const u64 write = 1u << 1, user = 1u << 2, instruction = 1u << 4;
+    if (!(error & user) || (error & ~(write | user | instruction)) || address >= X64_USER_TOP)
+        return false;
+    uptr root = paging64_active_root();
+    u64 *leaf = find_leaf(root, address);
+    return leaf && materialize_stack(root, address, leaf, (error & write) != 0,
+                                     (error & instruction) != 0);
+}
+
 static void release_mapping(uptr root, u64 value) {
     uptr physical = value & ADDRESS_MASK;
     if (!physical) return;
@@ -301,7 +324,7 @@ uptr paging64_exec_root(void) {
     return root;
 }
 
-static void clear_mmap(uptr root, uptr start, uptr end, u64 marker) {
+static void clear_mappings(uptr root, uptr start, uptr end, u64 marker) {
     uptr next, last = 0;
     for (uptr address = start; address < end; address = next) {
         u64 *leaf = find_leaf_span(root, address, &next);
@@ -316,13 +339,25 @@ static void clear_mmap(uptr root, uptr start, uptr end, u64 marker) {
     if (last) prune_empty_tables(root, last);
 }
 
+bool paging64_reserve_stack(uptr start, uptr end) {
+    if (start < 0x400000ul || start > end || end > X64_USER_TOP ||
+        ((start | end) & (PMM_PAGE_SIZE - 1))) return false;
+    uptr root = paging64_active_root();
+    for (uptr address = start; address < end; address += PMM_PAGE_SIZE) {
+        if (map_entry(root, address, STACK_LAZY | USER | WRITE | NO_EXECUTE)) continue;
+        clear_mappings(root, start, address, STACK_LAZY);
+        return false;
+    }
+    return true;
+}
+
 bool paging64_remove_mmap(uptr start, uptr end) {
     uptr root = paging64_active_root(), next;
     for (uptr address = start; address < end; address = next) {
         const u64 *leaf = find_leaf_span(root, address, &next);
         if (leaf && *leaf && !(*leaf & MMAP_OWNED)) return false;
     }
-    clear_mmap(root, start, end, MMAP_OWNED);
+    clear_mappings(root, start, end, MMAP_OWNED);
     return true;
 }
 
@@ -343,7 +378,8 @@ enum paging64_protect_result paging64_protect(uptr start, uptr end, bool accessi
             needs_backing = accessible;
             continue;
         }
-        if ((*leaf & ~(MMAP_NO_WRITE | MMAP_SHARED_FRAME)) != MMAP_OWNED &&
+        if (!(*leaf & STACK_LAZY) &&
+            (*leaf & ~(MMAP_NO_WRITE | MMAP_SHARED_FRAME)) != MMAP_OWNED &&
             !((*leaf & USER) && (*leaf & ADDRESS_MASK)))
             return PAGING64_PROTECT_UNMAPPED;
         if (writable && (*leaf & MMAP_NO_WRITE)) return PAGING64_PROTECT_DENIED;
@@ -356,7 +392,7 @@ enum paging64_protect_result paging64_protect(uptr start, uptr end, bool accessi
             uptr physical = pmm64_alloc();
             if (physical && map_entry(root, address, physical | MMAP_PENDING | USER)) continue;
             if (physical) pmm64_free(physical);
-            clear_mmap(root, start, address, MMAP_PENDING);
+            clear_mappings(root, start, address, MMAP_PENDING);
             return PAGING64_PROTECT_UNMAPPED;
         }
     }
@@ -374,6 +410,12 @@ enum paging64_protect_result paging64_protect(uptr start, uptr end, bool accessi
     for (uptr address = start; address < end; address = next) {
         u64 *leaf = find_leaf_span(root, address, &next);
         if (!leaf) continue;
+        if (*leaf & STACK_LAZY) {
+            /* Для отсутствующей страницы USER хранит разрешение доступа до выделения. */
+            *leaf = STACK_LAZY | (accessible ? USER : 0) | (writable ? WRITE : 0) |
+                    (executable ? 0 : NO_EXECUTE);
+            continue;
+        }
         uptr physical = *leaf & ADDRESS_MASK;
         /* Метка страницы за EOF сохраняет диапазон, но у неё нет данных. */
         if (!physical) continue;
@@ -407,7 +449,7 @@ fail_copies:
         copies = *(uptr *)pmm64_pointer(physical);
         pmm64_free(physical);
     }
-    if (needs_backing) clear_mmap(root, start, end, MMAP_PENDING);
+    if (needs_backing) clear_mappings(root, start, end, MMAP_PENDING);
     return PAGING64_PROTECT_UNMAPPED;
 }
 
@@ -488,7 +530,7 @@ fail:
         physical_list = *(uptr *)pmm64_pointer(physical);
         pmm64_free(physical);
     }
-    clear_mmap(root, start, prepared, MMAP_PENDING);
+    clear_mappings(root, start, prepared, MMAP_PENDING);
     return false;
 }
 
@@ -543,9 +585,13 @@ bool paging64_user_load(uptr address, const u8 *source, uptr offset, uptr length
 
 static u8 *user_pointer(uptr address, u64 required) {
     if (address < 0x400000ul || address >= X64_USER_TOP) return NULL;
-    const u64 *table = pmm64_pointer(paging64_active_root());
+    uptr root = paging64_active_root();
+    u64 *table = pmm64_pointer(root);
     for (int shift = 39; shift >= 12; shift -= 9) {
-        u64 entry = table[(address >> shift) & 511u];
+        u64 *slot = &table[(address >> shift) & 511u];
+        if (shift == 12 && (*slot & STACK_LAZY))
+            materialize_stack(root, address, slot, (required & WRITE) != 0, false);
+        u64 entry = *slot;
         if ((entry & required) != required) return NULL;
         if (shift == 12)
             return pmm64_pointer((entry & ADDRESS_MASK) | (address & (PMM_PAGE_SIZE - 1)));

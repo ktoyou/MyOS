@@ -3,7 +3,6 @@
 #include "segments.h"
 
 #define USER_MIN        0x400000ul
-#define STACK_TOP       0x00007ffffff00000ul
 #define BOOT_STACK_SIZE (4 * PMM_PAGE_SIZE)
 #define EXEC_STACK_SIZE (32 * PMM_PAGE_SIZE)
 #define EXEC_POINTERS   256u
@@ -187,7 +186,7 @@ static bool map_image(const struct elf_image *elf) {
 static uptr make_stack(const struct elf_image *main, u64 interp_bias, const u64 entropy[2],
                        const struct stack_arguments *args, uptr bottom) {
     const uptr path_size = args->path_length + 1;
-    const uptr execfn_address = STACK_TOP - path_size;
+    const uptr execfn_address = LINUX64_STACK_TOP - path_size;
     const uptr strings_address = execfn_address - args->string_bytes;
     const uptr random_address = (strings_address - 2 * sizeof(u64)) & ~7ul;
     u64 vectors[EXEC_POINTERS + 3];
@@ -206,7 +205,7 @@ static uptr make_stack(const struct elf_image *main, u64 interp_bias, const u64 
     uptr vector_size = used * sizeof(*vectors);
     uptr stack = (random_address - sizeof(auxv) - vector_size) & ~15ul;
     if (stack < bottom) return 0;
-    for (uptr page = bottom; page < STACK_TOP; page += PMM_PAGE_SIZE) {
+    for (uptr page = bottom; page < LINUX64_STACK_TOP; page += PMM_PAGE_SIZE) {
         if (!paging64_user_page(page)) return 0;
     }
     /* argv[0] изменяется программой независимо от AT_EXECFN. */
@@ -223,9 +222,9 @@ static long prepare_image(const void *image, uptr size, const struct linux64_fil
                           uptr *entry, uptr *stack) {
     struct elf_image main, interpreter = {0};
     u64 mapped = 0;
-    uptr bottom = STACK_TOP - stack_size, guard = bottom - PMM_PAGE_SIZE;
+    uptr bottom = LINUX64_STACK_TOP - stack_size, guard = LINUX64_STACK_FLOOR - PMM_PAGE_SIZE;
     if (!load_layout(&main, image, size, false, guard, &mapped) ||
-        !paging64_range_free(guard, STACK_TOP)) return -ENOEXEC;
+        !paging64_range_free(guard, LINUX64_STACK_TOP)) return -ENOEXEC;
     if (main.interp) {
         struct linux64_file interp;
         if (!source || !source->lookup || !source->lookup(source->context, main.interp, &interp))
@@ -240,6 +239,7 @@ static long prepare_image(const void *image, uptr size, const struct linux64_fil
         return -EIO;
     }
     if (!map_image(&main) || (main.interp && !map_image(&interpreter))) return -ENOMEM;
+    if (!paging64_reserve_stack(LINUX64_STACK_FLOOR, bottom)) return -ENOMEM;
     *entry = main.interp ? interpreter.entry : main.entry;
     *stack = make_stack(&main, interpreter.bias, entropy, args, bottom);
     return *stack ? 0 : -ENOMEM;

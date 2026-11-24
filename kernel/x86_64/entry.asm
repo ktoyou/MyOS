@@ -26,16 +26,50 @@ exception_%+%1:
 %endrep
 
 exception_entry:
-    ; Для C кадр унифицирован до номера, кода ошибки и RIP.
+    ; После выделения страницы повторяется исходная инструкция с её регистрами.
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    lea r12,[rsp+15*8]
     cld
-    mov rdi,[rsp]
-    mov rsi,[rsp+8]
-    mov rdx,[rsp+16]
-    mov rcx,[rsp+24]
-    mov r8,rsp
-    mov r9,[rsp+40]
+    mov rdi,[r12]
+    mov rsi,[r12+8]
+    mov rdx,[r12+16]
+    mov rcx,[r12+24]
+    mov r8,r12
+    mov r9,[r12+40]
     and rsp,-16
     call kernel64_exception
+    lea rsp,[r12-15*8]
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    add rsp,16
+    iretq
 
 global segments64_enter_user
 segments64_enter_user:
