@@ -1254,6 +1254,17 @@ $(BUILD)/user/threadcheck: $(BUILD)/user/threadcheck.o $(ULIB) user/user.ld
 threadtest:
 	python3 tests/thread_smoke.py
 
+$(BUILD)/user/tlscheck.o: tests/tlscheck.c user/lib/myos.h | $(BUILD)/user
+	$(CC) $(UCFLAGS) -c $< -o $@
+# Шаблон начинается внутри выровненного блока PT_TLS, как в ELF от LLD.
+$(BUILD)/tlscheck.ld: user/user.ld | $(BUILD)
+	sed 's/\.tdata  :/.tdata ALIGN(64) + 16 :/' $< > $@
+$(BUILD)/user/tlscheck: $(BUILD)/user/tlscheck.o $(ULIB) $(BUILD)/tlscheck.ld
+	$(LD) $(filter-out -T user/user.ld,$(ULDFLAGS)) -T $(BUILD)/tlscheck.ld $< $(ULIB) -o $@
+.PHONY: tlstest
+tlstest:
+	python3 tests/thread_smoke.py --tls-only
+
 .PHONY: klogtest
 klogtest: | $(BUILD)
 	$(HOSTCC) -m32 -std=gnu11 -g -O1 -fsanitize=address,undefined -fno-builtin tests/klog_test.c -o $(BUILD)/klog-test

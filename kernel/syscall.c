@@ -828,9 +828,14 @@ static bool mmap_range_free(u32 dir, u32 start, u32 end) {
     return true;
 }
 
-static u32 mmap_hole(u32 dir, u32 len) {
-    for (u32 va = MMAP_BASE; va <= MMAP_END - len; va += PAGE_SIZE)
-        if (mmap_range_free(dir, va, va + len)) return va;
+static u32 mmap_limit(struct task *t) {
+    return t->tls_size ? USER_TLS_TEMPLATE : MMAP_END;
+}
+
+static u32 mmap_hole(struct task *t, u32 len) {
+    u32 last = mmap_limit(t) - len;
+    for (u32 va = MMAP_BASE; va <= last; va += PAGE_SIZE)
+        if (mmap_range_free(t->page_dir, va, va + len)) return va;
     return 0;
 }
 
@@ -865,10 +870,10 @@ static int sys_mmap(u32 uargs) {
     }
     u32 va;
     if (!a.addr) {
-        va = mmap_hole(t->page_dir, len);
+        va = mmap_hole(t, len);
         if (!va) return -ENOMEM;
     } else {
-        if (a.addr & (PAGE_SIZE - 1) || a.addr < MMAP_BASE || a.addr > MMAP_END - len) return -EINVAL;
+        if (a.addr & (PAGE_SIZE - 1) || a.addr < MMAP_BASE || a.addr > mmap_limit(t) - len) return -EINVAL;
         if (!mmap_range_free(t->page_dir, a.addr, a.addr + len)) return -EINVAL;
         va = a.addr;
     }
@@ -895,7 +900,7 @@ static int sys_munmap(u32 addr, u32 len) {
     struct task *t = task_process(task_current());
     if (!len || len > MMAP_MAX) return -EINVAL;
     u32 end = addr + ((len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1));
-    if (addr & (PAGE_SIZE - 1) || addr < MMAP_BASE || end < addr || end > MMAP_END) return -EINVAL;
+    if (addr & (PAGE_SIZE - 1) || addr < MMAP_BASE || end < addr || end > mmap_limit(t)) return -EINVAL;
     if(task_stack_busy(task_process(t)->page_dir,addr,end))return -EBUSY;
     for (u32 va = addr; va < end; va += PAGE_SIZE) {
         u32 frame = vmm_unmap_in(t->page_dir, va);
@@ -911,7 +916,7 @@ static int sys_mprotect(u32 addr, u32 len, u32 prot) {
     if (!len || len > MMAP_MAX) return -EINVAL;
     if (prot & ~(PROT_READ | PROT_WRITE | PROT_EXEC)) return -EINVAL;
     u32 end = addr + ((len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1));
-    if (addr & (PAGE_SIZE - 1) || addr < MMAP_BASE || end < addr || end > MMAP_END) return -EINVAL;
+    if (addr & (PAGE_SIZE - 1) || addr < MMAP_BASE || end < addr || end > mmap_limit(t)) return -EINVAL;
     if(task_stack_busy(task_process(t)->page_dir,addr,end))return -EBUSY;
     for (u32 va = addr; va < end; va += PAGE_SIZE) {
         u32 frame, flags;
@@ -1123,10 +1128,9 @@ void syscall_dispatch(struct regs *r) {
     case SYS_GETTID: ret=t->id; break;
     case SYS_THREAD_EXIT: t->in_syscall=false; task_exit_code((int)a);
     case SYS_THREAD_CREATE: {
-        if(e<THREAD_STACK_MIN || e>4u*1024*1024 || d+e<d || d+e>USER_STACK_GUARD){ret=-EINVAL;break;}
+        if(e<THREAD_STACK_MIN || e>4u*1024*1024 || d+e<d || d+e>mmap_limit(task_process(t))){ret=-EINVAL;break;}
         if(!user_buf_ok(d,e,true) || !user_buf_ok(a,1,false) || !user_buf_ok(b,1,false)){ret=-EFAULT;break;}
-        u32 sp=((d+e)&~15u)-20; /* i386 ABI: esp+4 aligned to 16 */
-        ret=task_thread_create(a,b,c,sp,d,e); break;
+        ret=task_thread_create(a,b,c,d,e); break;
     }
     case SYS_THREAD_JOIN:
         if (b && !user_buf_ok(b,4,true)) ret=-EFAULT;

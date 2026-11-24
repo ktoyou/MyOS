@@ -30,7 +30,7 @@ struct tss {
     u16 trap, iomap_base;
 } __attribute__((packed));
 
-static struct gdt_entry cpu_gdt[SMP_MAX_CPUS][7];
+static struct gdt_entry cpu_gdt[SMP_MAX_CPUS][8];
 static struct gdt_ptr cpu_gdtr[SMP_MAX_CPUS];
 static struct tss cpu_tss[SMP_MAX_CPUS];
 #define gdt (cpu_gdt[smp_cpu()])
@@ -62,6 +62,7 @@ void gdt_init(void) {
     u32 cpu = smp_cpu();
     cpu_states[cpu].index = cpu;
     set_entry(6, (u32)&cpu_states[cpu], sizeof(struct cpu_state)-1, 0x92, 0x4);
+    gdt_set_user_tls(0);
 
     gdtr.limit = sizeof(gdt) - 1;
     gdtr.base  = (u32)&gdt;
@@ -83,3 +84,7 @@ void gdt_init(void) {
 }
 
 void tss_set_kernel_stack(u32 esp0) { tss.esp0 = esp0; }
+
+void gdt_set_user_tls(u32 base) {
+    set_entry(USER_TLS >> 3, base, 0xFFFFF, 0xF2, 0xC);
+}

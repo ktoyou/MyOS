@@ -21,9 +21,13 @@
 #define USER_STACK_PAGES 1024u /* 4 МБ: git; remote-http после фикса time/datetime_get */
 #define USER_STACK_BOTTOM (USER_TOP - USER_STACK_PAGES * PAGE_SIZE)
 #define USER_STACK_GUARD (USER_STACK_BOTTOM - PAGE_SIZE)
+#define USER_TLS_MAX (64u * 1024)
+#define USER_TLS_TCB_SIZE 16u
+#define USER_TLS_BASE (USER_STACK_GUARD - PAGE_SIZE)
+#define USER_TLS_TEMPLATE (USER_TLS_BASE - 2 * USER_TLS_MAX)
 #define MMAP_END USER_STACK_GUARD
 #define THREAD_STACK_MIN (3u * PAGE_SIZE)
-_Static_assert(MMAP_BASE < MMAP_END && MMAP_END + PAGE_SIZE == USER_STACK_BOTTOM, "mmap/stack guard layout");
+_Static_assert(MMAP_BASE < USER_TLS_TEMPLATE && MMAP_END + PAGE_SIZE == USER_STACK_BOTTOM, "mmap/TLS/stack layout");
 /* 0xD0000000..: куча ядра (heap.h) — общая для всех каталогов */
 
 void paging_init(void);
