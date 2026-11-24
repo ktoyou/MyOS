@@ -21,8 +21,8 @@ static bool xstate_supported;
 
 extern __attribute__((noreturn)) void linux64_task_resume(struct linux64_frame *frame);
 
-_Static_assert(sizeof(struct linux64_frame) == 18 * sizeof(u64), "Linux syscall frame size");
-_Static_assert(__builtin_offsetof(struct linux64_frame, rip) == 13 * sizeof(u64), "Linux IRET frame");
+_Static_assert(sizeof(struct linux64_frame) == 20 * sizeof(u64), "Linux syscall frame size");
+_Static_assert(__builtin_offsetof(struct linux64_frame, rip) == 15 * sizeof(u64), "Linux IRET frame");
 
 void linux64_task_init(void) {
     linux64_current->pid = LINUX64_PID;
@@ -77,19 +77,22 @@ static void restore_state(const struct linux64_task *task) {
     }
 }
 
-static struct linux64_address_space *fork_memory(const struct linux64_address_space *parent) {
-    for (unsigned i = 0; i < LINUX64_TASK_COUNT; ++i) {
-        struct linux64_address_space *child = &address_spaces[i];
-        if (child->references) continue;
-        uptr root = paging64_fork_root();
-        if (!root) return NULL;
-        child->root = root;
-        child->references = 1;
-        child->reserve_count = parent->reserve_count;
-        for (unsigned j = 0; j < parent->reserve_count; ++j) child->reserves[j] = parent->reserves[j];
-        return child;
-    }
+static struct linux64_address_space *unused_memory(void) {
+    for (unsigned i = 0; i < LINUX64_TASK_COUNT; ++i)
+        if (!address_spaces[i].references) return &address_spaces[i];
     return NULL;
+}
+
+static struct linux64_address_space *fork_memory(const struct linux64_address_space *parent) {
+    struct linux64_address_space *child = unused_memory();
+    if (!child) return NULL;
+    uptr root = paging64_fork_root();
+    if (!root) return NULL;
+    child->root = root;
+    child->references = 1;
+    child->reserve_count = parent->reserve_count;
+    for (unsigned i = 0; i < parent->reserve_count; ++i) child->reserves[i] = parent->reserves[i];
+    return child;
 }
 
 static void release_memory(struct linux64_task *task) {
@@ -126,6 +129,9 @@ static long fork_task(struct linux64_frame *frame, uptr flags, uptr stack, uptr 
     child->finish_wait = false;
     child->vfork_child = 0;
     child->signal_mask = parent->signal_mask;
+    child->executable_path_length = parent->executable_path_length;
+    for (uptr i = 0; i <= parent->executable_path_length; ++i)
+        child->executable_path[i] = parent->executable_path[i];
     for (unsigned i = 0; i < LINUX64_SIGNAL_COUNT; ++i) child->actions[i] = parent->actions[i];
     for (unsigned i = 0; i < LINUX64_FD_COUNT; ++i) child->fds[i] = parent->fds[i];
     linux64_retain_files(child);
@@ -263,6 +269,46 @@ static void complete_vfork(const struct linux64_task *child) {
     }
 }
 
+/* Новый CR3 уже активен, поэтому последнее освобождение старого корня безопасно. */
+bool linux64_commit_exec(struct linux64_frame *frame, uptr root, uptr entry, uptr stack,
+                        const char *path, uptr path_length) {
+    if (!xstate_supported) return false;
+    struct linux64_task *task = linux64_current;
+    struct linux64_address_space *old = task->memory;
+    struct linux64_address_space *memory = old->references == 1 ? old : unused_memory();
+    if (!memory) return false;
+    if (memory == old) paging64_drop_root(old->root);
+    else release_memory(task);
+    memory->root = root;
+    memory->references = 1;
+    memory->reserve_count = 0;
+    task->memory = memory;
+
+    linux64_close_on_exec(task);
+    for (unsigned i = 0; i < LINUX64_SIGNAL_COUNT; ++i) {
+        u64 handler = task->actions[i].handler;
+        task->actions[i] = (struct linux64_sigaction){.handler = handler == SIG_IGN ? handler : 0};
+    }
+    task->child_tid = 0;
+    task->executable_path_length = path_length;
+    for (uptr i = 0; i <= path_length; ++i) task->executable_path[i] = path[i];
+    task->fs = task->gs = 0;
+    task->fs_selector = task->gs_selector = 0;
+    task->ds_selector = task->es_selector = 0x1b;
+    for (uptr i = 0; i < sizeof(task->xstate); ++i) task->xstate[i] = 0;
+    if (!xfeatures) {
+        /* FXRSTOR принимает начальные x87 control word и MXCSR явно. */
+        task->xstate[0] = 0x7f;
+        task->xstate[1] = 0x03;
+        task->xstate[24] = 0x80;
+        task->xstate[25] = 0x1f;
+    }
+    restore_state(task);
+    *frame = (struct linux64_frame){.rip = entry, .cs = 0x23, .rflags = 2, .rsp = stack, .ss = 0x1b};
+    complete_vfork(task);
+    return true;
+}
+
 static void finish_child(i32 wait_status) {
     struct linux64_task *task = linux64_current;
     linux64_close_files(task);
@@ -378,6 +424,9 @@ void linux64_task_syscall(struct linux64_frame *frame) {
         break;
     case 58: /* vfork */
         frame->rax = (u64)fork_task(frame, CLONE_VM | CLONE_VFORK | SIGCHLD, 0, 0);
+        break;
+    case 59: /* execve */
+        frame->rax = (u64)linux64_execve(frame, frame->rdi, frame->rsi, frame->rdx);
         break;
     case 60: /* exit */
     case 231: /* exit_group */

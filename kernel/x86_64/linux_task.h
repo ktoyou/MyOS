@@ -12,7 +12,7 @@
 
 /* Порядок полей совпадает с сохранёнными регистрами в linux_syscall.asm. */
 struct linux64_frame {
-    u64 rax, r9, r8, r10, rdx, rsi, rdi, r15, r14, r13, r12, rbp, rbx;
+    u64 rcx, r11, rax, r9, r8, r10, rdx, rsi, rdi, r15, r14, r13, r12, rbp, rbx;
     u64 rip, cs, rflags, rsp, ss;
 };
 
@@ -52,6 +52,8 @@ struct linux64_task {
     struct linux64_fd_slot fds[LINUX64_FD_COUNT];
     struct linux64_address_space *memory;
     struct linux64_sigaction actions[LINUX64_SIGNAL_COUNT];
+    char executable_path[LINUX64_PATH_LIMIT];
+    uptr executable_path_length;
     u64 signal_mask, fs, gs;
     struct linux64_wait wait;
     uptr child_tid;
@@ -68,6 +70,12 @@ void linux64_task_init(void);
 void linux64_task_syscall(struct linux64_frame *frame);
 void linux64_retain_files(struct linux64_task *task);
 void linux64_close_files(struct linux64_task *task);
+void linux64_close_on_exec(struct linux64_task *task);
+const struct linux64_file_source *linux64_file_source(void);
+long linux64_user_string(uptr address, char *string, uptr limit);
+long linux64_execve(struct linux64_frame *frame, uptr filename, uptr argv, uptr envp);
+bool linux64_commit_exec(struct linux64_frame *frame, uptr root, uptr entry, uptr stack,
+                        const char *path, uptr path_length);
 long linux64_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2,
                     uptr arg3, uptr arg4, uptr arg5);
 

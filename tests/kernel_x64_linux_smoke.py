@@ -182,6 +182,31 @@ def check_vfork(build):
     print('OVMF: Linux vfork, shared address space and waitid: PASS', flush=True)
 
 
+def check_exec(build):
+    probe = (build / 'linux-exec.elf').resolve()
+    target = build / 'linux-exec-target.elf'
+    malformed = build / 'linux-exec-bad.elf'
+    malformed.write_bytes(b'not an ELF image\n')
+    malformed.chmod(0o755)
+    marker = 'Linux ELF64 execve probe'
+    host = subprocess.run([str(probe)], cwd=probe.parent, env={}, capture_output=True, timeout=5)
+    assert (host.returncode, host.stdout, host.stderr) == (0, (marker + '\n').encode(), b''), host
+    files = {pathlib.Path('/') / path.name: path.read_bytes() for path in (target, malformed)}
+    serial = check_guest('execve', probe.read_bytes(), 'Linux x86-64 exit status=0x00', files=files)
+    assert marker in serial, serial
+    symbols = subprocess.check_output(['nm', str(probe)], text=True)
+    entry = next(int(line.split()[0], 16) for line in symbols.splitlines() if line.endswith(' exec_oom'))
+    oom = bytearray(probe.read_bytes())
+    struct.pack_into('<Q', oom, 24, entry)
+    large = bytearray(target.read_bytes())
+    loads = [offset for offset in program_headers(large) if struct.unpack_from('<I', large, offset)[0] == 1]
+    last = max(loads, key=lambda offset: struct.unpack_from('<Q', large, offset + 16)[0])
+    struct.pack_into('<Q', large, last + 40, 0x9000000)
+    check_guest('execve-oom', oom, 'Linux x86-64 exit status=0x00',
+                files={pathlib.Path('/linux-exec-oom.elf'): large})
+    print('OVMF: execve, new ELF stack, CLOEXEC, vfork resume and rollback: PASS', flush=True)
+
+
 def main():
     build = pathlib.Path('build/x86_64')
     probe = build / 'linux-probe.elf'
@@ -223,6 +248,7 @@ def main():
     check_socket(build)
     check_fork(build)
     check_vfork(build)
+    check_exec(build)
 
 
 if __name__ == '__main__':

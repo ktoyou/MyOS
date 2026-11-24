@@ -36,10 +36,14 @@ linux64_syscall_entry:
     push r8
     push r9
     push rax
+    push qword [rsp+15*8]       ; r11: пользовательские флаги
+    push qword [rsp+14*8]       ; rcx: пользовательский RIP
     ; Планировщик может заменить весь кадр перед возвратом в ring 3.
     mov rdi,rsp
     call linux64_task_syscall
 .restore_frame:
+    pop rcx
+    pop r11
     pop rax
     pop r9
     pop r8
@@ -53,8 +57,6 @@ linux64_syscall_entry:
     pop r12
     pop rbp
     pop rbx
-    mov rcx,[rsp]
-    mov r11,[rsp+16]
     iretq
 .bad_return:
     and rsp,-16
