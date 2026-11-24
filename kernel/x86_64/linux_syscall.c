@@ -124,6 +124,7 @@ long linux64_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2,
     if (number == 158) return linux_arch_prctl((i32)arg0, arg1);
     if (number == 202) return linux64_futex(arg0, (u32)arg1, (u32)arg2, arg3, (u32)arg5);
     if (number == 228) return linux64_clock_gettime((i32)arg0, arg1);
+    if (number == 271) return linux64_ppoll(arg0, (u32)arg1, arg2, arg3, arg4);
     if (number == 318) return linux64_getrandom(arg0, arg1, (u32)arg2);
     return linux64_file_syscall(number, arg0, arg1, arg2, arg3);
 }

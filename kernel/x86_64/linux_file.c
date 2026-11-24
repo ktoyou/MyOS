@@ -1,6 +1,8 @@
 #include "linux_task.h"
 #include "paging.h"
 
+#define NS_PER_SECOND 1000000000ul
+
 enum {
     EPERM = 1, ENOENT = 2, EIO = 5, EBADF = 9, EAGAIN = 11, ENOMEM = 12, EACCES = 13, EFAULT = 14,
     EBUSY = 16, EEXIST = 17, ENOTDIR = 20, EISDIR = 21, EINVAL = 22, EMFILE = 24, EFBIG = 27, EROFS = 30,
@@ -100,34 +102,108 @@ bool linux64_poll_ready(struct linux64_task *task) {
     return poll->deadline && linux64_monotonic_ns(&nanos) && nanos >= poll->deadline;
 }
 
-long linux64_poll_resume(const struct linux64_task *task) {
+static void poll_remaining(const struct linux64_poll_timeout *end) {
+    u64 nanos;
+    if (!end || !end->address || !linux64_monotonic_ns(&nanos)) return;
+    u64 seconds = nanos / NS_PER_SECOND;
+    u64 fraction = nanos % NS_PER_SECOND;
+    u64 time[2] = {0};
+    if (end->seconds > seconds || (end->seconds == seconds && end->nanoseconds >= fraction)) {
+        time[0] = end->seconds - seconds;
+        if (end->nanoseconds < fraction) {
+            --time[0];
+            time[1] = NS_PER_SECOND - fraction + end->nanoseconds;
+        } else {
+            time[1] = end->nanoseconds - fraction;
+        }
+    }
+    /* Linux сохраняет результат ppoll, даже если остаток нельзя записать. */
+    paging64_copy_to_user(end->address, time, sizeof(time));
+}
+
+long linux64_poll_resume(struct linux64_task *task) {
     const struct linux64_poll_wait *poll = &task->poll;
+    long result = poll->ready;
     for (unsigned i = 0; i < poll->count; ++i) {
         uptr field = poll->address + i * sizeof(poll->entries[0]) +
                      __builtin_offsetof(struct linux64_pollfd, revents);
-        if (!paging64_put_user_u16(field, poll->entries[i].revents)) return -EFAULT;
+        if (!paging64_put_user_u16(field, poll->entries[i].revents)) {
+            result = -EFAULT;
+            break;
+        }
     }
-    return poll->ready;
+    task->signal_mask = poll->saved_mask;
+    poll_remaining(&poll->timeout);
+    return result;
+}
+
+static long poll_wait(uptr address, u32 count, u64 deadline, bool immediate,
+                      const struct linux64_poll_timeout *timeout, const u64 *mask) {
+    struct linux64_task *task = linux64_current;
+    struct linux64_poll_wait *poll = &task->poll;
+    if (count > FD_COUNT) {
+        poll_remaining(timeout);
+        return -EINVAL;
+    }
+    uptr bytes = count * sizeof(poll->entries[0]);
+    if (address > X64_USER_TOP || bytes > X64_USER_TOP - address ||
+        paging64_copy_from_user(poll->entries, address, bytes) != bytes) {
+        poll_remaining(timeout);
+        return -EFAULT;
+    }
+    poll->address = address;
+    poll->count = count;
+    poll->deadline = deadline;
+    poll->timeout = timeout ? *timeout : (struct linux64_poll_timeout){0};
+    poll->saved_mask = task->signal_mask;
+    if (mask) task->signal_mask = *mask;
+    if (linux64_poll_ready(task) || immediate) return linux64_poll_resume(task);
+    task->state = TASK_POLL_WAIT;
+    return 0;
 }
 
 long linux64_poll(uptr address, u32 count, i32 timeout) {
     if (count > FD_COUNT) return -EINVAL;
-    struct linux64_task *task = linux64_current;
-    struct linux64_poll_wait *poll = &task->poll;
     u64 deadline = 0;
     if (timeout > 0) {
         if (!linux64_monotonic_ns(&deadline)) return -EIO;
         deadline += (u64)timeout * 1000000ul;
     }
-    uptr bytes = count * sizeof(poll->entries[0]);
-    if (address > X64_USER_TOP || bytes > X64_USER_TOP - address ||
-        paging64_copy_from_user(poll->entries, address, bytes) != bytes) return -EFAULT;
-    poll->address = address;
-    poll->count = count;
-    poll->deadline = deadline;
-    if (linux64_poll_ready(task) || timeout == 0) return linux64_poll_resume(task);
-    task->state = TASK_POLL_WAIT;
-    return 0;
+    return poll_wait(address, count, deadline, timeout == 0, NULL, NULL);
+}
+
+long linux64_ppoll(uptr address, u32 count, uptr timeout, uptr sigmask, uptr sigset_size) {
+    u64 deadline = 0;
+    bool immediate = false;
+    struct linux64_poll_timeout end = {0};
+    if (timeout) {
+        long time[2];
+        if (paging64_copy_from_user(time, timeout, sizeof(time)) != sizeof(time)) return -EFAULT;
+        if (time[0] < 0 || (u64)time[1] >= NS_PER_SECOND) return -EINVAL;
+        immediate = !time[0] && !time[1];
+        if (!immediate) {
+            u64 nanos;
+            if (!linux64_monotonic_ns(&nanos)) return -EIO;
+            const u64 limit = 0x7fffffffffffffffULL;
+            u64 fraction = nanos % NS_PER_SECOND + (u64)time[1];
+            end.address = timeout;
+            end.seconds = (u64)time[0] + nanos / NS_PER_SECOND + fraction / NS_PER_SECOND;
+            end.nanoseconds = fraction % NS_PER_SECOND;
+            if (end.seconds > limit) {
+                end.seconds = limit;
+                end.nanoseconds = 0;
+            }
+            /* Планировщик ограничен 64-битными наносекундами, ABI timespec шире. */
+            deadline = end.seconds > (limit - end.nanoseconds) / NS_PER_SECOND
+                           ? limit : end.seconds * NS_PER_SECOND + end.nanoseconds;
+        }
+    }
+    u64 mask;
+    if (sigmask) {
+        long result = linux64_read_signal_mask(sigmask, sigset_size, &mask);
+        if (result) return result;
+    }
+    return poll_wait(address, count, deadline, immediate, &end, sigmask ? &mask : NULL);
 }
 
 static enum file_kind kind_of(const struct file_handle *file) {
