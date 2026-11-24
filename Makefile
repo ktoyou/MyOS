@@ -1594,19 +1594,29 @@ $(X64BUILD):
 	mkdir -p $@
 $(X64BUILD)/entry.o: kernel/x86_64/entry.asm | $(X64BUILD)
 	$(NASM) -f elf64 $< -o $@
-$(X64BUILD)/early-0.o $(X64BUILD)/early-6.o $(X64BUILD)/early-13.o: $(X64BUILD)/early-%.o: kernel/x86_64/early.c kernel/bootinfo.h kernel/types.h | $(X64BUILD)
+$(X64BUILD)/early-0.o $(X64BUILD)/early-6.o $(X64BUILD)/early-13.o: $(X64BUILD)/early-%.o: kernel/x86_64/early.c kernel/x86_64/pmm.h kernel/bootinfo.h kernel/types.h | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -DX64_TEST_EXCEPTION=$* -c $< -o $@
-$(X64BUILD)/kernel.elf: $(X64BUILD)/entry.o $(X64BUILD)/early-0.o kernel/x86_64/linker.ld
+$(X64BUILD)/early-pmm.o: kernel/x86_64/early.c kernel/x86_64/pmm.h kernel/bootinfo.h kernel/types.h | $(X64BUILD)
+	$(CC) $(X64CFLAGS) -DX64_TEST_PMM -c $< -o $@
+$(X64BUILD)/pmm.o: kernel/x86_64/pmm.c kernel/x86_64/pmm.h kernel/bootinfo.h kernel/types.h | $(X64BUILD)
+	$(CC) $(X64CFLAGS) -c $< -o $@
+$(X64BUILD)/pmm-check.o: tests/kernel_x64_pmm_check.c kernel/x86_64/pmm.h kernel/bootinfo.h kernel/types.h | $(X64BUILD)
+	$(CC) $(X64CFLAGS) -c $< -o $@
+$(X64BUILD)/kernel.elf: $(X64BUILD)/entry.o $(X64BUILD)/early-0.o $(X64BUILD)/pmm.o kernel/x86_64/linker.ld
 	$(LD) -m elf_x86_64 -T kernel/x86_64/linker.ld -nostdlib $(filter %.o,$^) -o $@
-$(X64BUILD)/kernel-6.elf $(X64BUILD)/kernel-13.elf: $(X64BUILD)/kernel-%.elf: $(X64BUILD)/entry.o $(X64BUILD)/early-%.o kernel/x86_64/linker.ld
+$(X64BUILD)/kernel-6.elf $(X64BUILD)/kernel-13.elf: $(X64BUILD)/kernel-%.elf: $(X64BUILD)/entry.o $(X64BUILD)/early-%.o $(X64BUILD)/pmm.o kernel/x86_64/linker.ld
 	$(LD) -m elf_x86_64 -T kernel/x86_64/linker.ld -nostdlib $(filter %.o,$^) -o $@
-$(X64BUILD)/kernel.bin $(X64BUILD)/kernel-6.bin $(X64BUILD)/kernel-13.bin: %.bin: %.elf
+$(X64BUILD)/kernel-pmm.elf: $(X64BUILD)/entry.o $(X64BUILD)/early-pmm.o $(X64BUILD)/pmm.o $(X64BUILD)/pmm-check.o kernel/x86_64/linker.ld
+	$(LD) -m elf_x86_64 -T kernel/x86_64/linker.ld -nostdlib $(filter %.o,$^) -o $@
+$(X64BUILD)/kernel.bin $(X64BUILD)/kernel-6.bin $(X64BUILD)/kernel-13.bin $(X64BUILD)/kernel-pmm.bin: %.bin: %.elf
 	$(OBJCOPY) -O binary $< $@
 
-.PHONY: kernel-x64 kernel-x64-smoke
+.PHONY: kernel-x64 kernel-x64-smoke kernel-x64-pmm-smoke
 kernel-x64: $(X64BUILD)/kernel.bin
 kernel-x64-smoke: kernel-x64 $(X64BUILD)/kernel-6.bin $(X64BUILD)/kernel-13.bin
 	python3 tests/kernel_x64_smoke.py
+kernel-x64-pmm-smoke: $(X64BUILD)/kernel-pmm.bin
+	python3 tests/kernel_x64_smoke.py --pmm
 
 uefi-smoke: $(HWBUILD)/kernel.bin $(BUILD)/myfs $(BUILD)/ld.so $(BUILD)/user/libc.so $(addprefix $(BUILD)/user/,sh cat stat poweroff sync)
 	python3 tests/uefi_smoke.py

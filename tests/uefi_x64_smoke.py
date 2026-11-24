@@ -11,10 +11,10 @@ sys.path.insert(0, str(pathlib.Path('tools').resolve()))
 from make_uefi import ESP_START, ESP_SECTORS, ROOT_START, esp
 
 
-def test_disk(image, payload, kernel_end):
+def test_disk(image, payload, kernel_end, live_root_header):
     disk_id = 0x23456789
     root_sectors = 131072
-    efi, _ = esp(payload, kernel_end, disk_id=disk_id,
+    efi, _ = esp(payload, kernel_end, mode=1 if live_root_header is not None else 2, disk_id=disk_id,
                  root_sectors=root_sectors, arch='x86_64')
     mbr = bytearray(512)
     struct.pack_into('<I', mbr, 440, disk_id)
@@ -25,12 +25,15 @@ def test_disk(image, payload, kernel_end):
         disk.write(mbr)
         disk.seek(512 * ESP_START)
         disk.write(efi)
+        if live_root_header is not None:
+            disk.seek(512 * ROOT_START)
+            disk.write(live_root_header)
         disk.truncate(512 * (ROOT_START + root_sectors))
 
 
-def boot_x64(directory, name, payload, kernel_end, markers):
+def boot_x64(directory, name, payload, kernel_end, markers, *, live_root_header=None):
     image = directory / 'disk.img'
-    test_disk(image, payload, kernel_end)
+    test_disk(image, payload, kernel_end, live_root_header)
     args = uefi_firmware(directory, name) + [
         '-drive', f'if=none,id=root,format=raw,file={image}',
         '-device', 'nvme,drive=root,serial=UEFIX64,bootindex=1',
