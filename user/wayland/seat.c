@@ -3,14 +3,23 @@
 #include "keyboard.h"
 
 #include <stdlib.h>
+#include <time.h>
 #include <wayland-server-protocol.h>
 
 struct wayland_seat {
+    struct wl_display *display;
     struct wl_global *global;
     struct wl_list clients;
     struct wayland_keyboard *keyboard;
     struct wayland_pointer *pointer;
     struct wayland_clipboard *clipboard;
+    const char *keymap_path;
+    const struct wayland_pointer_ops *pointer_ops;
+    void *pointer_data;
+    int width, height;
+    uint64_t next_input_probe_ms;
+    struct wl_resource *pending_focus;
+    struct wl_listener pending_focus_destroy;
 };
 
 struct seat_client {
@@ -105,31 +114,79 @@ static void bind_seat(struct wl_client *client, void *data, uint32_t version, ui
     if (version >= WL_SEAT_NAME_SINCE_VERSION) wl_seat_send_name(entry->resource, "MyOS");
 }
 
+static struct wl_resource *take_pending_focus(struct wayland_seat *seat) {
+    struct wl_resource *surface = seat->pending_focus;
+    if (surface) {
+        seat->pending_focus = NULL;
+        wl_list_remove(&seat->pending_focus_destroy.link);
+    }
+    return surface;
+}
+
+static void pending_focus_destroyed(struct wl_listener *listener, void *resource) {
+    (void)resource;
+    struct wayland_seat *seat = wl_container_of(listener, seat, pending_focus_destroy);
+    take_pending_focus(seat);
+}
+
+static bool open_inputs(struct wayland_seat *seat) {
+    bool keyboard_ok = seat->keyboard ||
+        wayland_keyboard_init(&seat->keyboard, seat->display, seat->keymap_path, capabilities_changed,
+                              keyboard_focused, input_pressed, seat);
+    bool pointer_ok = seat->pointer ||
+        wayland_pointer_init(&seat->pointer, seat->display, seat->width, seat->height,
+                             seat->pointer_ops, seat->pointer_data, capabilities_changed, input_pressed, seat);
+    if (seat->keyboard && seat->pending_focus)
+        wayland_keyboard_focus(seat->keyboard, take_pending_focus(seat));
+    return keyboard_ok && pointer_ok;
+}
+
 bool wayland_seat_init(struct wayland_seat **result, struct wl_display *display, const char *keymap_path,
                        int width, int height, const struct wayland_pointer_ops *ops, void *data) {
     struct wayland_seat *seat = calloc(1, sizeof(*seat));
     if (!seat) return false;
+    seat->display = display;
+    seat->keymap_path = keymap_path;
+    seat->width = width;
+    seat->height = height;
+    seat->pointer_ops = ops;
+    seat->pointer_data = data;
+    seat->pending_focus_destroy.notify = pending_focus_destroyed;
     wl_list_init(&seat->clients);
-    if (!wayland_keyboard_init(&seat->keyboard, display, keymap_path, capabilities_changed,
-                               keyboard_focused, input_pressed, seat) ||
-        !wayland_pointer_init(&seat->pointer, display, width, height, ops, data,
-                              capabilities_changed, input_pressed, seat)) {
+    seat->global = wl_global_create(display, &wl_seat_interface, 7, seat, bind_seat);
+    if (!seat->global || !wayland_clipboard_init(&seat->clipboard, display, owns_seat, seat) ||
+        !open_inputs(seat)) {
         wayland_seat_destroy(seat);
         return false;
-    }
-    if (seat->keyboard || seat->pointer) {
-        seat->global = wl_global_create(display, &wl_seat_interface, 7, seat, bind_seat);
-        if (!seat->global || !wayland_clipboard_init(&seat->clipboard, display, owns_seat, seat)) {
-            wayland_seat_destroy(seat);
-            return false;
-        }
     }
     *result = seat;
     return true;
 }
 
+void wayland_seat_probe_input(struct wayland_seat *seat) {
+    if (seat->pointer && (seat->keyboard || !seat->keymap_path)) return;
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now)) return;
+    uint64_t ms = (uint64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+    if (ms < seat->next_input_probe_ms) return;
+
+    uint32_t previous = capabilities(seat);
+    bool had_pointer = seat->pointer != NULL;
+    /* Ошибка открытия или настройки не должна повторять сообщения на каждом опросе. */
+    seat->next_input_probe_ms = ms + (open_inputs(seat) ? 250 : 2000);
+    if (!had_pointer && seat->pointer) wayland_pointer_update(seat->pointer);
+    if (previous != capabilities(seat)) capabilities_changed(seat);
+}
+
 void wayland_seat_keyboard_focus(struct wayland_seat *seat, struct wl_resource *surface) {
-    if (seat) wayland_keyboard_focus(seat->keyboard, surface);
+    if (!seat) return;
+    if (seat->keyboard) {
+        wayland_keyboard_focus(seat->keyboard, surface);
+    } else if (seat->keymap_path && seat->pending_focus != surface) {
+        take_pending_focus(seat);
+        seat->pending_focus = surface;
+        if (surface) wl_resource_add_destroy_listener(surface, &seat->pending_focus_destroy);
+    }
 }
 
 void wayland_seat_pointer_update(struct wayland_seat *seat) {
@@ -142,6 +199,7 @@ void wayland_seat_pointer_detach(struct wayland_seat *seat, struct wl_resource *
 
 void wayland_seat_destroy(struct wayland_seat *seat) {
     if (!seat) return;
+    take_pending_focus(seat);
     wayland_clipboard_destroy(seat->clipboard);
     if (seat->global) wl_global_destroy(seat->global);
     wayland_pointer_destroy(seat->pointer);

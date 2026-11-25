@@ -32,6 +32,8 @@ static struct wl_surface *input_surface;
 static int output_width, output_height, output_scale, width, height;
 static bool output_ready, configured, presented, released, xrgb;
 static bool keymap_ready, focused, repeat_ready, shift_down, shift_active;
+static bool late_usb, seat_capabilities_seen;
+static uint32_t seat_mask;
 static unsigned key_events;
 static const uint32_t window_colors[2][2] = {{0xf14c88, 0x13c5a2}, {0x8254ec, 0xd49d12}};
 static const char clipboard_mime[] = "text/plain;charset=utf-8";
@@ -181,6 +183,10 @@ static void keyboard_key(void *data, struct wl_keyboard *obj, uint32_t serial,
     }
     if (key == 42) shift_down = state != 0;
     ++key_events;
+    if (late_usb && key_events == 3) {
+        static const char marker[] = "Wayland USB A released\n";
+        if (write(1, marker, sizeof(marker) - 1) != sizeof(marker) - 1) fail("USB key release marker");
+    }
 }
 
 static void keyboard_modifiers(void *data, struct wl_keyboard *obj, uint32_t serial,
@@ -303,12 +309,18 @@ static const struct wl_pointer_listener pointer_listener = {
 
 static void seat_capabilities(void *data, struct wl_seat *obj, uint32_t capabilities) {
     (void)data;
-    if (capabilities != (WL_SEAT_CAPABILITY_KEYBOARD | WL_SEAT_CAPABILITY_POINTER)) fail("seat capabilities");
-    if (!keyboard) {
+    const uint32_t input = WL_SEAT_CAPABILITY_KEYBOARD | WL_SEAT_CAPABILITY_POINTER;
+    if (capabilities & ~input || (!late_usb && capabilities != input) ||
+        (late_usb && !seat_capabilities_seen && capabilities) ||
+        (late_usb && seat_capabilities_seen && (capabilities == seat_mask || (capabilities & seat_mask) != seat_mask)))
+        fail("seat capabilities");
+    seat_capabilities_seen = true;
+    seat_mask = capabilities;
+    if ((capabilities & WL_SEAT_CAPABILITY_KEYBOARD) && !keyboard) {
         keyboard = wl_seat_get_keyboard(obj);
         wl_keyboard_add_listener(keyboard, &keyboard_events, NULL);
     }
-    if (!pointer) {
+    if ((capabilities & WL_SEAT_CAPABILITY_POINTER) && !pointer) {
         pointer = wl_seat_get_pointer(obj);
         wl_pointer_add_listener(pointer, &pointer_listener, NULL);
     }
@@ -764,6 +776,10 @@ static void receiver_keyboard_key(void *data, struct wl_keyboard *object, uint32
     if (!receiver->focused || !serial || key != KEY_B || receiver->key_events >= 2 || state != expected)
         fail("clipboard receiver key sequence");
     ++receiver->key_events;
+    if (late_usb && receiver->key_events == 1) {
+        static const char marker[] = "Wayland USB clipboard key pressed\n";
+        if (write(1, marker, sizeof(marker) - 1) != sizeof(marker) - 1) fail("USB clipboard key marker");
+    }
 }
 
 static void receiver_keyboard_modifiers(void *data, struct wl_keyboard *object, uint32_t serial,
@@ -853,11 +869,13 @@ static void check_clipboard(struct wl_display *owner, struct wl_surface *owner_s
 }
 
 int main(void) {
+    late_usb = access("/myos/wayland-late-usb-input", F_OK) == 0;
     struct wl_display *display = start_compositor();
     struct wl_registry *registry = wl_display_get_registry(display);
     wl_registry_add_listener(registry, &registry_events, NULL);
-    if (wl_display_roundtrip(display) < 0 || !compositor || !subcompositor || !shm || !shell || !output || !data_manager ||
-        wl_display_roundtrip(display) < 0 || !output_ready || !xrgb || output_scale != 1)
+    if (wl_display_roundtrip(display) < 0 || !compositor || !subcompositor || !shm || !shell || !output ||
+        !seat || !data_manager || wl_display_roundtrip(display) < 0 || !seat_capabilities_seen ||
+        !output_ready || !xrgb || output_scale != 1)
         fail("bind display globals");
 
     source_device = wl_data_device_manager_get_data_device(data_manager, seat);
@@ -880,6 +898,13 @@ int main(void) {
 
     struct wl_buffer *buffer = create_buffer(shm, width, height, window_colors);
     commit_frame(display, surface, buffer, width, height);
+    if (late_usb) {
+        static const char marker[] = "Wayland surface mapped without input\n";
+        if (seat_mask || keyboard || pointer || focused || pointer_focused ||
+            write(1, marker, sizeof(marker) - 1) != sizeof(marker) - 1) fail("empty seat after mapping surface");
+        while (!focused || !pointer_focused || !pointer_frames)
+            if (wl_display_dispatch(display) < 0) fail("dispatch hotplug seat capabilities and focus");
+    }
     if (!keyboard || !focused || !pointer || !pointer_focused || pointer_frames != 1) fail("missing input focus");
     static const char ready[] = "Wayland keyboard focused\n";
     if (write(1, ready, sizeof(ready) - 1) != sizeof(ready) - 1) fail("keyboard marker");

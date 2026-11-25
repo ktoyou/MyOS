@@ -1,7 +1,7 @@
 """Проверка кадра и ввода отдельного Wayland-клиента в QEMU."""
+import argparse
 import pathlib
 import subprocess
-import sys
 import tempfile
 
 from kernel_x64_linux_smoke import linux_root
@@ -78,12 +78,20 @@ def check_client_cursor(shot):
 
 
 def main():
-    build = pathlib.Path(sys.argv[1])
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('build', type=pathlib.Path)
+    parser.add_argument('--late-usb', action='store_true')
+    args = parser.parse_args()
+    build = args.build
     client = build / 'wayland-client'
     compositor = build / 'wayland-compositor'
     files = dependencies(client) | dependencies(compositor)
     files['/myos/wayland-compositor'] = compositor.read_bytes()
     files['/myos/keyboard.xkb'] = (build / 'keyboard.xkb').read_bytes()
+    qemu = []
+    if args.late_usb:
+        files['/myos/wayland-late-usb-input'] = b'1'
+        qemu = ['-machine', 'q35,i8042=off', '-device', 'qemu-xhci,id=xhci']
     root = linux_root(client.read_bytes(), files, '/myos/wayland-client')
     payload, kernel_end = image('kernel-linux')
 
@@ -92,6 +100,16 @@ def main():
         shot = directory / 'wayland.ppm'
 
         def input_events(vm):
+            if args.late_usb:
+                vm.wait('Wayland surface mapped without input')
+                empty = directory / 'cursor-absent.ppm'
+                vm.qmp('screendump', {'filename': str(empty)})
+                check_pixels(empty)
+                w, h, pixels = read_frame(empty)
+                assert not overlay_pixels(w, h, pixels, w // 2, h // 2), 'cursor on an empty seat'
+                for driver, port in (('usb-kbd', '1'), ('usb-mouse', '2')):
+                    vm.qmp('device_add', {'driver': driver, 'id': driver, 'bus': 'xhci.0', 'port': port})
+
             vm.wait('Wayland keyboard focused')
 
             def send_keys(keys, down):
@@ -101,7 +119,12 @@ def main():
 
             send_keys(('shift', 'a'), True)
             vm.wait('Wayland clipboard serial published')
-            send_keys(('a', 'shift'), False)
+            if args.late_usb:
+                send_keys(('a',), False)
+                vm.wait('Wayland USB A released')
+                send_keys(('shift',), False)
+            else:
+                send_keys(('a', 'shift'), False)
 
             vm.wait('Wayland pointer focused')
             initial = directory / 'cursor-initial.ppm'
@@ -134,18 +157,23 @@ def main():
                 vm.wait(marker)
             vm.wait('Wayland clipboard receiver focused')
             send_keys(('b',), True)
+            if args.late_usb:
+                vm.wait('Wayland USB clipboard key pressed')
             send_keys(('b',), False)
 
-        serial = boot_x64(directory, 'x64-linux-wayland', payload, kernel_end,
+        name = 'x64-linux-wayland-late-usb' if args.late_usb else 'x64-linux-wayland'
+        serial = boot_x64(directory, name, payload, kernel_end,
                           ['Wayland popup configured, presented and restored',
                            'Wayland subsurface synchronized, presented and restored',
                            'Wayland clipboard received and cleared',
                            'Wayland shared memory frame presented', 'Linux x86-64 exit status=0x00'],
-                          live_root_header=root, screenshot=shot, interact=input_events)
+                          live_root_header=root, screenshot=shot, extra=qemu, interact=input_events)
         assert 'x86-64 exception' not in serial, serial
         check_pixels(shot)
         check_fallback_cursor(shot, POINTER_DX + CURSOR_DX, POINTER_DY + CURSOR_DY)
-    print('OVMF: Wayland xdg-shell, popups, subsurfaces, shared memory, framebuffer, input and clipboard: PASS', flush=True)
+    transport = 'late USB input' if args.late_usb else 'input'
+    print(f'OVMF: Wayland xdg-shell, popups, subsurfaces, shared memory, framebuffer, {transport} and clipboard: PASS',
+          flush=True)
 
 
 if __name__ == '__main__':
