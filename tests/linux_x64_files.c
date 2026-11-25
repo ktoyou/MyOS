@@ -427,6 +427,55 @@ static long check_named_file(long dir) {
     return 0;
 }
 
+static long check_flock(long dir) {
+    enum { SHARED = 1, EXCLUSIVE = 2, NONBLOCK = 4, UNLOCK = 8 };
+    static const char name[] = "profile-lock";
+    if (call(73, -1, EXCLUSIVE, 0, 0) != -9 ||
+        call(73, dir, SHARED | EXCLUSIVE, 0, 0) != -22) return 170;
+    long first = call(257, dir, (word)name, 0xc0, 0600);
+    long second = call(257, dir, (word)name, 0x800, 0);
+    long third = call(257, dir, (word)name, 0, 0);
+    if (first < 3 || second < 3 || third < 3 ||
+        call(73, first, SHARED, 0, 0) || call(73, first, SHARED, 0, 0) ||
+        call(73, second, SHARED, 0, 0) ||
+        call(73, first, EXCLUSIVE | NONBLOCK, 0, 0) != -11 ||
+        call(73, third, EXCLUSIVE | NONBLOCK, 0, 0) != -11 ||
+        call(73, second, UNLOCK, 0, 0) || call(73, third, EXCLUSIVE | NONBLOCK, 0, 0)) return 171;
+
+    long duplicate = call(32, third, 0, 0, 0);
+    if (duplicate < 3 || call(3, third, 0, 0, 0) ||
+        call(73, first, SHARED | NONBLOCK, 0, 0) != -11 || call(3, duplicate, 0, 0, 0) ||
+        call(73, first, EXCLUSIVE | NONBLOCK, 0, 0)) return 172;
+
+    int pipe[2];
+    if (call(22, (word)pipe, 0, 0, 0)) return 173;
+    long child = call(57, 0, 0, 0, 0);
+    if (!child) {
+        unsigned status = call(73, first, EXCLUSIVE | NONBLOCK, 0, 0) ||
+            call(3, first, 0, 0, 0) || call(3, pipe[0], 0, 0, 0) ||
+            call(1, pipe[1], (word)"R", 1, 0) != 1 || call(73, second, EXCLUSIVE, 0, 0);
+        call(60, status, 0, 0, 0);
+        __builtin_trap();
+    }
+    int status = 0;
+    char ready;
+    if (child < 0 || call(3, second, 0, 0, 0) || call(3, pipe[1], 0, 0, 0) ||
+        call(0, pipe[0], (word)&ready, 1, 0) != 1 || ready != 'R' ||
+        call(24, 0, 0, 0, 0) || call(61, child, (word)&status, 1, 0) ||
+        call(3, first, 0, 0, 0) || call(61, child, (word)&status, 0, 0) != child || status ||
+        call(3, pipe[0], 0, 0, 0)) return 174;
+
+    first = call(257, dir, (word)name, 0, 0);
+    if (first < 3 || call(73, first, EXCLUSIVE | NONBLOCK, 0, 0) ||
+        call(263, dir, (word)name, 0, 0)) return 175;
+    second = call(257, dir, (word)name, 0xc2, 0600);
+    if (second < 3 || call(73, second, EXCLUSIVE | NONBLOCK, 0, 0) ||
+        call(73, first, UNLOCK | NONBLOCK, 0, 0) ||
+        call(3, first, 0, 0, 0) || call(3, second, 0, 0, 0) ||
+        call(263, dir, (word)name, 0, 0)) return 176;
+    return 0;
+}
+
 static long check_directories(void) {
     static char path[] = "/tmp/myos-dir-0000000000";
     unsigned pid = (unsigned)call(39, 0, 0, 0, 0);
@@ -476,6 +525,8 @@ static long check_directories(void) {
     if (links) return links;
     long named = check_named_file(dir);
     if (named) return named;
+    long locks = check_flock(dir);
+    if (locks) return locks;
     if (call(3, dir, 0, 0, 0)) return 51;
     if (call(63, (word)buffer, 0, 0, 0)) return 52;
     if (buffer[0] == 'M') {

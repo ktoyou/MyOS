@@ -59,7 +59,7 @@ struct linux64_caps {
 
 enum linux64_task_state {
     TASK_FREE, TASK_RUNNABLE, TASK_WAITING, TASK_VFORK_WAIT, TASK_PIPE_WAIT, TASK_FUTEX_WAIT,
-    TASK_POLL_WAIT, TASK_SOCKET_WAIT, TASK_EVENTFD_WAIT, TASK_EPOLL_WAIT, TASK_DEAD,
+    TASK_POLL_WAIT, TASK_SOCKET_WAIT, TASK_EVENTFD_WAIT, TASK_EPOLL_WAIT, TASK_FLOCK_WAIT, TASK_DEAD,
 };
 
 struct linux64_pipe_io {
@@ -96,6 +96,11 @@ struct linux64_epoll_wait {
     uptr address;
     u64 deadline;
     u32 maxevents;
+};
+
+struct linux64_flock_wait {
+    struct file_handle *file;
+    u32 mode;
 };
 
 struct linux64_wait {
@@ -172,6 +177,7 @@ struct linux64_task {
     struct linux64_socket_wait socket_wait;
     struct linux64_eventfd_wait eventfd_wait;
     struct linux64_epoll_wait epoll_wait;
+    struct linux64_flock_wait flock_wait;
     struct linux64_futex_wait futex;
     struct linux64_poll_wait poll;
     uptr child_tid, clear_child_tid;
@@ -256,6 +262,9 @@ void linux64_eventfd_wait_finish(struct linux64_task *task);
 bool linux64_epoll_wait_ready(const struct linux64_epoll_wait *wait);
 long linux64_epoll_resume(void);
 void linux64_epoll_wait_finish(struct linux64_task *task);
+bool linux64_flock_ready(const struct linux64_flock_wait *wait);
+long linux64_flock_resume(void);
+void linux64_flock_wait_finish(struct linux64_task *task);
 const struct linux64_file_source *linux64_file_source(void);
 struct linux64_fs *linux64_initial_fs(void);
 struct linux64_fs *linux64_fs_copy(const struct linux64_fs *source);

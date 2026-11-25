@@ -19,6 +19,7 @@ enum {
     O_CLOEXEC = 0x80000,
     F_DUPFD = 0, F_GETFD = 1, F_SETFD = 2, F_GETFL = 3, F_SETFL = 4,
     F_DUPFD_CLOEXEC = 1030, F_ADD_SEALS = 1033, F_GET_SEALS = 1034,
+    LOCK_SH = 1, LOCK_EX = 2, LOCK_NB = 4, LOCK_UN = 8,
     F_SEAL_SEAL = 1, F_SEAL_SHRINK = 2, F_SEAL_GROW = 4, F_SEAL_EXEC = 0x20,
     MFD_CLOEXEC = 1, MFD_ALLOW_SEALING = 2, MFD_NOEXEC_SEAL = 8,
     EFD_SEMAPHORE = 1,
@@ -57,6 +58,8 @@ static struct memfd {
     u64 inode;
     u32 seals;
     unsigned references;
+    unsigned shared_locks;
+    bool exclusive_lock;
     bool linked;
 } memfds[OPEN_FILE_COUNT];
 static u64 next_memfd_inode = 1;
@@ -98,6 +101,7 @@ static struct file_handle {
     struct file_handle *released_next;
     u64 event_count;
     u32 flags;
+    u32 flock_mode;
     unsigned references, watched_by, scm_inflight;
     bool event_semaphore;
 } open_files[OPEN_FILE_COUNT];
@@ -304,6 +308,12 @@ static void release_backing(struct memfd *backing) {
     backing->size = 0;
 }
 
+static void flock_release(struct file_handle *file) {
+    if (file->flock_mode == LOCK_SH) --file->memfd->shared_locks;
+    if (file->flock_mode == LOCK_EX) file->memfd->exclusive_lock = false;
+    file->flock_mode = 0;
+}
+
 struct memfd *linux64_tmp_alloc(void) {
     for (unsigned i = 0; i < OPEN_FILE_COUNT; ++i) {
         struct memfd *backing = &memfds[i];
@@ -352,7 +362,10 @@ static void destroy_file(struct file_handle *file) {
     linux64_pidns_release(file->proc_pid_ns);
     if (file->directory_path) pmm64_free(file->directory_path);
     struct memfd *memfd = file->memfd;
-    if (memfd) release_backing(memfd);
+    if (memfd) {
+        flock_release(file);
+        release_backing(memfd);
+    }
     *file = (struct file_handle){0};
 }
 
@@ -428,6 +441,11 @@ void linux64_eventfd_wait_finish(struct linux64_task *task) {
 void linux64_epoll_wait_finish(struct linux64_task *task) {
     release_file(task->epoll_wait.file);
     task->epoll_wait.file = NULL;
+}
+
+void linux64_flock_wait_finish(struct linux64_task *task) {
+    release_file(task->flock_wait.file);
+    task->flock_wait.file = NULL;
 }
 
 static bool epoll_expired(const struct linux64_epoll_wait *wait) {
@@ -558,6 +576,48 @@ const struct linux64_file_source *linux64_file_source(void) {
 
 static bool open_file(i32 fd) {
     return fd >= 0 && fd < FD_COUNT && file_at(fd);
+}
+
+bool linux64_flock_ready(const struct linux64_flock_wait *wait) {
+    const struct file_handle *file = wait->file;
+    const struct memfd *backing = file->memfd;
+    if (backing->exclusive_lock && file->flock_mode != LOCK_EX) return false;
+    return wait->mode == LOCK_SH || backing->shared_locks == (unsigned)(file->flock_mode == LOCK_SH);
+}
+
+static long flock_attempt(const struct linux64_flock_wait *wait) {
+    struct file_handle *file = wait->file;
+    if (file->flock_mode == wait->mode) return 0;
+    /* При смене режима прежняя блокировка снимается даже при конфликте LOCK_NB. */
+    flock_release(file);
+    if (wait->mode == LOCK_UN) return 0;
+    if (!linux64_flock_ready(wait)) return -EAGAIN;
+    if (wait->mode == LOCK_SH) ++file->memfd->shared_locks;
+    else file->memfd->exclusive_lock = true;
+    file->flock_mode = wait->mode;
+    return 0;
+}
+
+long linux64_flock_resume(void) {
+    long result = flock_attempt(&linux64_current->flock_wait);
+    if (result == -EAGAIN) linux64_current->state = TASK_FLOCK_WAIT;
+    return result;
+}
+
+static long linux_flock(i32 fd, u32 operation) {
+    u32 mode = operation & ~LOCK_NB;
+    if (mode != LOCK_SH && mode != LOCK_EX && mode != LOCK_UN) return -EINVAL;
+    if (!open_file(fd)) return -EBADF;
+    struct file_handle *file = file_at(fd);
+    if (!file->memfd) return -ENOSYS;
+    const struct linux64_flock_wait wait = {.file = file, .mode = mode};
+    long result = flock_attempt(&wait);
+    if (result == -EAGAIN && !(operation & LOCK_NB)) {
+        ++file->references;
+        linux64_current->flock_wait = wait;
+        linux64_current->state = TASK_FLOCK_WAIT;
+    }
+    return result;
 }
 
 long linux64_get_file(i32 fd, struct linux64_fd_view *view) {
@@ -1969,6 +2029,8 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
         return linux_socketpair(fd, (u32)arg1, (i32)arg2, arg3);
     case 72: /* fcntl */
         return linux_fcntl(fd, (i32)arg1, (u32)arg2);
+    case 73: /* flock */
+        return linux_flock(fd, (u32)arg1);
     case 77: /* ftruncate */
         return linux_ftruncate(fd, arg1);
     case 80: /* chdir */
