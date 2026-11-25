@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -29,6 +30,26 @@ static int read_url(char url[], size_t capacity) {
                   !strncmp(url, "https://", 8))) return 0;
     errno = EINVAL;
     return -1;
+}
+
+static const char *profile_option(void) {
+    if (access("/myos/myfs-volume", F_OK)) {
+        return errno == ENOENT ? "--user-data-dir=/tmp/myos-chrome-profile" : NULL;
+    }
+
+    static const char profile[] = "/profile/chrome";
+    struct stat info;
+    if (lstat(profile, &info)) return NULL;
+    if (!S_ISDIR(info.st_mode)) {
+        errno = ENOTDIR;
+        return NULL;
+    }
+    if (info.st_uid != getuid() || (info.st_mode & 077)) {
+        errno = EACCES;
+        return NULL;
+    }
+    if (access(profile, R_OK | W_OK | X_OK)) return NULL;
+    return "--user-data-dir=/profile/chrome";
 }
 
 static int wait_for_wayland(void) {
@@ -59,6 +80,12 @@ int main(void) {
         return 1;
     }
 
+    const char *profile = profile_option();
+    if (!profile) {
+        perror("Chrome profile");
+        return 1;
+    }
+
     pid_t child = fork();
     if (child < 0) {
         perror("fork compositor");
@@ -86,7 +113,7 @@ int main(void) {
         (char *)chrome, "--ozone-platform=wayland", "--disable-gpu", "--js-flags=--jitless",
         "--window-size=800,600", "--no-first-run", "--no-default-browser-check",
         "--disable-background-networking", "--enable-logging=stderr",
-        "--user-data-dir=/tmp/myos-chrome-profile", url, NULL,
+        (char *)profile, url, NULL,
     };
     char *const env[] = {
         "HOME=/tmp", "XDG_RUNTIME_DIR=/tmp", "WAYLAND_DISPLAY=wayland-0",

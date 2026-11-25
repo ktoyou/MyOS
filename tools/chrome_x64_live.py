@@ -2,6 +2,8 @@
 
 import argparse
 import os
+import secrets
+import stat
 from pathlib import Path, PurePosixPath
 import shutil
 import struct
@@ -19,6 +21,12 @@ REPO = Path(__file__).resolve().parents[1]
 CHROME_GUEST = '/opt/google/chrome'
 LAUNCHER_GUEST = '/myos/chrome-launch'
 URL_GUEST = '/myos/chrome-url'
+PROFILE_TOKEN_GUEST = '/myos/myfs-volume'
+PROFILE_MAGIC = b'MYOSPROF'
+PROFILE_TOKEN_BYTES = 16
+PROFILE_SECTOR = 512
+PROFILE_BYTES = 1024 * 1024 * 1024
+MYFS_MAX_SECTORS = 128 * 1024 * 1024
 DEFAULT_URL = 'https://www.kernel.org/'
 PAGE_SIZE = 4096
 URL_LIMIT = PAGE_SIZE - 2  # fgets должен уместить также перевод строки и NUL.
@@ -201,7 +209,62 @@ def qemu_path(path: Path) -> str:
     return str(path.resolve()).replace(',', ',,')
 
 
-def run_image(image: Path, headless: bool) -> None:
+def read_profile_token(path: Path) -> bytes:
+    # O_NONBLOCK позволяет отклонить FIFO, не дожидаясь писателя.
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NONBLOCK), 'rb') as disk:
+        info = os.fstat(disk.fileno())
+        sectors, remainder = divmod(info.st_size, PROFILE_SECTOR)
+        if not stat.S_ISREG(info.st_mode) or remainder or not 1 < sectors <= MYFS_MAX_SECTORS + 1:
+            raise ValueError(f'{path}: ожидается файл-образ профиля MyFS')
+        if disk.read(12) != struct.pack('<4sII', b'MYFS', 5, sectors - 1):
+            raise ValueError(f'{path}: неверный заголовок тома профиля MyFS v5')
+        disk.seek(-PROFILE_SECTOR, os.SEEK_END)
+        record = disk.read(len(PROFILE_MAGIC) + PROFILE_TOKEN_BYTES)
+        token = record[len(PROFILE_MAGIC):]
+        if not record.startswith(PROFILE_MAGIC) or len(token) != PROFILE_TOKEN_BYTES or not any(token):
+            raise ValueError(f'{path}: отсутствует идентификатор профиля MyOS')
+        return token
+
+
+def prepare_profile(path: Path, myfs: Path, *, size: int = PROFILE_BYTES) -> bytes:
+    try:
+        return read_profile_token(path)
+    except FileNotFoundError:
+        if path.is_symlink():
+            raise
+    if size < 16 * 1024 * 1024 or size % PROFILE_SECTOR or size > MYFS_MAX_SECTORS * PROFILE_SECTOR:
+        raise ValueError('Недопустимый размер тома для профиля MyFS')
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='.myos-chrome-profile-', dir=path.parent) as directory:
+        candidate = Path(directory) / 'profile.img'
+        fd = os.open(candidate, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, 'w+b') as disk:
+            disk.truncate(size)
+        for args in (('mkdir', '/chrome'), ('chmod', '0700', '/chrome'), ('chown', '1000', '1000', '/chrome')):
+            subprocess.run((str(myfs.resolve()), str(candidate), *args), check=True, stdout=subprocess.DEVNULL)
+
+        token = secrets.token_bytes(PROFILE_TOKEN_BYTES)
+        with candidate.open('ab') as disk:
+            disk.write((PROFILE_MAGIC + token).ljust(PROFILE_SECTOR, b'\0'))
+            disk.flush()
+            os.fsync(disk.fileno())
+        token = read_profile_token(candidate)
+        try:
+            # Публикация готового тома не заменяет файл параллельного запуска.
+            os.link(candidate, path)
+        except FileExistsError:
+            return read_profile_token(path)
+        return token
+
+
+def profile_drive_args(path: Path) -> tuple[str, ...]:
+    return (
+        '-drive', f'if=none,id=chrome-profile,format=raw,snapshot=off,file={qemu_path(path)}',
+        '-device', 'nvme,drive=chrome-profile,serial=MYOSPROFILE',
+    )
+
+
+def run_image(image: Path, headless: bool, profile: Path | None = None) -> None:
     code, variables = firmware()
     with tempfile.TemporaryDirectory(prefix='myos-chrome-ovmf-') as directory:
         copy = Path(directory) / 'vars.fd'
@@ -214,6 +277,7 @@ def run_image(image: Path, headless: bool) -> None:
             '-drive', f'if=pflash,format=raw,unit=1,file={qemu_path(copy)}',
             '-drive', f'if=none,id=root,format=raw,snapshot=on,file={qemu_path(image)}',
             '-device', 'nvme,drive=root,serial=MYOSCHROME,bootindex=1',
+            *(profile_drive_args(profile) if profile is not None else ()),
             '-nic', 'none', '-netdev', 'user,id=wire,ipv6=off', '-device', 'e1000,netdev=wire',
         ), check=True)
 
@@ -229,6 +293,15 @@ def navigation_url(text: str) -> str:
     raise argparse.ArgumentTypeError('Ожидается URL http://, https:// или about:blank')
 
 
+def same_path(first: Path, second: Path) -> bool:
+    if first.resolve() == second.resolve():
+        return True
+    try:
+        return first.samefile(second)
+    except FileNotFoundError:
+        return False
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--kernel', type=Path, required=True, help='путь к ядру без суффикса .bin или .elf')
@@ -237,6 +310,8 @@ def main() -> None:
     parser.add_argument('--chrome', type=Path, required=True, help='исполняемый файл доверенного Chrome')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--url', type=navigation_url, default=DEFAULT_URL)
+    parser.add_argument('--profile', help='отдельный образ MyFS для постоянного профиля')
+    parser.add_argument('--myfs', type=Path, default=REPO / 'build/myfs')
     parser.add_argument('--run', action='store_true', help='запустить образ в QEMU после сборки')
     parser.add_argument('--headless', action='store_true', help='запустить QEMU без графического окна')
     args = parser.parse_args()
@@ -246,14 +321,21 @@ def main() -> None:
     try:
         inputs = (args.chrome, args.compositor, args.launcher, args.kernel.with_suffix('.bin'),
                   args.kernel.with_suffix('.elf'))
-        if args.output.resolve() in (source.resolve() for source in inputs):
+        profile = Path(args.profile) if args.profile else None
+        if profile is not None:
+            inputs = (*inputs, args.myfs)
+        if any(same_path(args.output, source) for source in inputs):
             raise ValueError('Путь выходного образа совпадает с входным файлом')
+        if profile is not None and any(same_path(profile, source) for source in (*inputs, args.output)):
+            raise ValueError('Образ профиля совпадает с входным файлом или Live-образом')
         files = chrome_files(args.chrome, args.compositor, args.launcher)
         files[URL_GUEST] = args.url.encode('utf-8') + b'\n'
+        if profile is not None:
+            files[PROFILE_TOKEN_GUEST] = prepare_profile(profile, args.myfs)
         make_image(args.output, args.kernel, args.launcher, files)
         print(args.output.resolve(), flush=True)
         if args.run:
-            run_image(args.output, args.headless)
+            run_image(args.output, args.headless, profile)
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
         parser.exit(1, f'{parser.prog}: {error}\n')
     except KeyboardInterrupt:
