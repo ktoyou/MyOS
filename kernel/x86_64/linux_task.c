@@ -26,9 +26,15 @@ enum {
     CLD_EXITED = 1, CLD_KILLED = 2,
 };
 
+/* Таблицы занимают страницы PMM вне низкой области загрузки ELF. */
+struct linux64_process_tables {
+    struct linux64_process processes[LINUX64_PROCESS_COUNT];
+    struct linux64_address_space address_spaces[LINUX64_PROCESS_COUNT];
+};
+
 static struct linux64_task tasks[LINUX64_TASK_COUNT];
-static struct linux64_process processes[LINUX64_PROCESS_COUNT];
-static struct linux64_address_space address_spaces[LINUX64_PROCESS_COUNT];
+static struct linux64_process *processes;
+static struct linux64_address_space *address_spaces;
 struct linux64_task *linux64_current = &tasks[0];
 static i32 next_pid = LINUX64_PID + 1;
 static u64 xfeatures;
@@ -89,6 +95,15 @@ bool linux64_task_init(uptr data_bytes) {
     init_xstate();
     xstate_pages = (xstate_bytes + PMM_PAGE_SIZE - 1) / PMM_PAGE_SIZE;
     if (!xstate_pages || !allocate_xstate(linux64_current)) return false;
+    const u32 pages = (sizeof(struct linux64_process_tables) + PMM_PAGE_SIZE - 1) / PMM_PAGE_SIZE;
+    uptr physical = pmm64_alloc_contiguous(pages);
+    if (!physical) {
+        release_xstate(linux64_current);
+        return false;
+    }
+    struct linux64_process_tables *tables = pmm64_pointer(physical);
+    processes = tables->processes;
+    address_spaces = tables->address_spaces;
     processes[0] = (struct linux64_process){
         .pid = LINUX64_PID, .sid = LINUX64_PID, .pgid = LINUX64_PID, .threads = 1,
         .pid_ns = linux64_pidns_init(), .pid_identity = linux64_pid_init(),

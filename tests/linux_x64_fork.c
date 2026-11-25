@@ -68,6 +68,49 @@ static word read_xmm(void) {
     return value;
 }
 
+static int check_process_turnover(void) {
+    enum { CHILDREN = 24, ROUNDS = 3, FIRST_STATUS = 64 };
+    for (unsigned round = 0; round < ROUNDS; ++round) {
+        int ready[2], gate[2];
+        if (call(22, (word)ready, 0, 0, 0, 0, 0) || call(22, (word)gate, 0, 0, 0, 0, 0)) return 33;
+
+        long children[CHILDREN];
+        char release[CHILDREN];
+        for (unsigned i = 0; i < CHILDREN; ++i) {
+            long child = call(57, 0, 0, 0, 0, 0, 0);
+            if (!child) {
+                char token;
+                if (call(3, ready[0], 0, 0, 0, 0, 0) || call(3, gate[1], 0, 0, 0, 0, 0) ||
+                    call(1, ready[1], (word)"r", 1, 0, 0, 0) != 1 || call(3, ready[1], 0, 0, 0, 0, 0) ||
+                    read_byte(gate[0], &token) != 1 || token != 'g') finish(34);
+                finish(FIRST_STATUS + round * CHILDREN + i);
+            }
+            if (child < 0) return 35;
+            children[i] = child;
+            release[i] = 'g';
+        }
+
+        /* Сначала все потомки сообщают о готовности, затем родитель открывает барьер. */
+        if (call(3, ready[1], 0, 0, 0, 0, 0) || call(3, gate[0], 0, 0, 0, 0, 0)) return 36;
+        for (unsigned i = 0; i < CHILDREN; ++i) {
+            char token;
+            if (read_byte(ready[0], &token) != 1 || token != 'r') return 37;
+        }
+        if (wait_child(-1, 0, 1) != 0 || call(3, ready[0], 0, 0, 0, 0, 0)) return 38;
+        if (call(1, gate[1], (word)release, sizeof(release), 0, 0, 0) != sizeof(release) ||
+            call(3, gate[1], 0, 0, 0, 0, 0)) return 39;
+
+        for (unsigned i = CHILDREN; i > 0; --i) {
+            long child = children[i - 1];
+            int status;
+            int expected = FIRST_STATUS + round * CHILDREN + i - 1;
+            if (wait_child(child, &status, 0) != child || status != expected * 256) return 40;
+        }
+        if (wait_child(-1, 0, 1) != -10) return 41;
+    }
+    return 0;
+}
+
 static long probe(void) {
     const word xmm = 0x34edbc0191db5164ul;
     volatile word tls = 0xdead5149;
@@ -136,11 +179,8 @@ static long probe(void) {
         credentials.pid != child || credentials.level != 1 || credentials.type != 2 ||
         read_byte(peers[0], &byte) || wait_child(-1, 0, 1) != -10) return 16;
     if (call(3, peers[0], 0, 0, 0, 0, 0) || call(3, fd, 0, 0, 0, 0, 0)) return 17;
-    for (unsigned i = 0; i < 16; ++i) {
-        child = call(57, 0, 0, 0, 0, 0, 0);
-        if (!child) finish(19);
-        if (child < 0 || wait_child(child, &status, 0) != child || status != 19 * 256) return 18;
-    }
+    int turnover = check_process_turnover();
+    if (turnover) return turnover;
     child = call(57, 0, 0, 0, 0, 0, 0);
     if (!child) finish(0);
     if (child < 0 || wait_child(child, (void *)1, 0) != -14 || wait_child(child, 0, 0) != -10)
@@ -157,7 +197,8 @@ static long probe(void) {
     word sigchld[4] = {1, 0, 0, 0};
     if (call(13, 17, (word)sigchld, 0, 8, 0, 0) ||
         wait_child(-0x7fffffff - 1, 0, 0) != -3) return 25;
-    for (unsigned i = 0; i < 16; ++i) {
+    /* Число завершений с игнорируемым SIGCHLD превышает размер таблицы процессов. */
+    for (unsigned i = 0; i < 72; ++i) {
         child = call(57, 0, 0, 0, 0, 0, 0);
         if (!child) finish(0);
         if (child < 0 || wait_child(child, &status, 0) != -10) return 26;
