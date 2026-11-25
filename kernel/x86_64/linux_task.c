@@ -18,7 +18,8 @@ enum {
     FUTEX_PRIVATE_FLAG = 128, FUTEX_CLOCK_REALTIME = 256,
     PR_GET_SECCOMP = 21, PR_SET_SECCOMP = 22, PR_SET_NO_NEW_PRIVS = 38, PR_GET_NO_NEW_PRIVS = 39,
     SECCOMP_MODE_FILTER = 2, SECCOMP_SET_MODE_FILTER = 1, SECCOMP_GET_ACTION_AVAIL = 2,
-    SECCOMP_TSYNC = 1, SECCOMP_TSYNC_ESRCH = 0x10, SIGSYS = 31,
+    SECCOMP_TSYNC = 1, SECCOMP_TSYNC_ESRCH = 0x10, SIGSEGV = 11, SIGSYS = 31,
+    SIGSYS_FRAME_LIMIT = 8,
     SA_NOCLDWAIT = 2, SIG_IGN = 1,
     WNOHANG = 1, WUNTRACED = 2, WEXITED = 4, WCONTINUED = 8, WNOWAIT = 0x01000000,
     P_ALL = 0, P_PID = 1, P_PGID = 2,
@@ -34,6 +35,7 @@ static u64 xfeatures;
 static u32 xstate_bytes, xstate_pages;
 static u64 task_clock_start;
 static bool task_clock_running;
+static void finish_task(i32 wait_status, bool group);
 
 extern __attribute__((noreturn)) void linux64_task_resume(struct linux64_frame *frame);
 
@@ -115,17 +117,85 @@ bool linux64_task_cpu_ns(u64 *nanos) {
     return true;
 }
 
-static void save_state(struct linux64_task *task) {
-    task->fs = linux64_rdmsr(LINUX64_FS_BASE);
-    task->gs = linux64_rdmsr(LINUX64_GS_BASE);
-    __asm__ volatile("mov %%fs,%0; mov %%gs,%1" : "=r"(task->fs_selector), "=r"(task->gs_selector));
-    __asm__ volatile("mov %%ds,%0; mov %%es,%1" : "=r"(task->ds_selector), "=r"(task->es_selector));
-    void *state = pmm64_pointer(task->xstate_physical);
+static void save_xstate(void *state) {
     if (xfeatures) {
         __asm__ volatile("xsave64 (%0)" :: "r"(state), "a"((u32)xfeatures), "d"((u32)(xfeatures >> 32)) : "memory");
     } else {
         __asm__ volatile("fxsave64 (%0)" :: "r"(state) : "memory");
     }
+}
+
+static void restore_xstate(const void *state) {
+    if (xfeatures) {
+        __asm__ volatile("xrstor64 (%0)" :: "r"(state),
+                         "a"((u32)xfeatures), "d"((u32)(xfeatures >> 32)) : "memory");
+    } else {
+        __asm__ volatile("fxrstor64 (%0)" :: "r"(state) : "memory");
+    }
+}
+
+struct linux64_sigsys_state {
+    struct linux64_sigsys_state *previous;
+    uptr physical, user_frame;
+    u32 references, pages, depth;
+    u8 xstate[] __attribute__((aligned(64)));
+};
+
+static struct linux64_sigsys_state *retain_sigsys(struct linux64_sigsys_state *state) {
+    if (state) ++state->references;
+    return state;
+}
+
+static void release_sigsys(struct linux64_sigsys_state *state) {
+    while (state && !--state->references) {
+        struct linux64_sigsys_state *previous = state->previous;
+        uptr physical = state->physical;
+        u32 pages = state->pages;
+        for (u32 i = 0; i < pages; ++i) pmm64_free(physical + (uptr)i * PMM_PAGE_SIZE);
+        state = previous;
+    }
+}
+
+static bool deliver_sigsys(struct linux64_frame *frame, u16 trap) {
+    struct linux64_task *task = linux64_current;
+    struct linux64_sigsys_state *previous = task->sigsys;
+    u32 depth = previous ? previous->depth + 1 : 1;
+    if (depth > SIGSYS_FRAME_LIMIT) return false;
+    u32 pages = (__builtin_offsetof(struct linux64_sigsys_state, xstate) +
+                 xstate_bytes + PMM_PAGE_SIZE - 1) / PMM_PAGE_SIZE;
+    uptr physical = pmm64_alloc_contiguous(pages);
+    if (!physical) return false;
+    struct linux64_sigsys_state *state = pmm64_pointer(physical);
+    *state = (struct linux64_sigsys_state){.physical = physical, .references = 1, .pages = pages, .depth = depth};
+    if (!linux64_deliver_seccomp_sigsys(frame, trap, LINUX64_SECCOMP_ARCH_X86_64, &state->user_frame)) {
+        release_sigsys(state);
+        return false;
+    }
+    /* XRSTOR читает только копию ядра, недоступную обработчику сигнала. */
+    save_xstate(state->xstate);
+    state->previous = previous;
+    task->sigsys = state;
+    return true;
+}
+
+static void return_sigsys(struct linux64_frame *frame) {
+    struct linux64_task *task = linux64_current;
+    struct linux64_sigsys_state *state = task->sigsys;
+    if (!state || !linux64_rt_sigreturn(frame, state->user_frame)) {
+        finish_task(SIGSEGV, true);
+        return;
+    }
+    restore_xstate(state->xstate);
+    task->sigsys = retain_sigsys(state->previous);
+    release_sigsys(state);
+}
+
+static void save_state(struct linux64_task *task) {
+    task->fs = linux64_rdmsr(LINUX64_FS_BASE);
+    task->gs = linux64_rdmsr(LINUX64_GS_BASE);
+    __asm__ volatile("mov %%fs,%0; mov %%gs,%1" : "=r"(task->fs_selector), "=r"(task->gs_selector));
+    __asm__ volatile("mov %%ds,%0; mov %%es,%1" : "=r"(task->ds_selector), "=r"(task->es_selector));
+    save_xstate(pmm64_pointer(task->xstate_physical));
 }
 
 static void restore_state(const struct linux64_task *task) {
@@ -135,13 +205,7 @@ static void restore_state(const struct linux64_task *task) {
                      "r"(task->gs_selector) : "memory");
     linux64_wrmsr(LINUX64_FS_BASE, task->fs);
     linux64_wrmsr(LINUX64_GS_BASE, task->gs);
-    const void *state = pmm64_pointer(task->xstate_physical);
-    if (xfeatures) {
-        __asm__ volatile("xrstor64 (%0)" :: "r"(state),
-                         "a"((u32)xfeatures), "d"((u32)(xfeatures >> 32)) : "memory");
-    } else {
-        __asm__ volatile("fxrstor64 (%0)" :: "r"(state) : "memory");
-    }
+    restore_xstate(pmm64_pointer(task->xstate_physical));
 }
 
 static struct linux64_address_space *unused_memory(void) {
@@ -281,6 +345,7 @@ static long clone_task(struct linux64_frame *frame, uptr flags, uptr stack, uptr
     child->signal_mask = parent->signal_mask;
     child->no_new_privs = parent->no_new_privs;
     child->seccomp = linux64_seccomp_retain(parent->seccomp);
+    child->sigsys = thread ? NULL : retain_sigsys(parent->sigsys);
     child->caps = parent->caps;
     if (new_user) linux64_userns_caps(child);
     if (!thread) {
@@ -461,6 +526,8 @@ bool linux64_commit_exec(struct linux64_frame *frame, uptr root, uptr entry, upt
     task->memory = memory;
 
     linux64_close_on_exec(process);
+    release_sigsys(task->sigsys);
+    task->sigsys = NULL;
     for (unsigned i = 0; i < LINUX64_SIGNAL_COUNT; ++i) {
         u64 handler = process->actions[i].handler;
         process->actions[i] = (struct linux64_sigaction){.handler = handler == SIG_IGN ? handler : 0};
@@ -588,6 +655,8 @@ static void stop_task(struct linux64_task *task) {
     linux64_input_wait_finish(task);
     linux64_seccomp_release(task->seccomp);
     task->seccomp = NULL;
+    release_sigsys(task->sigsys);
+    task->sigsys = NULL;
     release_xstate(task);
     task->state = TASK_DEAD;
     --task->process->threads;
@@ -893,6 +962,9 @@ static bool seccomp_allows(struct linux64_frame *frame) {
         frame->rax = (u64)-(long)(error > 4095 ? 4095 : error);
         break;
     }
+    case LINUX64_SECCOMP_TRAP:
+        if (!deliver_sigsys(frame, (u16)(decision & LINUX64_SECCOMP_DATA))) finish_task(SIGSYS, true);
+        break;
     case LINUX64_SECCOMP_TRACE:
     case LINUX64_SECCOMP_USER_NOTIF:
         frame->rax = (u64)-ENOSYS;
@@ -910,7 +982,7 @@ static long task_prctl(i32 option, uptr value, uptr third, uptr fourth, uptr fif
     case PR_GET_SECCOMP:
         return linux64_current->seccomp ? SECCOMP_MODE_FILTER : 0;
     case PR_SET_SECCOMP:
-        if (value != SECCOMP_MODE_FILTER || fourth || fifth) return -EINVAL;
+        if (value != SECCOMP_MODE_FILTER) return -EINVAL;
         return task_seccomp(SECCOMP_SET_MODE_FILTER, 0, third);
     case PR_SET_NO_NEW_PRIVS:
         if (value != 1 || third || fourth || fifth) return -EINVAL;
@@ -931,6 +1003,9 @@ void linux64_task_syscall(struct linux64_frame *frame) {
     }
     uptr number = frame->rax;
     switch (number) {
+    case 15: /* rt_sigreturn */
+        return_sigsys(frame);
+        break;
     case 24: /* sched_yield */
         frame->rax = 0;
         break;

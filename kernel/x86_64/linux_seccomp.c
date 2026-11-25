@@ -6,7 +6,7 @@
 
 enum {
     ENOMEM = 12, EACCES = 13, EFAULT = 14, EINVAL = 22, EOPNOTSUPP = 95,
-    MAX_PATH_INSNS = 32768, FILTER_COST = 4, AUDIT_ARCH_X86_64 = 0xc000003e,
+    MAX_PATH_INSNS = 32768, FILTER_COST = 4,
 };
 
 struct sock_program {
@@ -99,7 +99,7 @@ static bool known_action(u32 action) {
 u32 linux64_seccomp_evaluate(const struct linux64_seccomp_filter *filter, const struct linux64_frame *frame) {
     if (!filter) return LINUX64_SECCOMP_ALLOW;
     const struct linux64_seccomp_data data = {
-        .nr = (i32)frame->rax, .arch = AUDIT_ARCH_X86_64, .instruction_pointer = frame->rip,
+        .nr = (i32)frame->rax, .arch = LINUX64_SECCOMP_ARCH_X86_64, .instruction_pointer = frame->rip,
         .args = {frame->rdi, frame->rsi, frame->rdx, frame->r10, frame->r8, frame->r9},
     };
     u32 result = LINUX64_SECCOMP_ALLOW;
@@ -119,6 +119,7 @@ i32 linux64_seccomp_action_available(uptr address) {
     switch (action) {
     case LINUX64_SECCOMP_KILL_PROCESS:
     case LINUX64_SECCOMP_KILL_THREAD:
+    case LINUX64_SECCOMP_TRAP:
     case LINUX64_SECCOMP_ERRNO:
     case LINUX64_SECCOMP_TRACE:
     case LINUX64_SECCOMP_ALLOW:
