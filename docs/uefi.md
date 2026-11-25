@@ -66,6 +66,36 @@ Boot-info v4 содержит адрес карты памяти, RSDP и выд
 ядро, RAM-корень и arena из свободных страниц. Контракт BIOS v1–v3 сохранён.
 Шрифт `FONT.BIN` растеризован из Ubuntu Mono; его лицензия лежит рядом в `FONT.LIC`.
 
+## Live-образ с Google Chrome x86-64
+
+Для сборки нужен Linux x86-64 с GNU Make, GCC, NASM, GNU-EFI, Python с Pillow,
+библиотеками Wayland и xkbcommon для композитора, wayland-scanner,
+wayland-protocols и штатными библиотеками времени выполнения Chrome,
+включая NSS. Для запуска нужны QEMU с GTK и e1000, а также OVMF.
+
+Укажите путь к бинарнику из официального дистрибутива Google Chrome для Linux.
+Например, можно распаковать официальный deb-файл в отдельный каталог и
+передать путь к `opt/google/chrome/chrome`. Бинарник и ресурсы Chrome
+входят в собранный образ.
+
+```sh
+make kernel-x64-chrome-image CHROME_BIN=/path/to/chrome/opt/google/chrome/chrome
+make kernel-x64-chrome-run CHROME_BIN=/path/to/chrome/opt/google/chrome/chrome
+```
+
+Результат сборки — `build/x86_64/myos-chrome.img`. Цель запуска загружает
+его в QEMU и открывает Chrome на Wayland. Начальную страницу можно выбрать
+через `CHROME_URL`, например `CHROME_URL=about:blank`. Для пользовательской
+прошивки задайте переменные окружения `OVMF_CODE` и `OVMF_VARS` из одной
+поставки OVMF.
+
+Chrome использует программный вывод и `--jitless`. Профиль находится в
+`/tmp` гостя и действует до завершения сеанса.
+
+`make kernel-x64-chrome-smoke CHROME_BIN=...` проверяет в QEMU загрузку
+HTTPS-страницы с доверенным тестовым CA и отказ для того же сертификата
+без доверия к CA. Для теста нужны OpenSSL и `certutil` из NSS.
+
 ## Сборка и проверки
 
 Для проверки перехода в x86-64 используется отдельный тестовый образ.
