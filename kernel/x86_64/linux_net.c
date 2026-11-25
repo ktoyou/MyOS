@@ -1,6 +1,7 @@
 #include "linux.h"
 #include "dhcp.h"
 #include "e1000.h"
+#include "tcp.h"
 
 static bool started, waiting;
 static u64 next_poll;
@@ -49,13 +50,19 @@ static void report_lease(void) {
     print_text("\n");
 }
 
+static void receive(void *context, u32 source, u32 destination, u8 protocol, const u8 *data, u32 length) {
+    if (protocol == 6) tcp64_input(*(const u64 *)context, source, destination, data, length);
+    else linux64_udp_receive(context, source, destination, protocol, data, length);
+}
+
 bool linux64_net_poll(void) {
     u64 now;
     if (!started || !linux64_monotonic_ns(&now)) return false;
     if (now >= next_poll) {
         next_poll = now + 10000000ull;
-        bool dhcp_waiting = dhcp64_poll(now, linux64_udp_receive);
-        waiting = linux64_udp_flush(now) || dhcp_waiting;
+        bool dhcp_waiting = dhcp64_poll(now, receive);
+        bool udp_waiting = linux64_udp_flush(now);
+        waiting = tcp64_tick(now) || udp_waiting || dhcp_waiting;
         report_lease();
     }
     return waiting;

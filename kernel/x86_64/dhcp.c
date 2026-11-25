@@ -256,7 +256,7 @@ bool dhcp64_poll(u64 now, net64_receiver receiver) {
         cooldown(now);
         return false;
     }
-    net64_poll(now, receiver, NULL);
+    net64_poll(now, receiver, &now);
     acquiring = client.state == SELECTING || client.state == REQUESTING;
     if ((acquiring || client.state == RENEWING || client.state == REBINDING) && now >= client.next) {
         if (send_message(now)) {

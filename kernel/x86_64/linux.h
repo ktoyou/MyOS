@@ -61,8 +61,15 @@ long linux64_sendto(i32 fd, uptr buffer, uptr length, u32 flags, uptr address, i
 long linux64_recvfrom(i32 fd, uptr buffer, uptr length, u32 flags, uptr address, uptr address_length);
 long linux64_sockopt(bool get, i32 fd, i32 level, i32 option, uptr value, uptr length);
 struct linux64_socket;
+struct linux64_socket_wait;
 struct linux64_udp_address { u32 ip; u16 port; };
 bool linux64_socket_is_udp(const struct linux64_socket *socket);
+bool linux64_socket_is_inet(const struct linux64_socket *socket);
+bool linux64_socket_is_tcp(const struct linux64_socket *socket);
+long linux64_tcp_path(struct linux64_socket *socket, bool bind, uptr address, u32 length);
+long linux64_tcp_connect_result(const struct linux64_socket *socket);
+long linux64_tcp_connect_complete(struct linux64_socket *socket);
+long linux64_tcp_recvfrom(struct linux64_socket *socket, struct linux64_socket_wait *wait);
 long linux64_udp_address(uptr address, u32 length, struct linux64_udp_address *result, bool disconnect);
 long linux64_udp_path(struct linux64_socket *socket, bool bind, uptr address, u32 length);
 void linux64_udp_receive(void *context, u32 source, u32 destination, u8 protocol, const u8 *data, u32 length);

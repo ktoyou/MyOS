@@ -2,16 +2,17 @@
 #include "paging.h"
 #include "net.h"
 #include "net_bytes.h"
+#include "tcp.h"
 
 enum {
     EBADF = 9, EAGAIN = 11, ENOMEM = 12, EFAULT = 14, EINVAL = 22, ENFILE = 23, EPIPE = 32,
     EMSGSIZE = 90, EPROTONOSUPPORT = 93, ESOCKTNOSUPPORT = 94, EOPNOTSUPP = 95,
     EAFNOSUPPORT = 97, ENOPROTOOPT = 92, ECONNRESET = 104, EISCONN = 106, ENOTCONN = 107,
-    ECONNREFUSED = 111,
+    ECONNREFUSED = 111, EALREADY = 114, EINPROGRESS = 115,
     EDESTADDRREQ = 89, EADDRINUSE = 98, EADDRNOTAVAIL = 99, ENETDOWN = 100,
     ENETUNREACH = 101, EHOSTUNREACH = 113,
     AF_UNIX = 1, AF_INET = 2, SOCK_STREAM = 1, SOCK_DGRAM = 2, SOCK_SEQPACKET = 5,
-    SOCK_MAX = 11, SOCK_TYPE_MASK = 0xf, IPPROTO_UDP = 17,
+    SOCK_MAX = 11, SOCK_TYPE_MASK = 0xf, IPPROTO_TCP = 6, IPPROTO_UDP = 17, TCP_NODELAY = 1,
     SOCK_NONBLOCK = 0x800, SOCK_CLOEXEC = 0x80000,
     SHUT_RD = 0, SHUT_WR = 1, SHUT_RDWR = 2,
     SOL_SOCKET = 1, SO_TYPE = 3, SO_ERROR = 4, SO_PASSCRED = 16, SO_PEERCRED = 17,
@@ -85,6 +86,7 @@ struct peer_snapshot {
 };
 
 struct linux64_socket {
+    struct tcp64_connection *tcp;
     struct linux64_socket *peer;
     struct linux64_socket *accept_head, *accept_tail, *accept_next;
     struct packet *head, *tail;
@@ -94,10 +96,10 @@ struct linux64_socket {
     u64 inode;
     unsigned queued, head_offset, backlog, pending;
     unsigned udp_tx_count;
-    u32 udp_tx_source;
+    u32 udp_tx_source, tcp_source;
     i32 udp_error;
     u8 type;
-    bool open, passcred, reset, read_shutdown, write_shutdown, listening, scm_marked, udp_bound;
+    bool open, passcred, reset, read_shutdown, write_shutdown, listening, scm_marked, inet, inet_bound;
     char name[LINUX64_UNIX_PATH_LIMIT + 1];
 };
 
@@ -127,11 +129,16 @@ long linux64_socket_create(i32 domain, u32 type, i32 protocol, struct linux64_so
     if (type & ~(SOCK_TYPE_MASK | SOCK_CLOEXEC | SOCK_NONBLOCK)) return -EINVAL;
     if (domain != AF_UNIX && domain != AF_INET) return -EAFNOSUPPORT;
     if (base >= SOCK_MAX) return -EINVAL;
-    if (protocol != 0 && protocol != (domain == AF_INET ? IPPROTO_UDP : AF_UNIX)) return -EPROTONOSUPPORT;
-    if (base != (domain == AF_INET ? SOCK_DGRAM : SOCK_STREAM)) return -ESOCKTNOSUPPORT;
+    if (domain == AF_INET) {
+        if (base != SOCK_DGRAM && base != SOCK_STREAM) return -ESOCKTNOSUPPORT;
+        if (protocol && protocol != (base == SOCK_STREAM ? IPPROTO_TCP : IPPROTO_UDP)) return -EPROTONOSUPPORT;
+    } else {
+        if (protocol && protocol != AF_UNIX) return -EPROTONOSUPPORT;
+        if (base != SOCK_STREAM) return -ESOCKTNOSUPPORT;
+    }
     struct linux64_socket *slot = free_pair();
     if (!slot) return -ENFILE;
-    *slot = (struct linux64_socket){.type = (u8)base, .open = true};
+    *slot = (struct linux64_socket){.type = (u8)base, .open = true, .inet = domain == AF_INET};
     *socket = slot;
     return 0;
 }
@@ -157,7 +164,15 @@ bool linux64_socket_is_stream(const struct linux64_socket *socket) {
 }
 
 bool linux64_socket_is_udp(const struct linux64_socket *socket) {
-    return socket && socket->type == SOCK_DGRAM;
+    return linux64_socket_is_inet(socket) && socket->type == SOCK_DGRAM;
+}
+
+bool linux64_socket_is_inet(const struct linux64_socket *socket) {
+    return socket && socket->inet;
+}
+
+bool linux64_socket_is_tcp(const struct linux64_socket *socket) {
+    return linux64_socket_is_inet(socket) && socket->type == SOCK_STREAM;
 }
 
 static bool loopback(u32 ip) {
@@ -200,23 +215,26 @@ static long put_udp_name(uptr address, uptr length, struct linux64_udp_address e
 }
 
 static bool port_used(const struct linux64_socket *self, struct linux64_udp_address endpoint) {
+    if (linux64_socket_is_tcp(self) && tcp64_port_used(endpoint.port)) return true;
     for (unsigned i = 0; i < sizeof(pairs) / sizeof(*pairs); ++i) {
         const struct linux64_socket *socket = pairs[i];
-        if (socket != self && socket->open && linux64_socket_is_udp(socket) &&
+        if (socket != self && socket->open && socket->inet && socket->type == self->type &&
             socket->local.port == endpoint.port &&
             (!socket->local.ip || !endpoint.ip || socket->local.ip == endpoint.ip)) return true;
     }
     return false;
 }
 
-static long udp_bind(struct linux64_socket *socket, struct linux64_udp_address endpoint) {
+static long inet_bind(struct linux64_socket *socket, struct linux64_udp_address endpoint) {
     if (socket->local.port) return -EINVAL;
-    if (endpoint.ip && !loopback(endpoint.ip) && endpoint.ip != net64_address()) return -EADDRNOTAVAIL;
+    if (endpoint.ip && endpoint.ip != net64_address() &&
+        !(linux64_socket_is_udp(socket) && loopback(endpoint.ip))) return -EADDRNOTAVAIL;
     if (!endpoint.port) {
-        static u16 next = UDP_FIRST_PORT;
+        static u16 udp_next = UDP_FIRST_PORT, tcp_next = UDP_FIRST_PORT;
+        u16 *next = linux64_socket_is_tcp(socket) ? &tcp_next : &udp_next;
         for (unsigned i = UDP_FIRST_PORT; i <= 65535u; ++i) {
-            endpoint.port = next;
-            next = next == 65535u ? UDP_FIRST_PORT : next + 1;
+            endpoint.port = *next;
+            *next = *next == 65535u ? UDP_FIRST_PORT : *next + 1;
             if (!port_used(socket, endpoint)) {
                 socket->local = endpoint;
                 return 0;
@@ -248,13 +266,13 @@ long linux64_udp_path(struct linux64_socket *socket, bool bind, uptr address, u3
     long result = linux64_udp_address(address, length, &name, !bind);
     if (result) return result;
     if (bind) {
-        result = udp_bind(socket, name);
-        if (!result) socket->udp_bound = true;
+        result = inet_bind(socket, name);
+        if (!result) socket->inet_bound = true;
         return result;
     }
     if (!name.ip && !name.port) {
         socket->remote = name;
-        if (!socket->udp_bound) socket->local = (struct linux64_udp_address){0};
+        if (!socket->inet_bound) socket->local = (struct linux64_udp_address){0};
         return 0;
     }
     if (!name.port) return -EINVAL;
@@ -264,11 +282,62 @@ long linux64_udp_path(struct linux64_socket *socket, bool bind, uptr address, u3
     result = udp_route(socket, name.ip, &source, &local);
     if (result) return result;
     if (!socket->local.port) {
-        result = udp_bind(socket, (struct linux64_udp_address){0});
+        result = inet_bind(socket, (struct linux64_udp_address){0});
         if (result) return result;
     }
     socket->remote = name;
     return 0;
+}
+
+long linux64_tcp_connect_result(const struct linux64_socket *socket) {
+    return socket->tcp ? tcp64_connect_result(socket->tcp) : -ENOTCONN;
+}
+
+long linux64_tcp_connect_complete(struct linux64_socket *socket) {
+    long result = linux64_tcp_connect_result(socket);
+    if (result == -EINPROGRESS) return -EAGAIN;
+    if (result < 0 && socket->tcp) tcp64_error(socket->tcp, true);
+    return result;
+}
+
+long linux64_tcp_path(struct linux64_socket *socket, bool bind, uptr address, u32 length) {
+    struct linux64_udp_address name;
+    long result = linux64_udp_address(address, length, &name, false);
+    if (result) return result;
+    if (bind) {
+        result = inet_bind(socket, name);
+        if (!result) socket->inet_bound = true;
+        return result;
+    }
+
+    if (!name.port) return -EINVAL;
+    u64 now;
+    if (!linux64_monotonic_ns(&now)) return -ENETDOWN;
+    if (socket->tcp) {
+        result = linux64_tcp_connect_result(socket);
+        if (result == -EINPROGRESS) return -EALREADY;
+        if (!result) return -EISCONN;
+        tcp64_close(socket->tcp, now);
+        socket->tcp = NULL;
+        socket->tcp_source = 0;
+        socket->remote = (struct linux64_udp_address){0};
+        if (!socket->inet_bound) socket->local = (struct linux64_udp_address){0};
+    }
+    u32 source = net64_address();
+    if (socket->local.ip && socket->local.ip != source) return -EADDRNOTAVAIL;
+    if (!source || !net64_has_route(name.ip)) return -ENETUNREACH;
+    if (!socket->local.port) {
+        result = inet_bind(socket, (struct linux64_udp_address){0});
+        if (result) return result;
+    }
+    result = tcp64_open(now, source, socket->local.port, name.ip, name.port, &socket->tcp);
+    if (result) {
+        if (!socket->inet_bound) socket->local = (struct linux64_udp_address){0};
+        return result;
+    }
+    socket->tcp_source = source;
+    socket->remote = name;
+    return -EINPROGRESS;
 }
 
 bool linux64_socket_can_bind(const struct linux64_socket *socket) {
@@ -281,7 +350,7 @@ void linux64_socket_bind(struct linux64_socket *socket, u64 inode, const char *n
 }
 
 long linux64_socket_listen(struct linux64_socket *socket, u32 backlog) {
-    if (linux64_socket_is_udp(socket)) return -EOPNOTSUPP;
+    if (linux64_socket_is_inet(socket)) return -EOPNOTSUPP;
     if (!linux64_socket_is_stream(socket) || !socket->inode || socket->peer) return -EINVAL;
     socket->backlog = backlog > MAX_BACKLOG ? MAX_BACKLOG : backlog;
     socket->listening = true;
@@ -326,7 +395,7 @@ long linux64_socket_connect(struct linux64_socket *socket, u64 inode) {
 }
 
 long linux64_socket_pending(struct linux64_socket *socket, bool blocking, struct linux64_socket **accepted) {
-    if (linux64_socket_is_udp(socket)) return -EOPNOTSUPP;
+    if (linux64_socket_is_inet(socket)) return -EOPNOTSUPP;
     if (!socket->listening) return -EINVAL;
     if (!socket->accept_head) return blocking && socket->read_shutdown ? -EINVAL : -EAGAIN;
     *accepted = socket->accept_head;
@@ -338,6 +407,10 @@ bool linux64_socket_accept_ready(const struct linux64_socket *socket) {
 }
 
 bool linux64_socket_io_ready(const struct linux64_socket *socket, bool receive) {
+    if (linux64_socket_is_tcp(socket)) {
+        u16 mask = receive ? LINUX64_POLL_READ | LINUX64_POLLRDHUP : LINUX64_POLL_WRITE;
+        return (linux64_socket_poll(socket) & (mask | LINUX64_POLLERR | LINUX64_POLLHUP)) != 0;
+    }
     if (linux64_socket_is_udp(socket))
         return receive ? socket->head || socket->udp_error || socket->read_shutdown :
                          socket->udp_error || socket->write_shutdown || socket->udp_tx_count < UDP_TX_LIMIT;
@@ -360,13 +433,20 @@ long linux64_socket_check_sendto(const struct linux64_socket *socket, u32 flags,
         if (length < 0 || (uptr)length > sizeof(name)) return -EINVAL;
         if (paging64_copy_from_user(name, address, (uptr)length) != (uptr)length) return -EFAULT;
         if (length && linux64_socket_is_stream(socket))
-            return socket->peer ? -EISCONN : -EOPNOTSUPP;
+            return socket->peer || (socket->tcp && !linux64_tcp_connect_result(socket)) ?
+                   -EISCONN : -EOPNOTSUPP;
     }
     if (flags & MSG_OOB) return -EOPNOTSUPP;
     return 0;
 }
 
 long linux64_socket_name(const struct linux64_socket *socket, bool peer, uptr address, uptr length) {
+    if (linux64_socket_is_tcp(socket)) {
+        if (peer && linux64_tcp_connect_result(socket)) return -ENOTCONN;
+        struct linux64_udp_address endpoint = peer ? socket->remote : socket->local;
+        if (!peer && socket->tcp_source) endpoint.ip = socket->tcp_source;
+        return put_udp_name(address, length, endpoint);
+    }
     if (linux64_socket_is_udp(socket)) {
         if (peer && !socket->remote.port) return -ENOTCONN;
         struct linux64_udp_address endpoint = peer ? socket->remote : socket->local;
@@ -487,6 +567,12 @@ static void close_endpoint(struct linux64_socket *socket) {
 }
 
 void linux64_socket_close(struct linux64_socket *socket) {
+    if (socket->tcp) {
+        u64 now = 0;
+        linux64_monotonic_ns(&now);
+        tcp64_close(socket->tcp, now);
+        socket->tcp = NULL;
+    }
     while (socket->accept_head) {
         struct linux64_socket *accepted = socket->accept_head;
         linux64_socket_dequeue(socket);
@@ -498,6 +584,11 @@ void linux64_socket_close(struct linux64_socket *socket) {
 
 long linux64_socket_shutdown(struct linux64_socket *socket, i32 how) {
     if (how < SHUT_RD || how > SHUT_RDWR) return -EINVAL;
+    if (linux64_socket_is_tcp(socket)) {
+        if (linux64_tcp_connect_result(socket)) return -ENOTCONN;
+        tcp64_shutdown(socket->tcp, how);
+        return 0;
+    }
     if (linux64_socket_is_udp(socket) && !socket->remote.port) return -ENOTCONN;
     struct linux64_socket *peer = socket->peer;
     /* Закрытие направления останавливает новые записи, но сохраняет очередь. */
@@ -513,6 +604,8 @@ long linux64_socket_shutdown(struct linux64_socket *socket, i32 how) {
 }
 
 u16 linux64_socket_poll(const struct linux64_socket *socket) {
+    if (linux64_socket_is_tcp(socket))
+        return socket->tcp ? tcp64_events(socket->tcp) : LINUX64_POLLHUP | LINUX64_POLL_WRITE;
     if (linux64_socket_is_udp(socket)) {
         u16 ready = 0;
         if (socket->head || socket->read_shutdown) ready |= LINUX64_POLL_READ;
@@ -543,15 +636,20 @@ u16 linux64_socket_poll(const struct linux64_socket *socket) {
 
 long linux64_socket_option(struct linux64_socket *socket, bool get, i32 level, i32 option,
                            uptr value, uptr length) {
-    if (level != SOL_SOCKET) return -ENOPROTOOPT;
+    bool tcp = linux64_socket_is_tcp(socket);
+    bool nodelay = tcp && level == IPPROTO_TCP && option == TCP_NODELAY;
+    if (!nodelay && level != SOL_SOCKET) return -ENOPROTOOPT;
     bool udp = linux64_socket_is_udp(socket);
-    if (udp ? !(get && (option == SO_TYPE || option == SO_ERROR || option == SO_DOMAIN || option == SO_PROTOCOL)) :
-              (option != SO_PASSCRED && !(get && (option == SO_TYPE || option == SO_PEERCRED)))) return -ENOPROTOOPT;
+    if (!nodelay && (socket->inet ?
+        !(get && (option == SO_TYPE || option == SO_ERROR || option == SO_DOMAIN || option == SO_PROTOCOL)) :
+        (option != SO_PASSCRED && !(get && (option == SO_TYPE || option == SO_PEERCRED))))) return -ENOPROTOOPT;
     if (!get) {
         i32 enabled;
         if ((i32)length < (i32)sizeof(enabled)) return -EINVAL;
         if (paging64_copy_from_user(&enabled, value, sizeof(enabled)) != sizeof(enabled))
             return -EFAULT;
+        /* Стек отправляет короткие записи без задержки Нейгла. */
+        if (nodelay) return enabled ? 0 : -EOPNOTSUPP;
         socket->passcred = enabled != 0;
         return 0;
     }
@@ -559,10 +657,11 @@ long linux64_socket_option(struct linux64_socket *socket, bool get, i32 level, i
     if (paging64_copy_from_user(&count, length, sizeof(count)) != sizeof(count)) return -EFAULT;
     if (count < 0) return -EINVAL;
     i32 result = option == SO_TYPE ? socket->type : socket->passcred;
-    if (udp) {
-        if (option == SO_ERROR) result = socket->udp_error;
+    if (nodelay) result = 1;
+    else if (socket->inet) {
+        if (option == SO_ERROR) result = udp ? socket->udp_error : socket->tcp ? tcp64_error(socket->tcp, false) : 0;
         if (option == SO_DOMAIN) result = AF_INET;
-        if (option == SO_PROTOCOL) result = IPPROTO_UDP;
+        if (option == SO_PROTOCOL) result = tcp ? IPPROTO_TCP : IPPROTO_UDP;
     }
     struct identity credentials = {.uid = (u32)-1, .gid = (u32)-1};
     const void *data = &result;
@@ -582,6 +681,7 @@ long linux64_socket_option(struct linux64_socket *socket, bool get, i32 level, i
     if (paging64_copy_to_user(value, data, (uptr)count) != (uptr)count ||
         paging64_copy_to_user(length, &count, sizeof(count)) != sizeof(count)) return -EFAULT;
     if (udp && option == SO_ERROR) socket->udp_error = 0;
+    if (tcp && !nodelay && option == SO_ERROR && socket->tcp) tcp64_error(socket->tcp, true);
     return 0;
 }
 
@@ -723,7 +823,7 @@ static long udp_send(struct linux64_socket *socket, const struct iovec *iov, upt
         }
         copied += size;
     }
-    result = socket->local.port ? 0 : udp_bind(socket, (struct linux64_udp_address){0});
+    result = socket->local.port ? 0 : inet_bind(socket, (struct linux64_udp_address){0});
     packet->datagram.source_port = socket->local.port;
     if (!result && local) {
         bool delivered = udp_deliver((struct linux64_udp_address){source, socket->local.port},
@@ -938,6 +1038,50 @@ static uptr stream_copy(struct iov_cursor *cursor, u8 *bytes, uptr length, bool 
     return copied;
 }
 
+static long tcp_io(struct linux64_socket *socket, const struct iovec *iov, uptr count, bool receive, u32 flags) {
+    u8 bytes[PMM_PAGE_SIZE];
+    uptr length = 0;
+    for (uptr i = 0; i < count && length < sizeof(bytes); ++i) {
+        uptr room = sizeof(bytes) - length;
+        length += iov[i].length < room ? iov[i].length : room;
+    }
+    if (!length && receive) return 0;
+    if (!socket->tcp) return -ENOTCONN;
+
+    bool fault = false;
+    struct iov_cursor cursor = {iov, iov + count, 0};
+    if (!receive) {
+        uptr copied = stream_copy(&cursor, bytes, length, false, &fault);
+        if (fault && !copied) return -EFAULT;
+        return tcp64_write(socket->tcp, bytes, (u32)copied);
+    }
+
+    long result = tcp64_read(socket->tcp, bytes, (u32)length);
+    if (result <= 0) return result;
+    uptr copied = flags & MSG_TRUNC ? (uptr)result : stream_copy(&cursor, bytes, (uptr)result, true, &fault);
+    if (fault && !copied) return -EFAULT;
+    if (!(flags & MSG_PEEK)) tcp64_consume(socket->tcp, (u32)copied);
+    return (long)copied;
+}
+
+long linux64_tcp_recvfrom(struct linux64_socket *socket, struct linux64_socket_wait *wait) {
+    if (wait->flags & ~(MSG_DONTWAIT | MSG_PEEK | MSG_TRUNC)) return -EOPNOTSUPP;
+    if (wait->length && (wait->address >= X64_USER_TOP || wait->length > X64_USER_TOP - wait->address))
+        return -EFAULT;
+    const struct iovec iov = {wait->address, wait->length};
+    long result = tcp_io(socket, &iov, 1, true, wait->flags | MSG_PEEK);
+    if (result < 0) return result;
+    if (wait->name) {
+        i32 available;
+        if (paging64_copy_from_user(&available, wait->name_length, sizeof(available)) != sizeof(available))
+            return -EFAULT;
+        if (available < 0) return -EINVAL;
+        if (!paging64_put_user_u32(wait->name_length, 0)) return -EFAULT;
+    }
+    if (result && !(wait->flags & MSG_PEEK)) tcp64_consume(socket->tcp, (u32)result);
+    return result;
+}
+
 static long send_stream(struct linux64_socket *socket, const struct iovec *iov, uptr count,
                         struct linux64_scm_rights **rights) {
     struct linux64_socket *peer = socket->peer;
@@ -1011,6 +1155,7 @@ static long receive_stream(struct linux64_socket *socket, const struct iovec *io
 long linux64_socket_io(struct linux64_socket *socket, bool receive, uptr buffer, uptr length) {
     if (buffer >= X64_USER_TOP || length > X64_USER_TOP - buffer) return -EFAULT;
     const struct iovec iov = {buffer, length};
+    if (linux64_socket_is_tcp(socket)) return tcp_io(socket, &iov, 1, receive, 0);
     if (linux64_socket_is_stream(socket)) {
         if (!receive) return send_stream(socket, &iov, 1, NULL);
         return length ? receive_stream(socket, &iov, 1, 0, NULL) : 0;
@@ -1125,6 +1270,23 @@ long linux64_socket_message(struct linux64_socket *socket, struct linux64_socket
         if (iov[i].length &&
             (iov[i].base >= X64_USER_TOP || iov[i].length > X64_USER_TOP - iov[i].base))
             return -EFAULT;
+    if (linux64_socket_is_tcp(socket)) {
+        if (!receive) {
+            if (message.control_length) return -EOPNOTSUPP;
+            if (message.name && message.name_length) {
+                long result = linux64_socket_check_sendto(socket, flags, message.name, (i32)message.name_length);
+                if (result) return result;
+            }
+            return tcp_io(socket, iov, message.iov_count, false, flags);
+        }
+        long result = tcp_io(socket, iov, message.iov_count, true, flags | MSG_PEEK);
+        if (result < 0) return result;
+        if (!paging64_put_user_u32(address + __builtin_offsetof(struct msghdr, name_length), 0) ||
+            !paging64_put_user_u32(address + __builtin_offsetof(struct msghdr, flags), 0) ||
+            !paging64_put_user_u64(address + __builtin_offsetof(struct msghdr, control_length), 0)) return -EFAULT;
+        if (result && !(flags & MSG_PEEK)) tcp64_consume(socket->tcp, (u32)result);
+        return result;
+    }
     if (linux64_socket_is_udp(socket)) {
         if (!receive) {
             if (message.control_length) return -EOPNOTSUPP;
