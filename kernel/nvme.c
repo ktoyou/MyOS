@@ -29,7 +29,7 @@ static void *nvme_dma_pointer(u32 physical) {
 }
 
 static u32 nvme_dma_alloc(void) {
-    /* Аллокатор x86-64 управляет физической памятью ниже 1 ГиБ. */
+    /* Физические адреса страниц PMM укладываются в адрес DMA. */
     return (u32)pmm64_alloc();
 }
 
