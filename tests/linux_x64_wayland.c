@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <fcntl.h>
+#include <linux/fb.h>
 #include <linux/input-event-codes.h>
 #include <sched.h>
 #include <stdbool.h>
@@ -7,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
@@ -27,6 +29,15 @@ static int output_width, output_height, output_scale, width, height;
 static bool output_ready, configured, presented, released, xrgb;
 static bool keymap_ready, focused, repeat_ready, shift_down, shift_active;
 static unsigned key_events;
+static const uint32_t window_colors[2][2] = {{0xf14c88, 0x13c5a2}, {0x8254ec, 0xd49d12}};
+
+enum { POPUP_X = 98, POPUP_Y = 92, POPUP_WIDTH = 47, POPUP_HEIGHT = 35, POPUP_COLOR = 0x196dea };
+static const uint32_t popup_colors[2][2] = {{POPUP_COLOR, POPUP_COLOR}, {POPUP_COLOR, POPUP_COLOR}};
+
+struct popup_state {
+    int x, y;
+    bool geometry_received, acknowledged;
+};
 
 enum {
     POINTER_ENTER = 1u << 0, POINTER_LEAVE = 1u << 1, POINTER_MOTION = 1u << 2,
@@ -341,6 +352,31 @@ static void configured_surface(void *data, struct xdg_surface *obj, uint32_t ser
 
 static const struct xdg_surface_listener surface_events = { .configure = configured_surface };
 
+static void configure_popup(void *data, struct xdg_popup *popup, int32_t x, int32_t y, int32_t w, int32_t h) {
+    (void)popup;
+    struct popup_state *state = data;
+    if (state->geometry_received || x != state->x || y != state->y || w != POPUP_WIDTH || h != POPUP_HEIGHT)
+        fail("popup configure geometry");
+    state->geometry_received = true;
+}
+
+static void popup_done(void *data, struct xdg_popup *popup) {
+    (void)data;
+    (void)popup;
+    fail("unexpected popup dismissal");
+}
+
+static const struct xdg_popup_listener popup_events = { .configure = configure_popup, .popup_done = popup_done };
+
+static void configured_popup_surface(void *data, struct xdg_surface *surface, uint32_t serial) {
+    struct popup_state *state = data;
+    if (!state->geometry_received || state->acknowledged || !serial) fail("popup configure sequence");
+    xdg_surface_ack_configure(surface, serial);
+    state->acknowledged = true;
+}
+
+static const struct xdg_surface_listener popup_surface_events = { .configure = configured_popup_surface };
+
 static void frame_done(void *data, struct wl_callback *callback, uint32_t time) {
     (void)data;
     (void)time;
@@ -380,7 +416,7 @@ static struct wl_display *start_compositor(void) {
     return NULL;
 }
 
-static struct wl_buffer *create_buffer(void) {
+static struct wl_buffer *create_buffer(int width, int height, const uint32_t colors[2][2]) {
     const int offset = 64;
     int stride = width * 4 + 32;
     size_t length = offset + (size_t)stride * height;
@@ -389,7 +425,6 @@ static struct wl_buffer *create_buffer(void) {
         fail("sealed shared memory");
     unsigned char *memory = mmap(NULL, length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (memory == MAP_FAILED) fail("map shared memory");
-    const uint32_t colors[2][2] = { {0xf14c88, 0x13c5a2}, {0x8254ec, 0xd49d12} };
     for (int y = 0; y < height; ++y) {
         uint32_t *row = (uint32_t *)(memory + offset + (size_t)y * stride);
         for (int x = 0; x < width; ++x) row[x] = colors[y >= height / 2][x >= width / 2];
@@ -431,7 +466,8 @@ static struct wl_surface *set_client_cursor(struct wl_display *display) {
     return cursor;
 }
 
-static void commit_frame(struct wl_display *display, struct wl_surface *surface, struct wl_buffer *buffer) {
+static void commit_frame(struct wl_display *display, struct wl_surface *surface, struct wl_buffer *buffer,
+                         int width, int height) {
     presented = false;
     released = false;
     wl_surface_attach(surface, buffer, 0, 0);
@@ -439,6 +475,91 @@ static void commit_frame(struct wl_display *display, struct wl_surface *surface,
     wl_callback_add_listener(wl_surface_frame(surface), &frame_events, NULL);
     wl_surface_commit(surface);
     if (wl_display_roundtrip(display) < 0 || !presented || !released) fail("present frame");
+}
+
+static uint32_t framebuffer_color(int fb, const struct fb_fix_screeninfo *layout,
+                                  const struct fb_var_screeninfo *mode, int x, int y) {
+    uint32_t pixel;
+    off_t offset = (off_t)y * layout->line_length + (off_t)x * sizeof(pixel);
+    if (pread(fb, &pixel, sizeof(pixel), offset) != sizeof(pixel)) fail("read popup framebuffer pixel");
+    return ((pixel >> mode->red.offset) & 0xff) << 16 |
+           ((pixel >> mode->green.offset) & 0xff) << 8 | ((pixel >> mode->blue.offset) & 0xff);
+}
+
+static void check_popup_pixels(int fb, const struct fb_fix_screeninfo *layout,
+                               const struct fb_var_screeninfo *mode, const struct popup_state *state, bool mapped) {
+    int x = state->x, y = state->y;
+    const uint32_t background = window_colors[y >= (int)mode->yres / 2][x >= (int)mode->xres / 2];
+    const uint32_t inside = mapped ? POPUP_COLOR : background;
+    if (framebuffer_color(fb, layout, mode, x, y) != inside ||
+        framebuffer_color(fb, layout, mode, x + POPUP_WIDTH - 1, y + POPUP_HEIGHT - 1) != inside ||
+        framebuffer_color(fb, layout, mode, x - 1, y) != background ||
+        framebuffer_color(fb, layout, mode, x, y - 1) != background ||
+        framebuffer_color(fb, layout, mode, x + POPUP_WIDTH, y) != background)
+        fail(mapped ? "render placed popup" : "restore popup background");
+}
+
+static void check_popup(struct wl_display *display, struct xdg_surface *parent, int fb, bool detach) {
+    struct fb_fix_screeninfo layout;
+    struct fb_var_screeninfo mode;
+    if (ioctl(fb, FBIOGET_FSCREENINFO, &layout) || ioctl(fb, FBIOGET_VSCREENINFO, &mode) ||
+        mode.bits_per_pixel != 32 || mode.red.length != 8 || mode.green.length != 8 || mode.blue.length != 8 ||
+        mode.red.offset > 24 || mode.green.offset > 24 || mode.blue.offset > 24 ||
+        mode.xres / 2 <= POPUP_X + POPUP_WIDTH || mode.yres / 2 <= POPUP_Y + POPUP_HEIGHT)
+        fail("popup framebuffer layout");
+    const int anchor_width = 25, anchor_height = 21;
+    struct popup_state state = {.x = POPUP_X, .y = POPUP_Y};
+    int anchor_x = 64, anchor_y = 64;
+    if (detach) {
+        anchor_x = (int)mode.xres - anchor_width;
+        anchor_y = (int)mode.yres - anchor_height;
+        /* Ось X отражается от якоря, ось Y сдвигается до нижнего края. */
+        state.x = anchor_x - POPUP_WIDTH;
+        state.y = (int)mode.yres - POPUP_HEIGHT;
+    }
+    check_popup_pixels(fb, &layout, &mode, &state, false);
+
+    struct xdg_positioner *positioner = xdg_wm_base_create_positioner(shell);
+    xdg_positioner_set_size(positioner, POPUP_WIDTH, POPUP_HEIGHT);
+    xdg_positioner_set_anchor_rect(positioner, anchor_x, anchor_y, anchor_width, anchor_height);
+    xdg_positioner_set_anchor(positioner, XDG_POSITIONER_ANCHOR_BOTTOM_RIGHT);
+    xdg_positioner_set_gravity(positioner, XDG_POSITIONER_GRAVITY_BOTTOM_RIGHT);
+    if (detach)
+        xdg_positioner_set_constraint_adjustment(positioner, XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_X |
+                                               XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_Y);
+    else
+        xdg_positioner_set_offset(positioner, 9, 7);
+
+    struct wl_surface *surface = wl_compositor_create_surface(compositor);
+    struct xdg_surface *role = xdg_wm_base_get_xdg_surface(shell, surface);
+    xdg_surface_add_listener(role, &popup_surface_events, &state);
+    struct xdg_popup *popup = xdg_surface_get_popup(role, parent, positioner);
+    xdg_popup_add_listener(popup, &popup_events, &state);
+    xdg_positioner_destroy(positioner);
+    wl_surface_commit(surface);
+    if (wl_display_roundtrip(display) < 0 || !state.acknowledged || wl_display_roundtrip(display) < 0)
+        fail("configure and acknowledge popup");
+    check_popup_pixels(fb, &layout, &mode, &state, false);
+
+    struct wl_buffer *buffer = create_buffer(POPUP_WIDTH, POPUP_HEIGHT, popup_colors);
+    commit_frame(display, surface, buffer, POPUP_WIDTH, POPUP_HEIGHT);
+    check_popup_pixels(fb, &layout, &mode, &state, true);
+    wl_surface_commit(surface);
+    if (wl_display_roundtrip(display) < 0) fail("repeat popup commit");
+    check_popup_pixels(fb, &layout, &mode, &state, true);
+
+    if (detach) {
+        wl_surface_attach(surface, NULL, 0, 0);
+        wl_surface_commit(surface);
+        if (wl_display_roundtrip(display) < 0) fail("detach popup buffer");
+        check_popup_pixels(fb, &layout, &mode, &state, false);
+    }
+    xdg_popup_destroy(popup);
+    xdg_surface_destroy(role);
+    wl_surface_destroy(surface);
+    wl_buffer_destroy(buffer);
+    if (wl_display_roundtrip(display) < 0) fail("destroy popup");
+    check_popup_pixels(fb, &layout, &mode, &state, false);
 }
 
 int main(void) {
@@ -461,8 +582,8 @@ int main(void) {
         width != output_width || height != output_height || width > 8192 || height > 8192)
         fail("configure toplevel");
 
-    struct wl_buffer *buffer = create_buffer();
-    commit_frame(display, surface, buffer);
+    struct wl_buffer *buffer = create_buffer(width, height, window_colors);
+    commit_frame(display, surface, buffer, width, height);
     if (!keyboard || !focused || !pointer || !pointer_focused || pointer_frames != 1) fail("missing input focus");
     static const char ready[] = "Wayland keyboard focused\n";
     if (write(1, ready, sizeof(ready) - 1) != sizeof(ready) - 1) fail("keyboard marker");
@@ -487,6 +608,12 @@ int main(void) {
     uint32_t pixel;
     if (fb < 0 || pread(fb, &pixel, sizeof(pixel), 0) != sizeof(pixel) || !pixel)
         fail("mapped framebuffer");
+    check_popup(display, role, fb, false);
+    check_popup(display, role, fb, true);
+    static const char popup_marker[] = "Wayland popup configured, presented and restored\n";
+    if (!focused || !pointer_focused || pointer_frames != 6 ||
+        write(1, popup_marker, sizeof(popup_marker) - 1) != sizeof(popup_marker) - 1)
+        fail("popup completion and focus");
     wl_surface_attach(surface, NULL, 0, 0);
     wl_surface_commit(surface);
     if (wl_display_roundtrip(display) < 0 || focused || pointer_focused || pointer_frames != 7 ||
@@ -497,7 +624,7 @@ int main(void) {
     configured = false;
     wl_surface_commit(surface);
     if (wl_display_roundtrip(display) < 0 || !configured) fail("configure remapped toplevel");
-    commit_frame(display, surface, buffer);
+    commit_frame(display, surface, buffer, width, height);
     if (!focused || !pointer_focused || pointer_frames != 8) fail("focus remapped toplevel");
     wl_surface_destroy(cursor);
 

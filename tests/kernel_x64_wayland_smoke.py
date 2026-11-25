@@ -128,12 +128,13 @@ def main():
                 vm.wait(marker)
 
         serial = boot_x64(directory, 'x64-linux-wayland', payload, kernel_end,
-                          ['Wayland shared memory frame presented', 'Linux x86-64 exit status=0x00'],
+                          ['Wayland popup configured, presented and restored',
+                           'Wayland shared memory frame presented', 'Linux x86-64 exit status=0x00'],
                           live_root_header=root, screenshot=shot, interact=input_events)
         assert 'x86-64 exception' not in serial, serial
         check_pixels(shot)
         check_fallback_cursor(shot, POINTER_DX + CURSOR_DX, POINTER_DY + CURSOR_DY)
-    print('OVMF: Wayland xdg-shell, shared memory, framebuffer, keyboard and pointer: PASS', flush=True)
+    print('OVMF: Wayland xdg-shell, popups, shared memory, framebuffer, keyboard and pointer: PASS', flush=True)
 
 
 if __name__ == '__main__':
