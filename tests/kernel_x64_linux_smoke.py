@@ -187,6 +187,22 @@ def check_files(build):
     print('OVMF: Linux ELF64 files, directories, symlinks, descriptors, signals, IDs and UTC clocks: PASS', flush=True)
 
 
+def check_proc_exe(build):
+    probe = (build / 'linux-proc-exe.elf').resolve()
+    elf = probe.read_bytes()
+    marker = 'Linux ELF64 proc peer exe probe'
+    with tempfile.TemporaryDirectory(prefix='myos-linux-proc-exe-') as temp:
+        child = pathlib.Path(temp).resolve() / 'proc-peer-exec-target'
+        child.write_bytes(elf)
+        child.chmod(0o700)
+        host = subprocess.run([str(probe), str(child)], env={}, capture_output=True, timeout=10)
+    assert (host.returncode, host.stdout, host.stderr) == (0, (marker + '\n').encode(), b''), host
+    serial = check_guest('proc-exe', elf, 'Linux x86-64 exit status=0x00',
+                         files={'/myos/proc-peer-exec-target': elf})
+    assert marker in serial, serial
+    print('OVMF: Linux /proc peer executable paths, exit and namespace isolation: PASS', flush=True)
+
+
 def check_mmap(build):
     probe = (build / 'linux-mmap.elf').absolute()
     data = (build / 'linux-mmap-data.bin').absolute()
@@ -501,6 +517,7 @@ def main():
     print('OVMF: lazy stack growth, guard, PROT_NONE and NX: PASS', flush=True)
     check_interpreter(build)
     check_files(build)
+    check_proc_exe(build)
     check_framebuffer(build)
     check_input(build)
     check_mmap(build)

@@ -1816,6 +1816,10 @@ $(X64BUILD)/linux-fb.o: tests/linux_x64_fb.c | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
 $(X64BUILD)/linux-fb.elf: $(X64BUILD)/linux-fb.o
 	$(LD) -m elf_x86_64 -static -no-pie $< -o $@
+$(X64BUILD)/linux-proc-exe.o: tests/linux_x64_proc_exe.c | $(X64BUILD)
+	$(CC) $(X64CFLAGS) -c $< -o $@
+$(X64BUILD)/linux-proc-exe.elf: $(X64BUILD)/linux-proc-exe.o
+	$(LD) -m elf_x86_64 -static -no-pie $< -o $@
 $(X64BUILD)/linux-sigchld.o: tests/linux_x64_sigchld.c | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
 $(X64BUILD)/linux-sigchld.elf: $(X64BUILD)/linux-sigchld.o
@@ -1928,7 +1932,7 @@ kernel-x64-shm-smoke: $(X64BUILD)/kernel-linux.bin $(X64BUILD)/linux-shm-probe.e
 kernel-x64-ring3-smoke: $(X64_RING3_TESTS)
 	python3 tests/kernel_x64_smoke.py --ring3
 .PHONY: kernel-x64-linux-smoke
-kernel-x64-linux-smoke: $(X64BUILD)/linux-fb.elf $(X64BUILD)/linux-input.elf $(X64BUILD)/linux-sigchld.elf
+kernel-x64-linux-smoke: $(X64BUILD)/linux-fb.elf $(X64BUILD)/linux-input.elf $(X64BUILD)/linux-sigchld.elf $(X64BUILD)/linux-proc-exe.elf
 kernel-x64-linux-smoke: $(X64BUILD)/kernel-linux.bin $(X64BUILD)/linux-probe.elf $(X64BUILD)/linux-bad-stack.elf $(X64BUILD)/linux-pie.elf $(X64BUILD)/linux-files.elf $(X64BUILD)/linux-mmap.elf $(X64BUILD)/linux-socket.elf $(X64BUILD)/linux-pipe.elf $(X64BUILD)/linux-poll.elf $(X64BUILD)/linux-fork.elf $(X64BUILD)/linux-pthread.elf $(X64BUILD)/linux-userns.elf $(X64BUILD)/linux-pidns.elf $(X64BUILD)/linux-netns.elf $(X64BUILD)/linux-shared-fs.elf $(X64BUILD)/linux-vfork.elf $(X64BUILD)/linux-exec.elf $(X64BUILD)/linux-exec-target.elf
 	python3 tests/kernel_x64_linux_smoke.py
 
