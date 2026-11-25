@@ -1631,7 +1631,7 @@ $(X64BUILD)/dhcp.o: kernel/x86_64/dhcp.c kernel/x86_64/dhcp.h kernel/x86_64/net.
 	$(CC) $(X64CFLAGS) -c $< -o $@
 $(X64BUILD)/tcp.o: kernel/x86_64/tcp.c kernel/x86_64/tcp.h kernel/x86_64/linux.h kernel/x86_64/net.h kernel/x86_64/net_bytes.h $(X64_HEADERS) | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
-$(X64BUILD)/linux_net.o: kernel/x86_64/linux_net.c kernel/x86_64/linux.h kernel/x86_64/dhcp.h kernel/x86_64/tcp.h kernel/x86_64/net.h kernel/x86_64/e1000.h $(X64_HEADERS) | $(X64BUILD)
+$(X64BUILD)/linux_net.o: kernel/x86_64/linux_net.c kernel/x86_64/net_bytes.h kernel/x86_64/linux.h kernel/x86_64/dhcp.h kernel/x86_64/tcp.h kernel/x86_64/net.h kernel/x86_64/e1000.h $(X64_HEADERS) | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
 $(X64BUILD)/segments.o: kernel/x86_64/segments.c kernel/x86_64/segments.h kernel/types.h | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
@@ -1693,6 +1693,10 @@ $(X64BUILD)/linux-dhcp-probe.elf: $(X64BUILD)/linux-dhcp-probe.o
 $(X64BUILD)/linux-udp-probe.o: tests/kernel_x64_udp_probe.c | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
 $(X64BUILD)/linux-udp-probe.elf: $(X64BUILD)/linux-udp-probe.o
+	$(LD) -m elf_x86_64 -static -no-pie $< -o $@
+$(X64BUILD)/linux-udp-recverr-probe.o: tests/kernel_x64_udp_recverr_probe.c | $(X64BUILD)
+	$(CC) $(X64CFLAGS) -c $< -o $@
+$(X64BUILD)/linux-udp-recverr-probe.elf: $(X64BUILD)/linux-udp-recverr-probe.o
 	$(LD) -m elf_x86_64 -static -no-pie $< -o $@
 $(X64BUILD)/linux-tcp-probe.o: tests/kernel_x64_tcp_probe.c | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
@@ -1795,6 +1799,9 @@ kernel-x64-dhcp-smoke: $(X64BUILD)/kernel-linux.bin $(X64BUILD)/linux-dhcp-probe
 	python3 tests/kernel_x64_dhcp_smoke.py
 kernel-x64-udp-smoke: $(X64BUILD)/kernel-linux.bin $(X64BUILD)/linux-udp-probe.elf
 	python3 tests/kernel_x64_udp_smoke.py
+.PHONY: kernel-x64-udp-recverr-smoke
+kernel-x64-udp-recverr-smoke: $(X64BUILD)/kernel-linux.bin $(X64BUILD)/linux-udp-recverr-probe.elf
+	python3 tests/kernel_x64_udp_recverr_smoke.py
 kernel-x64-tcp-smoke: $(X64BUILD)/kernel-linux.bin $(X64BUILD)/linux-tcp-probe.elf $(X64BUILD)/tcp-test
 	$(X64BUILD)/tcp-test
 	python3 tests/kernel_x64_tcp_smoke.py

@@ -152,6 +152,9 @@ GNU ld и objcopy. EFI-приложение получается в `build/uefi/
   `AF_INET/SOCK_DGRAM`. Сокеты сохраняют границы датаграмм, поддерживают
   привязку и выбор удалённого адреса, loopback, `poll` и `epoll`.
   QEMU сверяет обмен с тестовым соседом по PCAP и проверяет адрес отправителя.
+- `make kernel-x64-udp-recverr-smoke` — QEMU возвращает ICMP-ошибку на исходящую
+  UDP-датаграмму. Linux ELF проверяет `POLLERR`, `SO_ERROR`, адрес отправителя
+  и процитированные данные в `recvmsg(MSG_ERRQUEUE)` на сокете с `IP_RECVERR`.
 - `make kernel-x64-tcp-smoke` — Linux ELF открывает исходящее соединение
   `AF_INET/SOCK_STREAM`, ждёт завершения через `epoll`, читает `SO_ERROR`
   и обменивается потоком с TCP-сервером через QEMU. PCAP сверяет рукопожатие,

@@ -10,18 +10,20 @@ enum {
     EAFNOSUPPORT = 97, ENOPROTOOPT = 92, ECONNRESET = 104, EISCONN = 106, ENOTCONN = 107,
     ECONNREFUSED = 111, EALREADY = 114, EINPROGRESS = 115,
     EDESTADDRREQ = 89, EADDRINUSE = 98, EADDRNOTAVAIL = 99, ENETDOWN = 100,
-    ENETUNREACH = 101, EHOSTUNREACH = 113,
+    ENONET = 64, EPROTO = 71, ENETUNREACH = 101, EHOSTDOWN = 112, EHOSTUNREACH = 113,
     AF_UNIX = 1, AF_INET = 2, SOCK_STREAM = 1, SOCK_DGRAM = 2, SOCK_SEQPACKET = 5,
     SOCK_MAX = 11, SOCK_TYPE_MASK = 0xf, IPPROTO_TCP = 6, IPPROTO_UDP = 17, TCP_NODELAY = 1,
     SOCK_NONBLOCK = 0x800, SOCK_CLOEXEC = 0x80000,
     SHUT_RD = 0, SHUT_WR = 1, SHUT_RDWR = 2,
+    SOL_IP = 0, IP_RECVERR = 11, SO_EE_ORIGIN_ICMP = 2,
+    ICMP_DEST_UNREACH = 3, ICMP_PORT_UNREACH = 3, ICMP_TIME_EXCEEDED = 11, ICMP_PARAMETERPROB = 12,
     SOL_SOCKET = 1, SO_TYPE = 3, SO_ERROR = 4, SO_PASSCRED = 16, SO_PEERCRED = 17,
     SO_PROTOCOL = 38, SO_DOMAIN = 39,
     SCM_RIGHTS = 1, SCM_CREDENTIALS = 2,
     MSG_OOB = 1, MSG_PEEK = 2, MSG_CTRUNC = 8, MSG_TRUNC = 0x20, MSG_DONTWAIT = 0x40,
     MSG_EOR = 0x80, MSG_NOSIGNAL = 0x4000, MSG_CMSG_CLOEXEC = 0x40000000,
     MAX_IOV = 64, MAX_QUEUED = 32, MAX_BACKLOG = 31, SCM_MAX_FD = 253,
-    UDP_HEADER = 8, UDP_MAX = 1472, UDP_TX_LIMIT = 4, UDP_FIRST_PORT = 49152,
+    UDP_HEADER = 8, UDP_MAX = 1472, UDP_TX_LIMIT = 4, UDP_ERROR_LIMIT = 8, UDP_FIRST_PORT = 49152,
 };
 
 _Static_assert(__builtin_offsetof(struct linux64_sockaddr, path) == 2, "Linux sockaddr_un path");
@@ -46,6 +48,33 @@ struct cmsghdr {
     uptr length;
     i32 level, type;
 };
+
+struct extended_error {
+    u32 error;
+    u8 origin, type, code, pad;
+    u32 info, data;
+};
+
+struct ipv4_sockaddr { u16 family; u8 port[2], ip[4], padding[8]; };
+
+struct udp_error_message {
+    struct cmsghdr header;
+    struct extended_error error;
+    struct ipv4_sockaddr offender;
+};
+
+struct udp_icmp_error {
+    struct udp_icmp_error *next;
+    struct linux64_udp_address peer;
+    u32 offender, length;
+    struct extended_error error;
+    u8 payload[];
+};
+
+_Static_assert(sizeof(struct ipv4_sockaddr) == 16, "Linux sockaddr_in");
+_Static_assert(sizeof(struct extended_error) == 16 && sizeof(struct udp_error_message) == 48,
+               "Linux IP_RECVERR cmsg");
+_Static_assert(sizeof(struct udp_icmp_error) + UDP_MAX <= PMM_PAGE_SIZE, "UDP ICMP error page");
 
 struct credentials {
     uptr length;
@@ -91,15 +120,17 @@ struct linux64_socket {
     struct linux64_socket *accept_head, *accept_tail, *accept_next;
     struct packet *head, *tail;
     struct packet *udp_tx_head, *udp_tx_tail;
+    struct udp_icmp_error *udp_err_head, *udp_err_tail;
     struct linux64_udp_address local, remote;
     struct peer_snapshot peer_credentials;
     u64 inode;
     unsigned queued, head_offset, backlog, pending;
-    unsigned udp_tx_count;
+    unsigned udp_tx_count, udp_err_count;
     u32 udp_tx_source, tcp_source;
-    i32 udp_error;
+    i32 udp_error, udp_icmp_errno;
     u8 type;
     bool open, passcred, reset, read_shutdown, write_shutdown, listening, scm_marked, inet, inet_bound;
+    bool udp_recverr;
     char name[LINUX64_UNIX_PATH_LIMIT + 1];
 };
 
@@ -167,6 +198,21 @@ bool linux64_socket_is_udp(const struct linux64_socket *socket) {
     return linux64_socket_is_inet(socket) && socket->type == SOCK_DGRAM;
 }
 
+bool linux64_udp_recverr_enabled(const struct linux64_socket *socket) {
+    return linux64_socket_is_udp(socket) && socket->udp_recverr;
+}
+
+static i32 udp_socket_error(const struct linux64_socket *socket) {
+    return socket->udp_error ? socket->udp_error : socket->udp_icmp_errno;
+}
+
+static long udp_pending_error(struct linux64_socket *socket) {
+    i32 error = udp_socket_error(socket);
+    if (socket->udp_error) socket->udp_error = 0;
+    else socket->udp_icmp_errno = 0;
+    return -error;
+}
+
 bool linux64_socket_is_inet(const struct linux64_socket *socket) {
     return socket && socket->inet;
 }
@@ -178,9 +224,6 @@ bool linux64_socket_is_tcp(const struct linux64_socket *socket) {
 static bool loopback(u32 ip) {
     return (ip >> 24) == 127;
 }
-
-struct ipv4_sockaddr { u16 family; u8 port[2], ip[4], padding[8]; };
-_Static_assert(sizeof(struct ipv4_sockaddr) == 16, "Linux sockaddr_in");
 
 long linux64_udp_address(uptr address, u32 length, struct linux64_udp_address *result, bool disconnect) {
     struct ipv4_sockaddr name;
@@ -412,8 +455,8 @@ bool linux64_socket_io_ready(const struct linux64_socket *socket, bool receive) 
         return (linux64_socket_poll(socket) & (mask | LINUX64_POLLERR | LINUX64_POLLHUP)) != 0;
     }
     if (linux64_socket_is_udp(socket))
-        return receive ? socket->head || socket->udp_error || socket->read_shutdown :
-                         socket->udp_error || socket->write_shutdown || socket->udp_tx_count < UDP_TX_LIMIT;
+        return receive ? socket->head || udp_socket_error(socket) || socket->read_shutdown :
+                         udp_socket_error(socket) || socket->write_shutdown || socket->udp_tx_count < UDP_TX_LIMIT;
     if (!socket->peer) return true;
     if (receive) return socket->head || socket->reset || socket->read_shutdown || !socket->peer->open;
     return socket->write_shutdown || !socket->peer->open || socket->peer->queued < MAX_QUEUED;
@@ -548,6 +591,15 @@ static void drop_udp_tx(struct linux64_socket *socket) {
     free_packet(packet);
 }
 
+static void drop_udp_error(struct linux64_socket *socket) {
+    struct udp_icmp_error *error = socket->udp_err_head;
+    socket->udp_err_head = error->next;
+    if (!socket->udp_err_head) socket->udp_err_tail = NULL;
+    --socket->udp_err_count;
+    socket->udp_icmp_errno = error->next ? (i32)error->next->error.error : 0;
+    pmm64_free((uptr)error - (uptr)pmm64_pointer(0));
+}
+
 static void drop_packet(struct linux64_socket *socket) {
     struct packet *packet = socket->head;
     socket->head = packet->next;
@@ -564,6 +616,7 @@ static void close_endpoint(struct linux64_socket *socket) {
     if (unread && !unread->length) unread = unread->next;
     if (unread && socket->peer && socket->peer->open) socket->peer->reset = true;
     while (socket->head) drop_packet(socket);
+    while (socket->udp_err_head) drop_udp_error(socket);
 }
 
 void linux64_socket_close(struct linux64_socket *socket) {
@@ -611,7 +664,7 @@ u16 linux64_socket_poll(const struct linux64_socket *socket) {
         if (socket->head || socket->read_shutdown) ready |= LINUX64_POLL_READ;
         if (socket->read_shutdown) ready |= LINUX64_POLLRDHUP;
         if (socket->udp_tx_count < UDP_TX_LIMIT) ready |= LINUX64_POLL_WRITE;
-        if (socket->udp_error) ready |= LINUX64_POLLERR;
+        if (udp_socket_error(socket) || socket->udp_err_head) ready |= LINUX64_POLLERR;
         return ready;
     }
     if (socket->listening) {
@@ -634,12 +687,42 @@ u16 linux64_socket_poll(const struct linux64_socket *socket) {
     return ready;
 }
 
+static long udp_recverr_option(struct linux64_socket *socket, bool get, uptr value, uptr length) {
+    if (!get) {
+        i32 count = (i32)length, enabled = 0;
+        if (count < 0) return -EINVAL;
+        if (count >= (i32)sizeof(enabled)) {
+            if (paging64_copy_from_user(&enabled, value, sizeof(enabled)) != sizeof(enabled)) return -EFAULT;
+        } else if (count) {
+            u8 byte;
+            if (paging64_copy_from_user(&byte, value, sizeof(byte)) != sizeof(byte)) return -EFAULT;
+            enabled = byte;
+        }
+        socket->udp_recverr = enabled != 0;
+        if (!enabled) {
+            /* Выключение опции удаляет очередь, но уже выставленный SO_ERROR остаётся. */
+            i32 pending = socket->udp_icmp_errno;
+            while (socket->udp_err_head) drop_udp_error(socket);
+            socket->udp_icmp_errno = pending;
+        }
+        return 0;
+    }
+    i32 count, enabled = socket->udp_recverr;
+    if (paging64_copy_from_user(&count, length, sizeof(count)) != sizeof(count)) return -EFAULT;
+    if (count < 0) return -EINVAL;
+    if (count) count = count < (i32)sizeof(enabled) ? 1 : sizeof(enabled);
+    if (!paging64_put_user_u32(length, (u32)count) ||
+        paging64_copy_to_user(value, &enabled, (uptr)count) != (uptr)count) return -EFAULT;
+    return 0;
+}
+
 long linux64_socket_option(struct linux64_socket *socket, bool get, i32 level, i32 option,
                            uptr value, uptr length) {
     bool tcp = linux64_socket_is_tcp(socket);
     bool nodelay = tcp && level == IPPROTO_TCP && option == TCP_NODELAY;
-    if (!nodelay && level != SOL_SOCKET) return -ENOPROTOOPT;
     bool udp = linux64_socket_is_udp(socket);
+    if (udp && level == SOL_IP && option == IP_RECVERR) return udp_recverr_option(socket, get, value, length);
+    if (!nodelay && level != SOL_SOCKET) return -ENOPROTOOPT;
     if (!nodelay && (socket->inet ?
         !(get && (option == SO_TYPE || option == SO_ERROR || option == SO_DOMAIN || option == SO_PROTOCOL)) :
         (option != SO_PASSCRED && !(get && (option == SO_TYPE || option == SO_PEERCRED))))) return -ENOPROTOOPT;
@@ -659,7 +742,7 @@ long linux64_socket_option(struct linux64_socket *socket, bool get, i32 level, i
     i32 result = option == SO_TYPE ? socket->type : socket->passcred;
     if (nodelay) result = 1;
     else if (socket->inet) {
-        if (option == SO_ERROR) result = udp ? socket->udp_error : socket->tcp ? tcp64_error(socket->tcp, false) : 0;
+        if (option == SO_ERROR) result = udp ? udp_socket_error(socket) : socket->tcp ? tcp64_error(socket->tcp, false) : 0;
         if (option == SO_DOMAIN) result = AF_INET;
         if (option == SO_PROTOCOL) result = tcp ? IPPROTO_TCP : IPPROTO_UDP;
     }
@@ -680,7 +763,7 @@ long linux64_socket_option(struct linux64_socket *socket, bool get, i32 level, i
     if (count > size) count = size;
     if (paging64_copy_to_user(value, data, (uptr)count) != (uptr)count ||
         paging64_copy_to_user(length, &count, sizeof(count)) != sizeof(count)) return -EFAULT;
-    if (udp && option == SO_ERROR) socket->udp_error = 0;
+    if (udp && option == SO_ERROR) udp_pending_error(socket);
     if (tcp && !nodelay && option == SO_ERROR && socket->tcp) tcp64_error(socket->tcp, true);
     return 0;
 }
@@ -711,25 +794,63 @@ static void enqueue(struct linux64_socket *peer, struct packet *packet) {
     ++peer->queued;
 }
 
-static bool udp_deliver(struct linux64_udp_address source, struct linux64_udp_address dest,
-                        const u8 *data, u32 length) {
+static struct linux64_socket *udp_receiver(struct linux64_udp_address source, struct linux64_udp_address dest) {
     for (unsigned i = 0; i < sizeof(pairs) / sizeof(*pairs); ++i) {
         struct linux64_socket *socket = pairs[i];
         if (!socket->open || !linux64_socket_is_udp(socket) || socket->local.port != dest.port ||
             (socket->local.ip && socket->local.ip != dest.ip) ||
             (socket->remote.port && (socket->remote.ip != source.ip || socket->remote.port != source.port)))
             continue;
-        if (socket->read_shutdown || socket->queued >= MAX_QUEUED) return true;
-        struct packet *packet = allocate_packet();
-        if (!packet) return true;
-        packet->datagram.ip = source.ip;
-        packet->datagram.port = source.port;
-        packet->length = length;
-        for (u32 j = 0; j < length; ++j) packet->bytes[j] = data[j];
-        enqueue(socket, packet);
-        return true;
+        return socket;
     }
-    return false;
+    return NULL;
+}
+
+static bool udp_deliver(struct linux64_udp_address source, struct linux64_udp_address dest,
+                        const u8 *data, u32 length) {
+    struct linux64_socket *socket = udp_receiver(source, dest);
+    if (!socket) return false;
+    if (socket->read_shutdown || socket->queued >= MAX_QUEUED) return true;
+    struct packet *packet = allocate_packet();
+    if (!packet) return true;
+    packet->datagram.ip = source.ip;
+    packet->datagram.port = source.port;
+    packet->length = length;
+    for (u32 i = 0; i < length; ++i) packet->bytes[i] = data[i];
+    enqueue(socket, packet);
+    return true;
+}
+
+void linux64_udp_icmp_error(u32 offender, u32 local_ip, u32 peer_ip, u16 local_port, u16 peer_port,
+                            u8 type, u8 code, u32 info, const u8 *payload, u32 length) {
+    static const u8 unreachable[] = {
+        ENETUNREACH, EHOSTUNREACH, ENOPROTOOPT, ECONNREFUSED, EMSGSIZE, EOPNOTSUPP, ENETUNREACH, EHOSTDOWN,
+        ENONET, ENETUNREACH, EHOSTUNREACH, ENETUNREACH, EHOSTUNREACH, EHOSTUNREACH, EHOSTUNREACH, EHOSTUNREACH,
+    };
+    i32 number;
+    if (type == ICMP_DEST_UNREACH && code < sizeof(unreachable)) number = unreachable[code];
+    else if (type == ICMP_TIME_EXCEEDED) number = EHOSTUNREACH;
+    else if (type == ICMP_PARAMETERPROB) number = EPROTO;
+    else return;
+    if (!local_port || !peer_port || length > UDP_MAX || (length && !payload)) return;
+    struct linux64_udp_address peer = {peer_ip, peer_port};
+    struct linux64_socket *socket = udp_receiver(peer, (struct linux64_udp_address){local_ip, local_port});
+    if (!linux64_udp_recverr_enabled(socket)) return;
+    socket->udp_icmp_errno = number;
+    if (socket->udp_err_count >= UDP_ERROR_LIMIT) return;
+
+    uptr physical = pmm64_alloc();
+    if (!physical) return;
+    struct udp_icmp_error *error = pmm64_pointer(physical);
+    *error = (struct udp_icmp_error){
+        .peer = peer, .offender = offender, .length = length,
+        .error = {.error = (u32)number, .origin = SO_EE_ORIGIN_ICMP, .type = type, .code = code, .info = info},
+    };
+    for (u32 i = 0; i < length; ++i) error->payload[i] = payload[i];
+    if (socket->udp_err_tail) socket->udp_err_tail->next = error;
+    else socket->udp_err_head = error;
+    socket->udp_err_tail = error;
+    ++socket->udp_err_count;
 }
 
 static u32 udp_checksum_seed(u32 source, u32 dest, u32 length) {
@@ -787,15 +908,9 @@ bool linux64_udp_flush(u64 now) {
     return pending;
 }
 
-static long udp_pending_error(struct linux64_socket *socket) {
-    long error = -socket->udp_error;
-    socket->udp_error = 0;
-    return error;
-}
-
 static long udp_send(struct linux64_socket *socket, const struct iovec *iov, uptr count,
                      struct linux64_udp_address dest) {
-    if (socket->udp_error) return udp_pending_error(socket);
+    if (udp_socket_error(socket)) return udp_pending_error(socket);
     if (socket->write_shutdown) return -EPIPE;
     if (!dest.port) return -EDESTADDRREQ;
     if (!dest.ip) dest.ip = 0x7f000001u;
@@ -828,8 +943,14 @@ static long udp_send(struct linux64_socket *socket, const struct iovec *iov, upt
     if (!result && local) {
         bool delivered = udp_deliver((struct linux64_udp_address){source, socket->local.port},
                                      dest, packet->bytes, packet->length);
-        if (!delivered && socket->remote.port == dest.port && socket->remote.ip == dest.ip)
-            socket->udp_error = ECONNREFUSED;
+        if (!delivered) {
+            if (socket->udp_recverr) {
+                linux64_udp_icmp_error(dest.ip, source, dest.ip, socket->local.port, dest.port,
+                                      ICMP_DEST_UNREACH, ICMP_PORT_UNREACH, 0, packet->bytes, packet->length);
+            } else if (socket->remote.port == dest.port && socket->remote.ip == dest.ip) {
+                socket->udp_error = ECONNREFUSED;
+            }
+        }
     } else if (!result) {
         u64 now;
         if (!linux64_monotonic_ns(&now)) result = -ENETDOWN;
@@ -851,7 +972,7 @@ static long udp_send(struct linux64_socket *socket, const struct iovec *iov, upt
 
 static long udp_receive(struct linux64_socket *socket, const struct iovec *iov, uptr count, u32 flags,
                         struct msghdr *message, uptr name, uptr name_length) {
-    if (socket->udp_error) return udp_pending_error(socket);
+    if (udp_socket_error(socket)) return udp_pending_error(socket);
     struct packet *packet = socket->head;
     if (!packet) return socket->read_shutdown ? 0 : -EAGAIN;
     struct linux64_udp_address source = {packet->datagram.ip, packet->datagram.port};
@@ -1252,12 +1373,54 @@ static void receive_ancillary(struct msghdr *message, const struct received_anci
     if (fds->count < rights->count) message->flags |= MSG_CTRUNC;
 }
 
+static long udp_error_message(struct msghdr *message, const struct udp_icmp_error *error) {
+    message->flags |= LINUX64_MSG_ERRQUEUE;
+    if (message->name) {
+        long result = put_udp_address(message->name, message->name_length, error->peer);
+        if (result) return result;
+        message->name_length = sizeof(struct ipv4_sockaddr);
+    } else message->name_length = 0;
+
+    struct udp_error_message control = {
+        .header = {sizeof(control), SOL_IP, IP_RECVERR},
+        .error = error->error,
+        .offender = {.family = error->offender ? AF_INET : 0},
+    };
+    net_write32(control.offender.ip, error->offender);
+    if (!message->control || message->control_length < sizeof(control.header)) {
+        message->flags |= MSG_CTRUNC;
+        message->control_length = 0;
+        return 0;
+    }
+    if (message->control_length < sizeof(control)) {
+        message->flags |= MSG_CTRUNC;
+        control.header.length = message->control_length;
+    }
+    message->control_length = control.header.length;
+    return paging64_copy_to_user(message->control, &control, control.header.length) == control.header.length
+           ? 0 : -EFAULT;
+}
+
+static long udp_receive_error(struct linux64_socket *socket, const struct iovec *iov, uptr count,
+                              struct msghdr *message) {
+    struct udp_icmp_error *error = socket->udp_err_head;
+    if (!error) return -EAGAIN;
+    struct iov_cursor cursor = {iov, iov + count, 0};
+    bool fault = false;
+    uptr copied = stream_copy(&cursor, error->payload, error->length, true, &fault);
+    message->flags = copied < error->length ? MSG_TRUNC : 0;
+    long result = fault ? -EFAULT : udp_error_message(message, error);
+    drop_udp_error(socket);
+    return result ? result : (long)copied;
+}
+
 long linux64_socket_message(struct linux64_socket *socket, struct linux64_socket_wait *wait) {
     bool receive = wait->operation == SOCKET_RECVMSG;
     uptr address = wait->address;
     u32 flags = wait->flags;
     u32 allowed = receive ? MSG_PEEK | MSG_TRUNC | MSG_DONTWAIT | MSG_CMSG_CLOEXEC
                           : MSG_DONTWAIT | MSG_EOR | MSG_NOSIGNAL;
+    if (receive && linux64_socket_is_udp(socket)) allowed |= LINUX64_MSG_ERRQUEUE;
     if (flags & ~allowed) return -EOPNOTSUPP;
     struct msghdr message;
     if (paging64_copy_from_user(&message, address, sizeof(message)) != sizeof(message))
@@ -1297,14 +1460,17 @@ long linux64_socket_message(struct linux64_socket *socket, struct linux64_socket
             }
             return udp_send(socket, iov, message.iov_count, dest);
         }
+        bool errors = (flags & LINUX64_MSG_ERRQUEUE) != 0;
         message.flags = 0;
-        message.control_length = 0;
         message.name_length = message.name ? message.name_length : 0;
-        long result = udp_receive(socket, iov, message.iov_count, flags, &message, 0, 0);
+        if (!errors) message.control_length = 0;
+        long result = errors ? udp_receive_error(socket, iov, message.iov_count, &message) :
+                               udp_receive(socket, iov, message.iov_count, flags, &message, 0, 0);
         if (result < 0) return result;
         if (!paging64_put_user_u32(address + __builtin_offsetof(struct msghdr, name_length), message.name_length) ||
             !paging64_put_user_u32(address + __builtin_offsetof(struct msghdr, flags), message.flags) ||
-            !paging64_put_user_u64(address + __builtin_offsetof(struct msghdr, control_length), 0)) return -EFAULT;
+            !paging64_put_user_u64(address + __builtin_offsetof(struct msghdr, control_length),
+                                   message.control_length)) return -EFAULT;
         return result;
     }
     if (!receive) {
