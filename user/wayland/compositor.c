@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include <wayland-server.h>
 
+#include "keyboard.h"
 #include "xdg-shell-server-protocol.h"
 
 struct compositor {
@@ -24,6 +25,7 @@ struct compositor {
     struct fb_var_screeninfo mode;
     struct fb_fix_screeninfo layout;
     struct surface *visible;
+    struct wayland_keyboard *keyboard;
     uint32_t *row;
     int drawn_width, drawn_height;
     int fb;
@@ -63,6 +65,7 @@ static void hide_surface(struct surface *surface) {
     struct compositor *server = surface->server;
     surface->mapped = false;
     if (server->visible != surface) return;
+    wayland_keyboard_focus(server->keyboard, NULL);
     memset(server->row, 0, (size_t)server->drawn_width * sizeof(*server->row));
     for (int y = 0; y < server->drawn_height; ++y) {
         if (!write_row(server, y, server->drawn_width)) {
@@ -120,6 +123,13 @@ static void surface_destroyed(struct wl_resource *resource) {
         wl_resource_destroy(frame->resource);
     }
     free(surface);
+}
+
+static void destroy_surface_request(struct wl_client *client, struct wl_resource *resource) {
+    (void)client;
+    struct surface *surface = wl_resource_get_user_data(resource);
+    hide_surface(surface);
+    wl_resource_destroy(resource);
 }
 
 static void surface_attach(struct wl_client *client, struct wl_resource *resource,
@@ -276,6 +286,7 @@ static void surface_commit(struct wl_client *client, struct wl_resource *resourc
         if (surface->toplevel) {
             surface->server->visible = surface;
             surface->mapped = true;
+            wayland_keyboard_focus(surface->server->keyboard, resource);
         }
         wl_buffer_send_release(buffer);
     } else if (surface->detach && surface->mapped) {
@@ -298,7 +309,7 @@ static void surface_commit(struct wl_client *client, struct wl_resource *resourc
 }
 
 static const struct wl_surface_interface surface_requests = {
-    .destroy = destroy_request,
+    .destroy = destroy_surface_request,
     .attach = surface_attach,
     .damage = rectangle_request,
     .frame = surface_frame,
@@ -550,8 +561,8 @@ static bool color_supported(struct fb_bitfield color) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 2) {
-        fputs("Usage: wayland-compositor /path/to/wayland-socket\n", stderr);
+    if (argc < 2 || argc > 3) {
+        fputs("Usage: wayland-compositor /path/to/wayland-socket [keymap.xkb]\n", stderr);
         return 2;
     }
     struct compositor server = { .fb = open("/dev/fb0", O_WRONLY | O_CLOEXEC) };
@@ -581,6 +592,13 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    const char *keymap = argc == 3 ? argv[2] : "/myos/keyboard.xkb";
+    if ((argc == 3 || access(keymap, R_OK) == 0) &&
+        !wayland_keyboard_init(&server.keyboard, server.display, keymap)) {
+        unlink(argv[1]);
+        return 1;
+    }
+
     struct sigaction action = { .sa_handler = stop };
     sigemptyset(&action.sa_mask);
     if (sigaction(SIGTERM, &action, NULL) || sigaction(SIGINT, &action, NULL)) {
@@ -599,6 +617,7 @@ int main(int argc, char **argv) {
         }
     }
     wl_display_destroy_clients(server.display);
+    wayland_keyboard_destroy(server.keyboard);
     wl_display_destroy(server.display);
     unlink(argv[1]);
     free(server.row);

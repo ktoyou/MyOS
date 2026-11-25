@@ -45,17 +45,25 @@ def main():
     compositor = build / 'wayland-compositor'
     files = dependencies(client) | dependencies(compositor)
     files['/myos/wayland-compositor'] = compositor.read_bytes()
+    files['/myos/keyboard.xkb'] = (build / 'keyboard.xkb').read_bytes()
     root = linux_root(client.read_bytes(), files, '/myos/wayland-client')
     payload, kernel_end = image('kernel-linux')
+
+    def keyboard_input(vm):
+        vm.wait('Wayland keyboard focused')
+        events = [{'type': 'key', 'data': {'down': down, 'key': {'type': 'qcode', 'data': key}}}
+                  for key, down in (('shift', True), ('a', True), ('a', False), ('shift', False))]
+        vm.qmp('input-send-event', {'events': events})
+
     with tempfile.TemporaryDirectory(prefix='myos-wayland-x64-') as temp:
         directory = pathlib.Path(temp)
         shot = directory / 'wayland.ppm'
         serial = boot_x64(directory, 'x64-linux-wayland', payload, kernel_end,
                           ['Wayland shared memory frame presented', 'Linux x86-64 exit status=0x00'],
-                          live_root_header=root, screenshot=shot)
+                          live_root_header=root, screenshot=shot, interact=keyboard_input)
         assert 'x86-64 exception' not in serial, serial
         check_pixels(shot)
-    print('OVMF: Wayland xdg-shell, shared memory, frame callback and framebuffer pixels: PASS', flush=True)
+    print('OVMF: Wayland xdg-shell, shared memory, framebuffer pixels and keyboard focus: PASS', flush=True)
 
 
 if __name__ == '__main__':
