@@ -28,6 +28,8 @@ enum linux64_poll_events {
 
 struct memfd;
 
+#define LINUX64_RESOLVER_CONFIG_MAX 50u
+
 struct linux64_file {
     const u8 *bytes;
     struct memfd *backing;
@@ -35,6 +37,7 @@ struct linux64_file {
     u64 inode;
     u32 mode, uid, gid;
     i32 proc_fd_owner, proc_fd_number;
+    u32 dns_server;
     bool writable_directory, live_pages, private_directory;
     bool proc_fd_directory, proc_exe;
 };
@@ -103,6 +106,8 @@ long linux64_madvise(uptr address, uptr length, i32 advice);
 uptr linux64_random_bytes(void *buffer, uptr length);
 bool linux64_net_init(void);
 bool linux64_net_poll(void);
+u32 linux64_net_dns_server(void);
+uptr linux64_net_resolver_config(u32 server, char *buffer);
 long linux64_getrandom(uptr address, uptr length, u32 flags);
 void linux64_clock_init(void);
 bool linux64_monotonic_ns(u64 *nanos);

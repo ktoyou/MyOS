@@ -4,7 +4,7 @@
 enum {
     EPERM = 1, ENOENT = 2, EACCES = 13, EBUSY = 16, EEXIST = 17, ENOTDIR = 20, EISDIR = 21,
     ENOSPC = 28, EROFS = 30, ENAMETOOLONG = 36, ELOOP = 40, EOPNOTSUPP = 95,
-    NAME_LIMIT = 255, LINK_LIMIT = 40, TEMP_NODES = 256,
+    NAME_LIMIT = 255, LINK_LIMIT = 40, TEMP_NODES = 256, LIVE_ENTRY_OFFSET = TEMP_NODES + 3,
 };
 
 enum walk_action { WALK_FOLLOW, WALK_NOFOLLOW, WALK_CREATE, WALK_CREATE_FOLLOW, WALK_UNLINK, WALK_RENAME };
@@ -23,6 +23,7 @@ struct rename_entry {
 
 static struct temporary_node temporary[TEMP_NODES];
 static u64 next_inode = 1ull << 32;
+static const u64 etc_inode = 1ull << 36;
 
 struct linux64_fs *linux64_initial_fs(void) {
     static struct linux64_fs initial = {
@@ -87,8 +88,19 @@ static bool find_node(const struct linux64_file_source *source, const char *path
     }
     if (source->lookup && source->lookup(source->context, path, file)) return true;
     u64 inode = source->directory ? source->directory(source->context, path) : 0;
-    if (!inode) return false;
-    *file = (struct linux64_file){.mode = LINUX64_S_IFDIR | 0555, .inode = inode};
+    if (inode || same_path(path, "/etc")) {
+        *file = (struct linux64_file){.mode = LINUX64_S_IFDIR | 0555, .inode = inode ? inode : etc_inode};
+        return true;
+    }
+    if (!same_path(path, "/etc/resolv.conf")) return false;
+    u32 server = linux64_net_dns_server();
+    if (!server) return false;
+    char config[LINUX64_RESOLVER_CONFIG_MAX];
+    *file = (struct linux64_file){
+        .size = linux64_net_resolver_config(server, config),
+        /* libc перечитывает resolv.conf, когда по этому пути появился другой inode. */
+        .inode = etc_inode | server, .mode = LINUX64_S_IFREG | 0444, .dns_server = server,
+    };
     return true;
 }
 
@@ -171,9 +183,20 @@ bool linux64_vfs_next_entry(const struct linux64_directory *dir, uptr *position,
         }
         child = NULL;
     }
+    if (!child && *position == LIVE_ENTRY_OFFSET - 1) {
+        ++*position;
+        if (same_path(dir->path, "/") && find_node(source, "/etc", file) && file->inode == etc_inode) {
+            child = "etc";
+            size = sizeof("etc") - 1;
+        } else if (same_path(dir->path, "/etc") && find_node(source, "/etc/resolv.conf", file) &&
+                   file->dns_server) {
+            child = "resolv.conf";
+            size = sizeof("resolv.conf") - 1;
+        }
+    }
     if (!child) {
         if (!source->entry_path) return false;
-        uptr index = *position - TEMP_NODES - 2;
+        uptr index = *position - LIVE_ENTRY_OFFSET;
         if (length > 1) path[length++] = '/';
         while (live_child(source, dir->path, &index, &child, &size)) {
             for (uptr i = 0; i < size; ++i) path[length + i] = child[i];
@@ -182,7 +205,7 @@ bool linux64_vfs_next_entry(const struct linux64_directory *dir, uptr *position,
             child = NULL;
         }
         if (!child) return false;
-        *position = index + TEMP_NODES + 2;
+        *position = index + LIVE_ENTRY_OFFSET;
     }
     for (uptr i = 0; i < size; ++i) name[i] = child[i];
     name[size] = 0;
