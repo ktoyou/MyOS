@@ -6,6 +6,7 @@ enum {
     SYS_PIPE = 22, SYS_DUP = 32, SYS_GETPID = 39, SYS_FORK = 57, SYS_EXIT = 60, SYS_WAIT4 = 61,
     SYS_FCNTL = 72, SYS_FLOCK = 73, SYS_FSYNC = 74, SYS_FDATASYNC = 75, SYS_FTRUNCATE = 77,
     SYS_GETCWD = 79, SYS_CHDIR = 80, SYS_UMASK = 95,
+    SYS_STATFS = 137, SYS_FSTATFS = 138,
     SYS_GETDENTS64 = 217, SYS_OPENAT = 257, SYS_MKDIRAT = 258, SYS_STATAT = 262, SYS_UNLINKAT = 263, SYS_RENAMEAT = 264,
     SYS_SYMLINKAT = 266, SYS_READLINKAT = 267,
     AT_FDCWD = -100, AT_SYMLINK_NOFOLLOW = 0x100, O_RDONLY = 0, O_RDWR = 2,
@@ -25,6 +26,14 @@ struct file_stat {
     long size;
     word remaining[11];
 };
+
+struct filesystem_info {
+    word type, block_size, blocks, free_blocks, available_blocks, inodes, free_inodes;
+    unsigned fsid[2];
+    word name_max, fragment_size, flags, reserved[4];
+};
+
+_Static_assert(sizeof(struct filesystem_info) == 120, "Linux x86-64 statfs ABI");
 
 struct directory_entry {
     word inode, offset;
@@ -497,6 +506,38 @@ static int write_profile(long parent) {
     return 0;
 }
 
+static int check_filesystem_space(long parent) {
+    static const char profile[] = "/profile/owned";
+    static const char probe[] = "statfs-probe";
+    static const char data[512] = "statfs";
+    struct filesystem_info before, allocated, after, ram;
+    if (call(SYS_STATFS, (word)profile, (word)&before, 0, 0) ||
+        call(SYS_FSTATFS, parent, (word)&after, 0, 0) ||
+        !same_bytes(&before, &after, sizeof(before)) ||
+        before.type != 0x5346594d || before.block_size != sizeof(data) ||
+        before.fragment_size != sizeof(data) || before.name_max != 255 ||
+        !before.blocks || before.blocks < before.free_blocks ||
+        before.free_blocks != before.available_blocks ||
+        !before.inodes || before.inodes < before.free_inodes ||
+        !(before.flags & 0x20) || (before.flags & 1)) return 71;
+    if (call(SYS_STATFS, (word)"/tmp", (word)&ram, 0, 0) ||
+        ram.type != 0x01021994 || ram.fragment_size != PAGE_BYTES ||
+        !ram.blocks || !ram.free_blocks || ram.blocks < ram.free_blocks ||
+        !ram.inodes || ram.inodes < ram.free_inodes ||
+        call(SYS_STATFS, (word)"/profile/owned/statfs-missing", (word)&after, 0, 0) != -ENOENT ||
+        call(SYS_STATFS, (word)profile, 1, 0, 0) != -14 ||
+        call(SYS_FSTATFS, -1, (word)&after, 0, 0) != -9) return 72;
+    long fd = open_at(parent, probe, O_CREAT | O_EXCL | O_RDWR, 0600);
+    if (fd < 0 || call(SYS_WRITE, fd, (word)data, sizeof(data), 0) != sizeof(data) ||
+        call(SYS_FSTATFS, fd, (word)&allocated, 0, 0) ||
+        allocated.blocks != before.blocks || allocated.free_blocks >= before.free_blocks ||
+        allocated.free_inodes + 1 != before.free_inodes || close_fd(fd) ||
+        call(SYS_UNLINKAT, parent, (word)probe, 0, 0) ||
+        call(SYS_FSTATFS, parent, (word)&after, 0, 0) ||
+        !same_bytes(&before, &after, sizeof(before))) return 73;
+    return 0;
+}
+
 void _start(void) {
     int status = 1;
     char phase;
@@ -506,6 +547,7 @@ void _start(void) {
         long parent = open_at(AT_FDCWD, "/profile/owned", O_RDONLY | O_DIRECTORY, 0);
         prepare_long_target();
         status = parent < 0 ? 2 : check_permissions(parent);
+        if (!status) status = check_filesystem_space(parent);
         if (!status && phase == '1') status = write_profile(parent);
         if (!status) status = verify_profile(parent);
         if (!status) status = check_deep_path(parent, phase == '1');
