@@ -99,7 +99,7 @@ static bool load_layout(struct elf_image *elf, const struct linux64_file *file,
                         bool interpreter, uptr stack_guard, u64 *mapped) {
     const struct elf_header *e = (const void *)file->bytes;
     uptr size = file->size;
-    if (!valid_header(e, size)) return false;
+    if (!e || !valid_header(e, size)) return false;
     const struct elf_segment *segments = (const void *)(file->bytes + e->phoff);
     u64 bias = e->type == ET_DYN ? (interpreter ? INTERP_BIAS : PROGRAM_BIAS) : 0;
     *elf = (struct elf_image){.header = e, .segments = segments, .bias = bias,

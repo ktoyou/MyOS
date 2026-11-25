@@ -56,7 +56,8 @@ static struct memfd {
     uptr size;
     u64 inode;
     u32 seals;
-    unsigned handles;
+    unsigned references;
+    bool linked;
 } memfds[OPEN_FILE_COUNT];
 static u64 next_memfd_inode = 1;
 static u64 next_special_inode = 1;
@@ -297,6 +298,29 @@ static void memfd_trim(struct memfd *memfd, uptr first, uptr end) {
     }
 }
 
+static void release_backing(struct memfd *backing) {
+    if (--backing->references) return;
+    memfd_trim(backing, 0, memfd_page_count(backing->size));
+    backing->size = 0;
+}
+
+struct memfd *linux64_tmp_alloc(void) {
+    for (unsigned i = 0; i < OPEN_FILE_COUNT; ++i) {
+        struct memfd *backing = &memfds[i];
+        if (backing->references) continue;
+        backing->references = 1;
+        backing->linked = true;
+        backing->seals = 0;
+        return backing;
+    }
+    return NULL;
+}
+
+void linux64_tmp_unlink(struct memfd *backing) {
+    backing->linked = false;
+    release_backing(backing);
+}
+
 static void epoll_remove(struct file_handle *epoll, struct epoll_watch **link) {
     struct epoll_watch *watch = *link;
     *link = watch->next;
@@ -328,10 +352,7 @@ static void destroy_file(struct file_handle *file) {
     linux64_pidns_release(file->proc_pid_ns);
     if (file->directory_path) pmm64_free(file->directory_path);
     struct memfd *memfd = file->memfd;
-    if (memfd && !--memfd->handles) {
-        memfd_trim(memfd, 0, memfd_page_count(memfd->size));
-        memfd->size = 0;
-    }
+    if (memfd) release_backing(memfd);
     *file = (struct file_handle){0};
 }
 
@@ -542,11 +563,12 @@ static bool open_file(i32 fd) {
 long linux64_get_file(i32 fd, struct linux64_fd_view *view) {
     if (!open_file(fd)) return -EBADF;
     if (kind_of(file_at(fd)) != FILE_REGULAR) return -ENODEV;
+    if ((file_at(fd)->flags & O_ACCMODE) == O_WRONLY) return -EACCES;
     const struct memfd *memfd = file_at(fd)->memfd;
     *view = (struct linux64_fd_view){.file = file_at(fd)->file};
     if (memfd) {
         view->file.size = memfd->size;
-        view->file.inode = memfd->inode;
+        if (!view->file.backing) view->file.inode = memfd->inode;
         view->object = memfd;
         view->frame = memfd_frame;
         view->writable = (file_at(fd)->flags & O_ACCMODE) == O_RDWR;
@@ -771,7 +793,7 @@ static long new_handle(const struct linux64_file *file, struct memfd *memfd, u32
         *description = (struct file_handle){.memfd = memfd, .flags = flags & ~O_CLOEXEC,
                                             .references = 1};
         if (file) description->file = *file;
-        if (memfd) ++memfd->handles;
+        if (memfd) ++memfd->references;
         linux64_current->process->fds[fd] = (struct linux64_fd_slot){description, (flags & O_CLOEXEC) != 0};
         return fd;
     }
@@ -1050,7 +1072,7 @@ static long memfd_create(uptr name_address, u32 flags) {
     if (free_fd(0) == FD_COUNT) return -EMFILE;
     for (unsigned i = 0; i < OPEN_FILE_COUNT; ++i) {
         struct memfd *memfd = &memfds[i];
-        if (memfd->handles) continue;
+        if (memfd->references) continue;
         result = new_handle(NULL, memfd, O_RDWR | O_LARGEFILE |
                              (flags & MFD_CLOEXEC ? O_CLOEXEC : 0));
         if (result < 0) return result;
@@ -1084,11 +1106,7 @@ static bool memfd_grow(struct memfd *memfd, uptr first, uptr end) {
     return false;
 }
 
-static long linux_ftruncate(i32 fd, uptr size) {
-    if ((long)size < 0) return -EINVAL;
-    if (!open_file(fd)) return -EBADF;
-    struct memfd *memfd = file_at(fd)->memfd;
-    if (!memfd || (file_at(fd)->flags & O_ACCMODE) != O_RDWR) return -EINVAL;
+static long resize_backing(struct memfd *memfd, uptr size) {
     uptr old_size = memfd->size;
     if (size == old_size) return 0;
     if (memfd->seals & (size < old_size ? F_SEAL_SHRINK : F_SEAL_GROW)) return -EPERM;
@@ -1109,6 +1127,14 @@ static long linux_ftruncate(i32 fd, uptr size) {
     return 0;
 }
 
+static long linux_ftruncate(i32 fd, uptr size) {
+    if ((long)size < 0) return -EINVAL;
+    if (!open_file(fd)) return -EBADF;
+    const struct file_handle *handle = file_at(fd);
+    if (!handle->memfd || !(handle->flags & O_ACCMODE)) return -EINVAL;
+    return resize_backing(handle->memfd, size);
+}
+
 static long linux_fcntl(i32 fd, i32 command, u32 value) {
     if (!open_file(fd)) return -EBADF;
     if (command == F_DUPFD || command == F_DUPFD_CLOEXEC)
@@ -1120,7 +1146,8 @@ static long linux_fcntl(i32 fd, i32 command, u32 value) {
         return 0;
     }
     if (command == F_GETFL) return file_at(fd)->flags;
-    if (command == F_SETFL && (file_at(fd)->socket || file_at(fd)->device == FILE_EVENTFD)) {
+    if (command == F_SETFL && (file_at(fd)->socket || file_at(fd)->device == FILE_EVENTFD ||
+                              file_at(fd)->file.backing)) {
         if (value & O_DIRECT) return -EINVAL;
         const u32 mask = O_APPEND | O_NONBLOCK;
         file_at(fd)->flags = (file_at(fd)->flags & ~mask) | (value & mask);
@@ -1131,7 +1158,7 @@ static long linux_fcntl(i32 fd, i32 command, u32 value) {
         file_at(fd)->flags = (file_at(fd)->flags & ~O_NONBLOCK) | (value & O_NONBLOCK);
         return 0;
     }
-    if (!memfd) return -EINVAL;
+    if (!memfd || file_at(fd)->file.backing) return -EINVAL;
     if (command == F_GET_SEALS) return memfd->seals;
     if (command != F_ADD_SEALS) return -EINVAL;
     if ((file_at(fd)->flags & O_ACCMODE) != O_RDWR) return -EPERM;
@@ -1148,7 +1175,7 @@ static void handle_stat(const struct file_handle *handle, struct linux64_file *f
     *file = handle->file;
     if (*memfd) {
         file->size = (*memfd)->size;
-        file->inode = (*memfd)->inode;
+        if (!file->backing) file->inode = (*memfd)->inode;
     }
 }
 
@@ -1256,7 +1283,33 @@ static long linux_readlink(i32 dirfd, uptr path_address, uptr destination, i32 s
     return paging64_copy_to_user(destination, target, length) == length ? (long)length : -EFAULT;
 }
 
-static long linux_open(i32 dirfd, uptr address, u32 flags) {
+static u32 regular_status_flags(u32 flags) {
+    return (flags & (O_ACCMODE | O_APPEND | O_NONBLOCK | O_CLOEXEC)) | O_LARGEFILE;
+}
+
+static bool named_open_flags(u32 flags) {
+    return !(flags & ~(O_ACCMODE | O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC | O_APPEND |
+                       O_NONBLOCK | O_LARGEFILE | O_NOFOLLOW | O_CLOEXEC));
+}
+
+static long open_named(const struct linux64_file *file, u32 flags) {
+    if (flags & O_DIRECTORY) return -ENOTDIR;
+    if (!named_open_flags(flags)) return -EINVAL;
+    u32 access = flags & O_ACCMODE;
+    u32 needed = (access != O_WRONLY ? 4u : 0) | (access || (flags & O_TRUNC) ? 2u : 0);
+    if (needed & ~linux64_file_permissions(file)) return -EACCES;
+    long fd = new_handle(file, file->backing, regular_status_flags(flags));
+    if (fd >= 0 && (flags & O_TRUNC)) {
+        long result = resize_backing(file->backing, 0);
+        if (result) {
+            close_file((i32)fd);
+            return result;
+        }
+    }
+    return fd;
+}
+
+static long linux_open(i32 dirfd, uptr address, u32 flags, u32 mode) {
     if ((flags & O_ACCMODE) == O_ACCMODE) return -EINVAL;
     char path[LINUX64_PATH_LIMIT];
     long result = user_path(address, path);
@@ -1267,11 +1320,25 @@ static long linux_open(i32 dirfd, uptr address, u32 flags) {
     if (result) return result;
     struct linux64_file file;
     bool exclusive = (flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL);
-    result = linux64_vfs_walk(&base, path, &file, path, !(flags & O_NOFOLLOW) && !exclusive);
-    if (result) {
-        if (result == -ENOENT && (flags & (O_ACCMODE | O_CREAT | O_TRUNC))) return -EROFS;
-        return result;
+    bool follow = !(flags & O_NOFOLLOW) && !exclusive;
+    result = linux64_vfs_walk(&base, path, &file, path, follow);
+    if (result == -ENOENT && (flags & O_CREAT)) {
+        if (!named_open_flags(flags)) return -EINVAL;
+        long fd = new_handle(NULL, NULL, regular_status_flags(flags));
+        if (fd < 0) return fd;
+        mode &= 0777u & ~linux64_current->process->fs->umask;
+        result = linux64_vfs_create_file(&base, path, mode, follow, &file);
+        if (result) {
+            close_file((i32)fd);
+            return result;
+        }
+        struct file_handle *handle = file_at((i32)fd);
+        handle->file = file;
+        handle->memfd = file.backing;
+        ++file.backing->references;
+        return fd;
     }
+    if (result) return result;
     const char *absolute = path;
     u32 type = file.mode & LINUX64_S_IFMT;
     if (file.proc_fd_owner && file.proc_fd_number >= 0) {
@@ -1281,6 +1348,7 @@ static long linux_open(i32 dirfd, uptr address, u32 flags) {
         const struct file_handle *target = file_at(file.proc_fd_number);
         if ((flags & O_DIRECTORY) && !file.proc_fd_directory) return -ENOTDIR;
         if (!target->memfd) return -ENOSYS;
+        if (target->file.backing) return open_named(&target->file, flags);
         if (flags & ~(O_CLOEXEC | O_LARGEFILE | O_NONBLOCK)) return -EINVAL;
         return new_handle(NULL, target->memfd, flags | O_LARGEFILE);
     }
@@ -1292,6 +1360,7 @@ static long linux_open(i32 dirfd, uptr address, u32 flags) {
         if (flags & O_DIRECTORY) return -ENOTDIR;
         return exclusive ? -EEXIST : -ENXIO;
     }
+    if (file.backing) return exclusive ? -EEXIST : open_named(&file, flags);
     enum file_kind device = device_node(absolute, &file);
     if (device) {
         if (flags & O_DIRECTORY) return -ENOTDIR;
@@ -1380,7 +1449,9 @@ static long linux_open(i32 dirfd, uptr address, u32 flags) {
         file_at((i32)result)->directory_path = physical;
         return result;
     }
-    if (flags & (O_ACCMODE | O_CREAT | O_TRUNC)) return -EROFS;
+    if (exclusive) return -EEXIST;
+    if (flags & (O_ACCMODE | O_TRUNC)) return -EROFS;
+    flags &= ~(O_CREAT | O_EXCL);
     if (flags & ~(O_NONBLOCK | O_LARGEFILE | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC))
         return -EINVAL;
     if (flags & O_DIRECTORY) return -ENOTDIR;
@@ -1514,10 +1585,12 @@ static long linux_read(i32 fd, uptr buffer, uptr count, uptr offset, bool positi
         if (!positioned && copied > 0) handle->offset += (uptr)copied;
         return copied;
     }
+    if ((handle->flags & O_ACCMODE) == O_WRONLY) return -EBADF;
     if ((long)offset < 0) return -EINVAL;
     if (buffer >= X64_USER_TOP || count > X64_USER_TOP - buffer) return -EFAULT;
     struct linux64_fd_view view;
-    linux64_get_file(fd, &view);
+    long result = linux64_get_file(fd, &view);
+    if (result) return result;
     if (!count || offset >= view.file.size) return 0;
     if (count > 0x7ffff000u) count = 0x7ffff000u;
     if (count > view.file.size - offset) count = view.file.size - offset;
@@ -1537,6 +1610,48 @@ static long linux_read(i32 fd, uptr buffer, uptr count, uptr offset, bool positi
     }
     if (!copied) return -EFAULT;
     if (!positioned) file_at(fd)->offset += copied;
+    return (long)copied;
+}
+
+static long named_write(struct file_handle *handle, uptr buffer, uptr count,
+                        uptr position, bool positioned) {
+    if (!(handle->flags & O_ACCMODE)) return -EBADF;
+    if (!count) return 0;
+    if (buffer >= X64_USER_TOP || count > X64_USER_TOP - buffer) return -EFAULT;
+    struct memfd *backing = handle->file.backing;
+    uptr offset = handle->flags & O_APPEND ? backing->size : positioned ? position : handle->offset;
+    const uptr limit = (uptr)MEMFD_CHUNKS * FRAMES_PER_CHUNK * PMM_PAGE_SIZE;
+    if (offset >= limit) return -EFBIG;
+    if (count > limit - offset) count = limit - offset;
+    uptr old_pages = memfd_page_count(backing->size);
+    uptr wanted_pages = memfd_page_count(offset + count);
+    if (wanted_pages > old_pages && !memfd_grow(backing, old_pages, wanted_pages)) return -ENOMEM;
+    uptr copied = 0;
+    while (copied < count) {
+        uptr current = offset + copied;
+        uptr within = current % PMM_PAGE_SIZE;
+        uptr chunk = PMM_PAGE_SIZE - within;
+        if (chunk > count - copied) chunk = count - copied;
+        u8 *page = pmm64_pointer(memfd_frame(backing, current));
+        uptr done = paging64_copy_from_user(page + within, buffer + copied, chunk);
+        copied += done;
+        if (done < chunk) break;
+    }
+    if (copied && offset + copied > backing->size) {
+        /* Отображение последней страницы могло записать байты за старым EOF. */
+        if (offset > backing->size && backing->size % PMM_PAGE_SIZE) {
+            uptr gap_end = old_pages * PMM_PAGE_SIZE;
+            if (gap_end > offset) gap_end = offset;
+            u8 *page = pmm64_pointer(memfd_frame(backing, backing->size));
+            uptr base = (old_pages - 1) * PMM_PAGE_SIZE;
+            for (uptr i = backing->size; i < gap_end; ++i) page[i - base] = 0;
+        }
+        backing->size = offset + copied;
+    }
+    uptr used_pages = memfd_page_count(backing->size);
+    if (wanted_pages > used_pages) memfd_trim(backing, used_pages, wanted_pages);
+    if (!copied) return -EFAULT;
+    if (!positioned) handle->offset = offset + copied;
     return (long)copied;
 }
 
@@ -1587,6 +1702,10 @@ static long file_stat(const struct linux64_file *file, const struct memfd *memfd
     } else if (kind == FILE_SYMLINK || kind == FILE_NAMED_SOCKET) {
         mode = file->mode;
         device = 9;
+    } else if (file->backing) {
+        mode = file->mode;
+        device = 9;
+        links = file->backing->linked;
     } else if (memfd) {
         mode = memfd->seals & F_SEAL_EXEC ? 0100666 : 0100777;
         device = 2;
@@ -1595,13 +1714,14 @@ static long file_stat(const struct linux64_file *file, const struct memfd *memfd
     bool owned = kind == FILE_SOCKET || kind == FILE_PIPE || kind == FILE_PROC_MAP ||
                  kind == FILE_PROC_LINK || memfd;
     bool named = kind == FILE_DIRECTORY || kind == FILE_SYMLINK || kind == FILE_NAMED_SOCKET ||
-                 kind == FILE_FRAMEBUFFER;
+                 kind == FILE_FRAMEBUFFER || file->backing;
+    uptr size = file->backing ? file->backing->size : file->size;
     const struct linux_stat stat = {
         .dev = device, .ino = file->inode, .nlink = links, .mode = mode,
         .uid = linux64_visible_id(ns, false, named ? file->uid : owned ? LINUX64_UID : 0),
         .gid = linux64_visible_id(ns, true, named ? file->gid : owned ? LINUX64_GID : 0),
-        .rdev = rdev, .size = file->size, .blksize = PMM_PAGE_SIZE,
-        .blocks = kind == FILE_SYMLINK ? 0 : (file->size + 511) / 512,
+        .rdev = rdev, .size = size, .blksize = PMM_PAGE_SIZE,
+        .blocks = kind == FILE_SYMLINK ? 0 : (size + 511) / 512,
     };
     return paging64_copy_to_user(stat_address, &stat, sizeof(stat)) == sizeof(stat) ? 0 : -EFAULT;
 }
@@ -1708,6 +1828,7 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
         return linux_read(fd, arg1, arg2, 0, false);
     case 1: /* write */
         if (!open_file(fd)) return -EBADF;
+        if (file_at(fd)->file.backing) return named_write(file_at(fd), arg1, arg2, 0, false);
         if (file_at(fd)->serial) return serial_write(arg1, arg2);
         if (file_at(fd)->device == FILE_FRAMEBUFFER)
             return framebuffer_io(file_at(fd), true, arg1, arg2, 0, false);
@@ -1727,7 +1848,7 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
         if (!file_at(fd)->pipe || (file_at(fd)->flags & O_ACCMODE) != O_WRONLY) return -EBADF;
         return pipe_io(file_at(fd), true, arg1, arg2);
     case 2: /* open */
-        return linux_open(AT_FDCWD, arg0, (u32)arg1);
+        return linux_open(AT_FDCWD, arg0, (u32)arg1, (u32)arg2);
     case 3: /* close */
         if (!open_file(fd)) return -EBADF;
         close_file(fd);
@@ -1742,6 +1863,16 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
         return file_stat(&file, memfd, kind_of(file_at(fd)), arg1);
     case 8: /* lseek */
         if (!open_file(fd)) return -EBADF;
+        if (file_at(fd)->file.backing) {
+            struct file_handle *handle = file_at(fd);
+            long offset = (long)arg1;
+            u32 whence = (u32)arg2;
+            if (whence > 2) return -EINVAL;
+            uptr base = whence == 2 ? handle->file.backing->size : whence == 1 ? handle->offset : 0;
+            if (__builtin_add_overflow((long)base, offset, &offset) || offset < 0) return -EINVAL;
+            handle->offset = (uptr)offset;
+            return offset;
+        }
         if (file_at(fd)->device == FILE_FRAMEBUFFER) {
             long offset = (long)arg1;
             u32 whence = (u32)arg2;
@@ -1771,6 +1902,7 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
     case 18: /* pwrite64 */
         if ((long)arg3 < 0) return -EINVAL;
         if (!open_file(fd)) return -EBADF;
+        if (file_at(fd)->file.backing) return named_write(file_at(fd), arg1, arg2, arg3, true);
         if (file_at(fd)->device == FILE_FRAMEBUFFER)
             return framebuffer_io(file_at(fd), true, arg1, arg2, arg3, true);
         if (file_at(fd)->serial || file_at(fd)->socket ||
@@ -1781,6 +1913,7 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
         result = lookup(AT_FDCWD, arg0, 0, &file, &memfd, &kind);
         if (result) return result;
         if (kind == FILE_NULL || kind == FILE_URANDOM) return (arg1 & 1u) ? -EACCES : 0;
+        if (file.backing) return (arg1 & ~linux64_file_permissions(&file)) ? -EACCES : 0;
         if (kind == FILE_FRAMEBUFFER) return (arg1 & ~linux64_file_permissions(&file)) ? -EACCES : 0;
         if (kind == FILE_NAMESPACE) {
             if (arg1 & 1u) return -EACCES;
@@ -1852,7 +1985,7 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
     case 217: /* getdents64 */
         return linux_getdents64(fd, arg1, (u32)arg2);
     case 257: /* openat */
-        return linux_open(fd, arg1, (u32)arg2);
+        return linux_open(fd, arg1, (u32)arg2, (u32)arg3);
     case 258: /* mkdirat */
         return linux_mkdir(fd, arg1, (u32)arg2);
     case 262: /* newfstatat */

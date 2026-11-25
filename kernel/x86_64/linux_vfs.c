@@ -7,7 +7,7 @@ enum {
     NAME_LIMIT = 255, LINK_LIMIT = 40, TEMP_NODES = 256,
 };
 
-enum walk_action { WALK_FOLLOW, WALK_NOFOLLOW, WALK_CREATE, WALK_UNLINK };
+enum walk_action { WALK_FOLLOW, WALK_NOFOLLOW, WALK_CREATE, WALK_CREATE_FOLLOW, WALK_UNLINK };
 
 struct temporary_node {
     const char *path;
@@ -205,6 +205,14 @@ static long create_node(const char *path, uptr length, struct linux64_file file,
         for (uptr i = 0; i <= file.size; ++i) target[i] = file.bytes[i];
         file.bytes = target;
     }
+    if ((file.mode & LINUX64_S_IFMT) == LINUX64_S_IFREG) {
+        file.backing = linux64_tmp_alloc();
+        if (!file.backing) {
+            if (target_page) pmm64_free(target_page);
+            pmm64_free(name_page);
+            return -ENOSPC;
+        }
+    }
     char *name = pmm64_pointer(name_page);
     for (uptr i = 0; i <= length; ++i) name[i] = path[i];
     file.inode = next_inode++;
@@ -226,6 +234,7 @@ static long unlink_node(const struct linux64_file *parent, const struct linux64_
         return -EPERM;
     struct temporary_node *node = temporary_node(path);
     if (!node) return -EROFS;
+    if (node->file.backing) linux64_tmp_unlink(node->file.backing);
     if (node->target_page) pmm64_free(node->target_page);
     pmm64_free(node->name_page);
     *node = (struct temporary_node){0};
@@ -246,6 +255,7 @@ static long walk(const struct linux64_directory *base, const char *input,
     const struct linux64_directory *root = &fs->root;
     const struct linux64_file_source *source = linux64_file_source();
     const char *absolute = input;
+    bool creating = action == WALK_CREATE || action == WALK_CREATE_FOLLOW;
     char path[LINUX64_PATH_LIMIT];
     uptr length = start_at(path, *input == '/' ? root : base ? base : &fs->cwd, file);
     /* Обход не уступает CPU, поэтому указатели на цели действуют до его конца. */
@@ -298,13 +308,14 @@ static long walk(const struct linux64_directory *base, const char *input,
             found = !file->private_directory && find_node(source, path, &child);
         }
         if (!found) {
-            if (!final || action != WALK_CREATE ||
+            if (!final || !creating ||
                 (trailing && (create->mode & LINUX64_S_IFMT) != LINUX64_S_IFDIR)) return -ENOENT;
             if (!file->writable_directory) return -EROFS;
             if (!(linux64_file_permissions(file) & 2u)) return -EACCES;
             return create_node(path, length, *create, file);
         }
-        if (final && action == WALK_CREATE) return -EEXIST;
+        if (final && creating && (action == WALK_CREATE || (child.mode & LINUX64_S_IFMT) != LINUX64_S_IFLNK))
+            return -EEXIST;
         if (final && action == WALK_UNLINK) return unlink_node(file, &child, path, trailing);
         if (child.proc_fd_owner && child.proc_fd_number >= 0) {
             /* Ссылка ведёт к объекту дескриптора, а не к текстовому пути. */
@@ -315,7 +326,7 @@ static long walk(const struct linux64_directory *base, const char *input,
             continue;
         }
         u32 type = child.mode & LINUX64_S_IFMT;
-        if (type == LINUX64_S_IFLNK && (trailing || action == WALK_FOLLOW)) {
+        if (type == LINUX64_S_IFLNK && (trailing || action == WALK_FOLLOW || action == WALK_CREATE_FOLLOW)) {
             if (++links > LINK_LIMIT) return -ELOOP;
             /* Пустой хвост сохраняет завершающий '/', который требует каталог. */
             if (trailing) suffixes[depth++] = absolute;
@@ -331,7 +342,7 @@ static long walk(const struct linux64_directory *base, const char *input,
         if (trailing && type != LINUX64_S_IFDIR) return -ENOTDIR;
         *file = child;
     }
-    if (action == WALK_CREATE) return -EEXIST;
+    if (creating) return -EEXIST;
     if (action == WALK_UNLINK) return -EISDIR;
     if (resolved)
         for (uptr i = 0; i <= length; ++i) resolved[i] = path[i];
@@ -347,6 +358,12 @@ long linux64_vfs_mkdir(const struct linux64_directory *base, const char *path, u
     const struct linux64_file node = {.mode = mode, .writable_directory = true};
     struct linux64_file file;
     return walk(base, path, &file, NULL, WALK_CREATE, &node);
+}
+
+long linux64_vfs_create_file(const struct linux64_directory *base, const char *path,
+                             u32 mode, bool follow_final, struct linux64_file *file) {
+    const struct linux64_file node = {.mode = LINUX64_S_IFREG | mode};
+    return walk(base, path, file, NULL, follow_final ? WALK_CREATE_FOLLOW : WALK_CREATE, &node);
 }
 
 long linux64_vfs_symlink(const struct linux64_directory *base, const char *path,
