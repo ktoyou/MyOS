@@ -924,7 +924,7 @@ static void surface_commit(struct wl_client *client, struct wl_resource *resourc
                 wl_client_post_no_memory(client);
                 return;
             }
-            if (surface->toplevel) {
+            if (surface->toplevel && (!surface->mapped || !server->visible)) {
                 server->visible = surface;
                 wayland_seat_keyboard_focus(server->seat, resource);
             }

@@ -7,7 +7,9 @@
 struct wayland_keyboard;
 
 bool wayland_keyboard_init(struct wayland_keyboard **result, struct wl_display *display,
-                           const char *keymap_path, void (*changed)(void *), void *data);
+                           const char *keymap_path, void (*changed)(void *),
+                           void (*focused)(void *, struct wl_client *),
+                           void (*pressed)(void *, struct wl_client *, uint32_t), void *data);
 bool wayland_keyboard_available(const struct wayland_keyboard *keyboard);
 void wayland_keyboard_bind(struct wayland_keyboard *keyboard, struct wl_client *client, int version, uint32_t id);
 void wayland_keyboard_focus(struct wayland_keyboard *keyboard, struct wl_resource *surface);

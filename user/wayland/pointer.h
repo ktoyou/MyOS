@@ -17,7 +17,8 @@ struct wayland_pointer_ops {
 
 bool wayland_pointer_init(struct wayland_pointer **result, struct wl_display *display, int width, int height,
                           const struct wayland_pointer_ops *ops, void *data,
-                          void (*changed)(void *), void *changed_data);
+                          void (*changed)(void *), void (*pressed)(void *, struct wl_client *, uint32_t),
+                          void *changed_data);
 bool wayland_pointer_available(const struct wayland_pointer *pointer);
 void wayland_pointer_bind(struct wayland_pointer *pointer, struct wl_client *client, int version, uint32_t id);
 void wayland_pointer_update(struct wayland_pointer *pointer);

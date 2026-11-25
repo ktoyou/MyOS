@@ -22,6 +22,7 @@ struct wayland_pointer {
     const struct wayland_pointer_ops *ops;
     void *data;
     void (*changed)(void *);
+    void (*pressed)(void *, struct wl_client *, uint32_t);
     void *changed_data;
     int fd, width, height, x, y;
     int32_t hotspot_x, hotspot_y;
@@ -224,6 +225,9 @@ static void report(struct wayland_pointer *pointer, uint32_t time) {
             send_frame(resource);
             pointer->delivered |= pressed;
         }
+        for (unsigned i = 0; i < BUTTON_COUNT; ++i)
+            if (pointer->delivered & pressed & (1u << i))
+                pointer->pressed(pointer->changed_data, wl_resource_get_client(pointer->focus), serials[i]);
         pointer->delivered &= ~released;
     }
     update_focus(pointer);
@@ -297,7 +301,8 @@ bool wayland_pointer_available(const struct wayland_pointer *pointer) {
 
 bool wayland_pointer_init(struct wayland_pointer **result, struct wl_display *display, int width, int height,
                           const struct wayland_pointer_ops *ops, void *data,
-                          void (*changed)(void *), void *changed_data) {
+                          void (*changed)(void *), void (*pressed)(void *, struct wl_client *, uint32_t),
+                          void *changed_data) {
     int fd = open("/dev/input/event1", O_RDONLY | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0) {
         if (errno == ENOENT || errno == ENODEV) return true;
@@ -313,6 +318,7 @@ bool wayland_pointer_init(struct wayland_pointer **result, struct wl_display *di
     pointer->ops = ops;
     pointer->data = data;
     pointer->changed = changed;
+    pointer->pressed = pressed;
     pointer->changed_data = changed_data;
     pointer->fd = fd;
     pointer->width = width;
