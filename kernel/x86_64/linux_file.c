@@ -9,7 +9,7 @@
 #define NS_PER_SECOND 1000000000ul
 
 enum {
-    EPERM = 1, ENOENT = 2, EIO = 5, EBADF = 9, EAGAIN = 11, ENOMEM = 12, EACCES = 13, EFAULT = 14,
+    EPERM = 1, ENOENT = 2, EINTR = 4, EIO = 5, EBADF = 9, EAGAIN = 11, ENOMEM = 12, EACCES = 13, EFAULT = 14,
     EBUSY = 16, EEXIST = 17, ENOTDIR = 20, EISDIR = 21, EINVAL = 22, ENFILE = 23, EMFILE = 24,
     ENOTTY = 25, EFBIG = 27, EROFS = 30, ERANGE = 34, ENOLCK = 37, EOVERFLOW = 75,
     ENODEV = 19, ENXIO = 6, ESPIPE = 29, ENAMETOOLONG = 36, ENOSYS = 38, ELOOP = 40, ENOTSOCK = 88,
@@ -269,7 +269,7 @@ bool linux64_poll_ready(struct linux64_task *task) {
         entry->revents = poll_fd(task->process, entry->fd, entry->events, &poll->input);
         if (entry->revents) ++poll->ready;
     }
-    if (poll->ready) return true;
+    if (poll->ready || linux64_sigchld_pending(task)) return true;
     u64 nanos;
     return poll->deadline && linux64_monotonic_ns(&nanos) && nanos >= poll->deadline;
 }
@@ -294,7 +294,7 @@ static void poll_remaining(const struct linux64_poll_timeout *end) {
 }
 
 long linux64_poll_resume(struct linux64_task *task) {
-    const struct linux64_poll_wait *poll = &task->poll;
+    struct linux64_poll_wait *poll = &task->poll;
     long result = poll->ready;
     for (unsigned i = 0; i < poll->count; ++i) {
         uptr field = poll->address + i * sizeof(poll->entries[0]) +
@@ -304,9 +304,11 @@ long linux64_poll_resume(struct linux64_task *task) {
             break;
         }
     }
-    task->signal_mask = poll->saved_mask;
+    poll->interrupted = !result && linux64_sigchld_pending(task);
+    /* При EINTR обработчик получает временную маску, sigreturn восстановит прежнюю. */
+    if (!poll->interrupted) task->signal_mask = poll->saved_mask;
     poll_remaining(&poll->timeout);
-    return result;
+    return poll->interrupted ? -EINTR : result;
 }
 
 static long poll_wait(uptr address, u32 count, u64 deadline, bool immediate,
@@ -328,6 +330,7 @@ static long poll_wait(uptr address, u32 count, u64 deadline, bool immediate,
     poll->deadline = deadline;
     poll->timeout = timeout ? *timeout : (struct linux64_poll_timeout){0};
     poll->saved_mask = task->signal_mask;
+    poll->interrupted = false;
     if (mask) task->signal_mask = *mask;
     if (linux64_poll_ready(task) || immediate) return linux64_poll_resume(task);
     task->state = TASK_POLL_WAIT;

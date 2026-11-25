@@ -7,6 +7,8 @@
 #define LINUX64_PROCESS_COUNT 64u
 #define LINUX64_RESERVE_COUNT 256u
 #define LINUX64_SIGNAL_COUNT 64u
+#define LINUX64_SIGCHLD 17u
+#define LINUX64_SIGCHLD_MASK (1ull << (LINUX64_SIGCHLD - 1))
 #define LINUX64_XSTATE_SIZE 16384u
 #define LINUX64_FS_BASE 0xc0000100u
 #define LINUX64_GS_BASE 0xc0000101u
@@ -135,9 +137,26 @@ struct linux64_fs {
     u32 umask;
 };
 
+struct linux64_child_signal {
+    i32 pid;
+    u32 uid;
+    i32 status, code;
+};
+
+struct linux64_siginfo {
+    i32 signal, error, code;
+    u32 padding;
+    union {
+        struct { uptr address; i32 number; u32 arch; } syscall;
+        struct { i32 pid; u32 uid; i32 status; } child;
+        u8 storage[112];
+    };
+};
+
 struct linux64_process {
     struct linux64_fd_slot fds[LINUX64_FD_COUNT];
     struct linux64_sigaction actions[LINUX64_SIGNAL_COUNT];
+    struct linux64_child_signal child_signal;
     struct linux64_rlimit data_limit;
     char executable_path[LINUX64_PATH_LIMIT];
     uptr executable_path_length;
@@ -175,11 +194,11 @@ struct linux64_poll_wait {
     uptr address;
     u64 deadline, saved_mask;
     unsigned count, ready;
-    bool input;
+    bool input, interrupted;
 };
 
 struct linux64_seccomp_filter;
-struct linux64_sigsys_state;
+struct linux64_signal_state;
 
 struct linux64_task {
     struct linux64_frame frame;
@@ -202,8 +221,8 @@ struct linux64_task {
     u16 ds_selector, es_selector, fs_selector, gs_selector;
     enum linux64_task_state state;
     struct linux64_seccomp_filter *seccomp;
-    struct linux64_sigsys_state *sigsys;
-    bool finish_wait, no_new_privs;
+    struct linux64_signal_state *signal_state;
+    bool finish_wait, no_new_privs, signal_frame_ready;
     uptr xstate_physical;
 };
 
@@ -253,7 +272,9 @@ bool linux64_task_cpu_ns(u64 *nanos);
 const struct linux64_process *linux64_process_by_pid(i32 pid);
 u16 linux64_task_count(void);
 void linux64_task_syscall(struct linux64_frame *frame);
-bool linux64_deliver_seccomp_sigsys(struct linux64_frame *frame, u16 trap, u32 arch, uptr *user_frame);
+bool linux64_build_signal_frame(struct linux64_frame *frame, const struct linux64_siginfo *info,
+                                u64 return_mask, uptr *user_frame);
+bool linux64_sigchld_pending(const struct linux64_task *task);
 bool linux64_rt_sigreturn(struct linux64_frame *frame, uptr user_frame);
 void linux64_file_retain(struct file_handle *file);
 void linux64_file_release(struct file_handle *file);

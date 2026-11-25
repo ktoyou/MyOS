@@ -288,6 +288,16 @@ def check_poll(build):
     print('OVMF: Linux poll, ppoll, eventfd and epoll readiness and blocking wakeup: PASS', flush=True)
 
 
+def check_sigchld(build):
+    probe = (build / 'linux-sigchld.elf').resolve()
+    marker = 'Linux ELF64 SIGCHLD and ppoll probe'
+    host = subprocess.run([str(probe)], env={}, capture_output=True, timeout=15)
+    assert (host.returncode, host.stdout, host.stderr) == (0, (marker + '\n').encode(), b''), host
+    serial = check_guest('sigchld', probe.read_bytes(), 'Linux x86-64 exit status=0x00')
+    assert marker in serial, serial
+    print('OVMF: Linux SIGCHLD handlers, delivery to a sibling thread and ppoll interruption: PASS', flush=True)
+
+
 def check_pthread(build):
     probe = (build / 'linux-pthread.elf').resolve()
     marker = 'Linux ELF64 pthread probe'
@@ -497,6 +507,7 @@ def main():
     check_socket(build)
     check_pipe(build)
     check_poll(build)
+    check_sigchld(build)
     check_fork(build)
     check_pthread(build)
     check_pthread_preemption(build)
