@@ -408,16 +408,20 @@ static long check_named_file(long dir) {
     long empty = call(257, dir, (word)name, 0x202, 0);
     if (empty < 3 || call(8, next, 0, 2, 0) || call(5, empty, (word)stat, 0, 0) || stat[6] ||
         call(3, empty, 0, 0, 0) || call(1, next, (word)"Q", 1, 0) != 1) return 166;
-    word limit[2], previous[2];
-    if (call(302, 0, 7, 0, (word)previous)) return 167;
-    limit[0] = 3;
-    limit[1] = previous[1];
-    if (call(302, 0, 7, (word)limit, 0) ||
-        call(257, dir, (word)"uncreated", 0xc2, 0600) != -24 ||
+    int descriptors[256];
+    unsigned count = 0;
+    long fd_result;
+    while ((fd_result = call(32, next, 0, 0, 0)) >= 0) {
+        if (count == sizeof(descriptors) / sizeof(*descriptors)) return 167;
+        descriptors[count++] = (int)fd_result;
+    }
+    if (fd_result != -24 || call(257, dir, (word)"uncreated", 0xc2, 0600) != -24 ||
         call(257, dir, (word)name, 0x202, 0) != -24 ||
-        call(302, 0, 7, (word)previous, 0) ||
         call(262, dir, (word)"uncreated", (word)stat, 0) != -2 ||
         call(17, next, (word)buffer, 1, 0) != 1 || buffer[0] != 'Q') return 168;
+    for (unsigned i = 0; i < count; ++i) {
+        if (call(3, (word)descriptors[i], 0, 0, 0)) return 169;
+    }
     if (call(3, next, 0, 0, 0) || call(263, dir, (word)alias, 0, 0) ||
         call(263, dir, (word)name, 0, 0)) return 169;
     return 0;
