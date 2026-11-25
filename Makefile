@@ -1590,6 +1590,7 @@ X64BUILD := $(BUILD)/x86_64
 X64_HEADERS := kernel/x86_64/paging.h kernel/x86_64/pmm.h kernel/x86_64/segments.h kernel/x86_64/framebuffer.h kernel/bootinfo.h kernel/types.h
 X64_CORE := $(X64BUILD)/entry.o $(X64BUILD)/paging.o $(X64BUILD)/pmm.o $(X64BUILD)/segments.o $(X64BUILD)/framebuffer.o
 X64_ETHERNET := $(X64BUILD)/pci.o $(X64BUILD)/e1000.o
+X64_NETWORK := $(X64_ETHERNET) $(X64BUILD)/net.o
 X64_PAGING_TESTS := $(addprefix $(X64BUILD)/kernel-paging-,$(addsuffix .bin,0 1 2 3))
 X64_RING3_TESTS := $(addprefix $(X64BUILD)/kernel-ring3-,$(addsuffix .bin,0 1 2 3))
 X64CFLAGS := -m64 -mno-red-zone -mgeneral-regs-only -ffreestanding -fno-pie -fno-pic \
@@ -1607,6 +1608,8 @@ $(X64BUILD)/early-gop.o: kernel/x86_64/early.c $(X64_HEADERS) | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -DX64_TEST_GOP -c $< -o $@
 $(X64BUILD)/early-ethernet.o: kernel/x86_64/early.c $(X64_HEADERS) | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -DX64_TEST_ETHERNET -c $< -o $@
+$(X64BUILD)/early-ipv4.o: kernel/x86_64/early.c $(X64_HEADERS) | $(X64BUILD)
+	$(CC) $(X64CFLAGS) -DX64_TEST_IPV4 -c $< -o $@
 $(X64_PAGING_TESTS:$(X64BUILD)/kernel-paging-%.bin=$(X64BUILD)/early-paging-%.o): $(X64BUILD)/early-paging-%.o: kernel/x86_64/early.c $(X64_HEADERS) | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -DX64_TEST_PAGING=$* -c $< -o $@
 $(X64_RING3_TESTS:$(X64BUILD)/kernel-ring3-%.bin=$(X64BUILD)/early-ring3-%.o): $(X64BUILD)/early-ring3-%.o: kernel/x86_64/early.c $(X64_HEADERS) | $(X64BUILD)
@@ -1621,6 +1624,8 @@ $(X64BUILD)/pci.o: kernel/x86_64/pci.c kernel/x86_64/pci.h kernel/types.h | $(X6
 	$(CC) $(X64CFLAGS) -c $< -o $@
 $(X64BUILD)/e1000.o: kernel/x86_64/e1000.c kernel/x86_64/e1000.h kernel/x86_64/pci.h $(X64_HEADERS) | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
+$(X64BUILD)/net.o: kernel/x86_64/net.c kernel/x86_64/net.h kernel/x86_64/e1000.h kernel/types.h | $(X64BUILD)
+	$(CC) $(X64CFLAGS) -c $< -o $@
 $(X64BUILD)/segments.o: kernel/x86_64/segments.c kernel/x86_64/segments.h kernel/types.h | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
 $(X64BUILD)/pmm-check.o: tests/kernel_x64_pmm_check.c kernel/x86_64/pmm.h kernel/x86_64/framebuffer.h kernel/bootinfo.h kernel/types.h | $(X64BUILD)
@@ -1631,6 +1636,10 @@ $(X64BUILD)/gop-check.o: tests/kernel_x64_gop_check.c $(X64_HEADERS) user/lib/vi
 	$(CC) $(X64CFLAGS) -c $< -o $@
 $(X64BUILD)/ethernet-check.o: tests/kernel_x64_ethernet_check.c kernel/x86_64/e1000.h kernel/types.h | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
+$(X64BUILD)/ipv4-check.o: tests/kernel_x64_ipv4_check.c kernel/x86_64/net.h kernel/x86_64/e1000.h kernel/types.h | $(X64BUILD)
+	$(CC) $(X64CFLAGS) -c $< -o $@
+$(X64BUILD)/ipv4-test: tests/kernel_x64_ipv4_test.c kernel/x86_64/net.c kernel/x86_64/net.h kernel/x86_64/e1000.h kernel/types.h | $(X64BUILD)
+	$(HOSTCC) -O2 -Wall -Wextra -fno-builtin -DHOST_TEST $(filter %.c,$^) -o $@
 $(X64BUILD)/ring3-code.o: tests/kernel_x64_ring3.asm | $(X64BUILD)
 	$(NASM) -f elf64 $< -o $@
 $(X64BUILD)/kernel.elf: $(X64_CORE) $(X64BUILD)/early-0.o kernel/x86_64/linker.ld
@@ -1642,6 +1651,8 @@ $(X64BUILD)/kernel-pmm.elf: $(X64BUILD)/entry.o $(X64BUILD)/early-pmm.o $(X64BUI
 $(X64BUILD)/kernel-gop.elf: $(X64_CORE) $(X64BUILD)/early-gop.o $(X64BUILD)/gop-check.o $(X64BUILD)/ring3-check.o $(X64BUILD)/ring3-code.o kernel/x86_64/linker.ld
 	$(LD) -m elf_x86_64 -T kernel/x86_64/linker.ld -nostdlib $(filter %.o,$^) -o $@
 $(X64BUILD)/kernel-ethernet.elf: $(X64_CORE) $(X64_ETHERNET) $(X64BUILD)/early-ethernet.o $(X64BUILD)/ethernet-check.o kernel/x86_64/linker.ld
+	$(LD) -m elf_x86_64 -T kernel/x86_64/linker.ld -nostdlib $(filter %.o,$^) -o $@
+$(X64BUILD)/kernel-ipv4.elf: $(X64_CORE) $(X64_NETWORK) $(X64BUILD)/early-ipv4.o $(X64BUILD)/ipv4-check.o kernel/x86_64/linker.ld
 	$(LD) -m elf_x86_64 -T kernel/x86_64/linker.ld -nostdlib $(filter %.o,$^) -o $@
 $(X64_PAGING_TESTS:.bin=.elf): $(X64BUILD)/kernel-paging-%.elf: $(X64_CORE) $(X64BUILD)/early-paging-%.o kernel/x86_64/linker.ld
 	$(LD) -m elf_x86_64 -T kernel/x86_64/linker.ld -nostdlib $(filter %.o,$^) -o $@
@@ -1659,7 +1670,7 @@ $(X64BUILD)/early-linux.o $(X64BUILD)/linux_file.o $(X64BUILD)/linux_fb.o: kerne
 $(X64BUILD)/linux_file.o: kernel/x86_64/linux_input.h
 $(X64BUILD)/linux_input.o: kernel/x86_64/linux_input.c kernel/x86_64/linux_input.h kernel/x86_64/linux.h kernel/x86_64/linux_task.h $(X64_HEADERS) | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
-$(X64BUILD)/kernel-linux.elf: $(X64_CORE) $(X64_ETHERNET) $(X64BUILD)/early-linux.o $(X64BUILD)/linux_elf.o $(X64BUILD)/linux_syscall.o $(X64BUILD)/linux_file.o $(X64BUILD)/linux_fb.o $(X64BUILD)/linux_input.o $(X64BUILD)/linux_mmap.o $(X64BUILD)/linux_random.o $(X64BUILD)/linux_time.o $(X64BUILD)/linux_signal.o $(X64BUILD)/linux_socket.o $(X64BUILD)/linux_pipe.o $(X64BUILD)/linux_userns.o $(X64BUILD)/linux_pidns.o $(X64BUILD)/linux_vfs.o $(X64BUILD)/linux_task.o $(X64BUILD)/linux-entry.o kernel/x86_64/linker.ld
+$(X64BUILD)/kernel-linux.elf: $(X64_CORE) $(X64_NETWORK) $(X64BUILD)/early-linux.o $(X64BUILD)/linux_elf.o $(X64BUILD)/linux_syscall.o $(X64BUILD)/linux_file.o $(X64BUILD)/linux_fb.o $(X64BUILD)/linux_input.o $(X64BUILD)/linux_mmap.o $(X64BUILD)/linux_random.o $(X64BUILD)/linux_time.o $(X64BUILD)/linux_signal.o $(X64BUILD)/linux_socket.o $(X64BUILD)/linux_pipe.o $(X64BUILD)/linux_userns.o $(X64BUILD)/linux_pidns.o $(X64BUILD)/linux_vfs.o $(X64BUILD)/linux_task.o $(X64BUILD)/linux-entry.o kernel/x86_64/linker.ld
 	$(LD) -m elf_x86_64 -T kernel/x86_64/linker.ld -nostdlib $(filter %.o,$^) -o $@
 $(X64BUILD)/linux-probe.o: tests/linux_x64_probe.S | $(X64BUILD)
 	$(CC) -m64 -c $< -o $@
@@ -1733,7 +1744,7 @@ $(X64BUILD)/linux-exec-target.o: tests/linux_x64_exec_target.c tests/linux_x64_e
 	$(CC) $(X64CFLAGS) -c $< -o $@
 $(X64BUILD)/linux-exec-target.elf: $(X64BUILD)/linux-exec-target.o
 	$(LD) -m elf_x86_64 -static -no-pie $< -o $@
-$(X64BUILD)/kernel.bin $(X64BUILD)/kernel-6.bin $(X64BUILD)/kernel-13.bin $(X64BUILD)/kernel-pmm.bin $(X64BUILD)/kernel-gop.bin $(X64BUILD)/kernel-ethernet.bin $(X64BUILD)/kernel-linux.bin $(X64_PAGING_TESTS) $(X64_RING3_TESTS): %.bin: %.elf
+$(X64BUILD)/kernel.bin $(X64BUILD)/kernel-6.bin $(X64BUILD)/kernel-13.bin $(X64BUILD)/kernel-pmm.bin $(X64BUILD)/kernel-gop.bin $(X64BUILD)/kernel-ethernet.bin $(X64BUILD)/kernel-ipv4.bin $(X64BUILD)/kernel-linux.bin $(X64_PAGING_TESTS) $(X64_RING3_TESTS): %.bin: %.elf
 	$(OBJCOPY) -O binary $< $@
 
 .PHONY: kernel-x64 kernel-x64-smoke kernel-x64-pmm-smoke kernel-x64-paging-smoke kernel-x64-ring3-smoke
@@ -1744,11 +1755,14 @@ kernel-x64-pmm-smoke: $(X64BUILD)/kernel-pmm.bin
 	python3 tests/kernel_x64_smoke.py --pmm
 kernel-x64-paging-smoke: $(X64_PAGING_TESTS)
 	python3 tests/kernel_x64_smoke.py --paging
-.PHONY: kernel-x64-gop-smoke kernel-x64-ethernet-smoke
+.PHONY: kernel-x64-gop-smoke kernel-x64-ethernet-smoke kernel-x64-ipv4-smoke
 kernel-x64-gop-smoke: $(X64BUILD)/kernel-gop.bin
 	python3 tests/kernel_x64_smoke.py --gop
 kernel-x64-ethernet-smoke: $(X64BUILD)/kernel-ethernet.bin $(X64BUILD)/kernel-linux.bin $(X64BUILD)/linux-probe.elf
 	python3 tests/kernel_x64_ethernet_smoke.py
+kernel-x64-ipv4-smoke: $(X64BUILD)/kernel-ipv4.bin $(X64BUILD)/ipv4-test
+	$(X64BUILD)/ipv4-test
+	python3 tests/kernel_x64_ipv4_smoke.py
 kernel-x64-ring3-smoke: $(X64_RING3_TESTS)
 	python3 tests/kernel_x64_smoke.py --ring3
 .PHONY: kernel-x64-linux-smoke

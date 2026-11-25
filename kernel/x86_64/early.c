@@ -30,6 +30,9 @@ extern bool gop64_check(const struct boot_info *boot, const struct gop64_framebu
 #ifdef X64_TEST_ETHERNET
 extern bool e1000_check(void);
 #endif
+#ifdef X64_TEST_IPV4
+extern bool net64_check(void);
+#endif
 
 struct idt_gate {
     u16 offset_low, selector;
@@ -395,6 +398,9 @@ __attribute__((noreturn)) void kernel64_main(const struct boot_info *boot, u32 e
 #endif
 #ifdef X64_TEST_ETHERNET
     serial_puts(e1000_check() ? "x86-64 e1000 ARP PASS\n" : "x86-64 e1000 ARP FAIL\n");
+#endif
+#ifdef X64_TEST_IPV4
+    serial_puts(net64_check() ? "x86-64 IPv4 PASS\n" : "x86-64 IPv4 FAIL\n");
 #endif
 #ifdef X64_TEST_LINUX
     if (e1000_init()) serial_puts("MyOS x86-64: e1000 Ethernet ready\n");
