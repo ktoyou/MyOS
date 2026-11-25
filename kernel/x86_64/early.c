@@ -1,5 +1,8 @@
 #include "paging.h"
 #include "framebuffer.h"
+#ifdef X64_TEST_LINUX
+#include "linux_fb.h"
+#endif
 #include "segments.h"
 #ifdef X64_TEST_LINUX
 #include "linux.h"
@@ -379,6 +382,7 @@ __attribute__((noreturn)) void kernel64_main(const struct boot_info *boot, u32 e
     if (!ring3_check(X64_TEST_RING3)) serial_puts("x86-64 ring3 FAIL\n");
 #endif
 #ifdef X64_TEST_LINUX
+    linux64_fb_init(&fb.surface);
     linux_test_boot(boot->root_phys, boot->root_bytes);
     serial_puts("Linux x86-64 ELF rejected\n");
 #endif

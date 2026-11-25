@@ -80,6 +80,17 @@ def check_ring3():
         print(f'OVMF x86-64 ring3 {mode}: PASS', flush=True)
 
 
+def check_gop_pixels(shot):
+    magic, width, height, maxval, pixels = shot.read_bytes().split(maxsplit=4)
+    w, h = int(width), int(height)
+    assert magic == b'P6' and maxval == b'255' and w >= 640 and h >= 480 and len(pixels) == w * h * 3
+    for y in (0, h // 2 - 1, h // 2, h - 1):
+        for x in (0, w // 2 - 1, w // 2, w - 1):
+            colors = ('de292f', '23b471') if y < h // 2 else ('365ed6', 'efd487')
+            offset = (y * w + x) * 3
+            assert pixels[offset:offset + 3] == bytes.fromhex(colors[x >= w // 2]), (x, y, w, h)
+
+
 def check_gop():
     payload, kernel_end = image('kernel-gop')
     markers = ['x86-64 GOP frame PASS', 'x86-64 exception vector=0x000000000000000e',
@@ -89,14 +100,7 @@ def check_gop():
         shot = directory / 'gop.ppm'
         serial = boot_x64(directory, 'x64-kernel-gop', payload, kernel_end, markers, screenshot=shot)
         assert 'error=0x0000000000000005' in serial and 'x86-64 ring3 FAIL' not in serial, serial
-        magic, width, height, maxval, pixels = shot.read_bytes().split(maxsplit=4)
-        w, h = int(width), int(height)
-        assert magic == b'P6' and maxval == b'255' and w >= 640 and h >= 480 and len(pixels) == w * h * 3
-        for y in (0, h // 2 - 1, h // 2, h - 1):
-            for x in (0, w // 2 - 1, w // 2, w - 1):
-                colors = ('de292f', '23b471') if y < h // 2 else ('365ed6', 'efd487')
-                offset = (y * w + x) * 3
-                assert pixels[offset:offset + 3] == bytes.fromhex(colors[x >= w // 2]), (x, y, w, h)
+        check_gop_pixels(shot)
     print('OVMF x86-64 GOP output and supervisor access: PASS', flush=True)
 
 
