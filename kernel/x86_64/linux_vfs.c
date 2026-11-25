@@ -76,6 +76,12 @@ static bool same_path(const char *left, const char *right) {
     return *left == *right;
 }
 
+void linux64_vfs_temporary_counts(u32 *total, u32 *free) {
+    *total = *free = TEMP_NODES;
+    for (unsigned i = 0; i < TEMP_NODES; ++i)
+        if (temporary[i].path) --*free;
+}
+
 static struct temporary_node *temporary_node(const char *path) {
     for (unsigned i = 0; i < TEMP_NODES; ++i)
         if (temporary[i].path && same_path(path, temporary[i].path)) return &temporary[i];

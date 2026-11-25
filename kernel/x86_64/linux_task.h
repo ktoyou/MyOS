@@ -304,6 +304,7 @@ struct linux64_fs *linux64_initial_fs(void);
 struct linux64_fs *linux64_fs_copy(const struct linux64_fs *source);
 void linux64_fs_retain(struct linux64_fs *fs);
 void linux64_fs_release(struct linux64_fs *fs);
+void linux64_vfs_temporary_counts(u32 *total, u32 *free);
 long linux64_vfs_walk(const struct linux64_directory *base, const char *path,
                       struct linux64_file *file, char *resolved, bool follow_final);
 long linux64_vfs_mkdir(const struct linux64_directory *base, const char *path, u32 mode);

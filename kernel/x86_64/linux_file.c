@@ -3,6 +3,7 @@
 #include "linux_input.h"
 #include "linux_myfs.h"
 #include "paging.h"
+#include "../myfs.h"
 
 #define NS_PER_SECOND 1000000000ul
 
@@ -62,6 +63,15 @@ struct linux_stat {
 
 _Static_assert(sizeof(struct linux_stat) == 144, "Linux x86-64 stat size");
 _Static_assert(__builtin_offsetof(struct linux_stat, size) == 48, "Linux x86-64 st_size");
+
+struct linux_statfs {
+    u64 type, block_size, blocks, free_blocks, available_blocks, inodes, free_inodes;
+    i32 fsid[2];
+    u64 name_max, fragment_size, flags, reserved[4];
+};
+
+_Static_assert(sizeof(struct linux_statfs) == 120 &&
+               __builtin_offsetof(struct linux_statfs, flags) == 80, "Linux x86-64 statfs ABI");
 
 static struct linux64_file_source files;
 static struct memfd {
@@ -2252,6 +2262,62 @@ static long file_stat(const struct linux64_file *file, const struct memfd *memfd
     return paging64_copy_to_user(stat_address, &stat, sizeof(stat)) == sizeof(stat) ? 0 : -EFAULT;
 }
 
+static long filesystem_stat(const struct linux64_file *file, const struct memfd *memfd,
+                            enum file_kind kind, uptr address) {
+    enum {
+        MYFS_MAGIC = 0x5346594d, RAMFS_MAGIC = 0x858458f6, TMPFS_MAGIC = 0x01021994,
+        PROC_MAGIC = 0x9fa0, SOCKFS_MAGIC = 0x534f434b, PIPEFS_MAGIC = 0x50495045,
+        ANON_INODE_MAGIC = 0x09041934, NSFS_MAGIC = 0x6e736673,
+        ST_RDONLY = 1, ST_VALID = 0x20, MYFS_BLOCK_SIZE = 512,
+    };
+    struct linux_statfs stat = {
+        .type = RAMFS_MAGIC, .block_size = PMM_PAGE_SIZE, .fragment_size = PMM_PAGE_SIZE,
+        .name_max = FS_NAME_MAX, .flags = ST_VALID, .fsid = {1, 0},
+    };
+    if (file->myfs_ino) {
+        struct fs_info info;
+        myfs_info(&info);
+        stat.type = MYFS_MAGIC;
+        stat.block_size = stat.fragment_size = MYFS_BLOCK_SIZE;
+        stat.blocks = info.total_blocks;
+        stat.available_blocks = stat.free_blocks = info.free_blocks;
+        stat.inodes = info.total_inodes;
+        stat.free_inodes = info.free_inodes;
+        stat.fsid[0] = 11;
+    } else if (memfd || file->backing || file->writable_directory ||
+               kind == FILE_NAMED_SOCKET || kind == FILE_SYMLINK) {
+        u32 total, free;
+        pmm64_page_counts(&total, &free);
+        stat.type = TMPFS_MAGIC;
+        stat.blocks = total;
+        stat.available_blocks = stat.free_blocks = free;
+        bool anonymous = memfd && !file->backing;
+        stat.fsid[0] = anonymous ? 2 : 9;
+        if (!anonymous) {
+            linux64_vfs_temporary_counts(&total, &free);
+            stat.inodes = total;
+            stat.free_inodes = free;
+        }
+    } else if (kind == FILE_SOCKET) {
+        stat.type = SOCKFS_MAGIC;
+        stat.fsid[0] = 3;
+    } else if (kind == FILE_PIPE) {
+        stat.type = PIPEFS_MAGIC;
+        stat.fsid[0] = 4;
+    } else if (kind == FILE_EVENTFD || kind == FILE_EPOLL) {
+        stat.type = ANON_INODE_MAGIC;
+        stat.fsid[0] = 10;
+    } else if (kind == FILE_NAMESPACE) {
+        stat.type = NSFS_MAGIC;
+        stat.fsid[0] = 7;
+    } else if (kind == FILE_PROC_DIR || kind == FILE_PROC_MAP || kind == FILE_PROC_LINK) {
+        stat.type = PROC_MAGIC;
+    } else {
+        stat.flags |= ST_RDONLY;
+    }
+    return paging64_copy_to_user(address, &stat, sizeof(stat)) == sizeof(stat) ? 0 : -EFAULT;
+}
+
 /* Имена до четырёх цифр занимают один 24-байтовый linux_dirent64. */
 struct linux_dirent64 {
     u64 inode, next;
@@ -2535,6 +2601,13 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
         return linux_symlink(AT_FDCWD, arg1, arg0);
     case 89: /* readlink */
         return linux_readlink(AT_FDCWD, arg0, arg1, (i32)arg2);
+    case 137: /* statfs */
+        result = lookup(AT_FDCWD, arg0, 0, &file, &memfd, &kind);
+        return result ? result : filesystem_stat(&file, memfd, kind, arg1);
+    case 138: /* fstatfs */
+        if (!open_file(fd)) return -EBADF;
+        handle_stat(file_at(fd), &file, &memfd);
+        return filesystem_stat(&file, memfd, kind_of(file_at(fd)), arg1);
     case 217: /* getdents64 */
         return linux_getdents64(fd, arg1, (u32)arg2);
     case 257: /* openat */
