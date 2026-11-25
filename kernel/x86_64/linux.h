@@ -55,8 +55,10 @@ struct boot_info;
 bool linux64_run(const struct linux64_file *file, const char *path, uptr path_length,
                  const struct linux64_file_source *source, const struct boot_info *boot);
 void linux64_use_files(const struct linux64_file_source *source, const char *path, uptr path_length);
+struct file_handle;
 struct linux64_fd_view {
     struct linux64_file file;
+    struct file_handle *handle;
     const void *object;
     uptr (*frame)(const void *object, uptr offset);
     bool writable, may_grow;

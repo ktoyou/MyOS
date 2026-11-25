@@ -1735,6 +1735,8 @@ $(X64BUILD)/linux-myfs-mmap.o: kernel/x86_64/linux_myfs_mmap.c kernel/x86_64/lin
 	$(CC) $(X64CFLAGS) -c $< -o $@
 $(X64BUILD)/linux_file.o $(X64BUILD)/linux_vfs.o $(X64BUILD)/linux_elf.o $(X64BUILD)/linux_mmap.o: kernel/x86_64/linux_myfs.h
 $(X64BUILD)/linux_elf.o: kernel/x86_64/linux_input.h
+$(X64BUILD)/linux_mmap.o: kernel/x86_64/storage_alloc.h kernel/string.h
+$(X64BUILD)/linux_file.o: kernel/x86_64/storage_alloc.h
 $(X64BUILD)/linux_syscall.o: X64CFLAGS += -I$(BUILD)
 $(X64BUILD)/linux_syscall.o: $(BUILD)/build_info.h
 $(X64BUILD)/linux_timer.o: kernel/acpi_smp.h kernel/smp.h

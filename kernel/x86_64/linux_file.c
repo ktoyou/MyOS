@@ -1,4 +1,5 @@
 #include "linux_task.h"
+#include "storage_alloc.h"
 #include "linux_fb.h"
 #include "linux_input.h"
 #include "linux_myfs.h"
@@ -131,8 +132,10 @@ struct epoll_watch {
     bool armed;
 };
 
+struct file_handle_block;
 static struct file_handle {
     struct linux64_file file;
+    struct file_handle_block *block;
     char resolver_config[LINUX64_RESOLVER_CONFIG_MAX];
     struct memfd *memfd;
     struct linux64_socket *socket;
@@ -155,6 +158,54 @@ static struct file_handle {
     unsigned references, watched_by, scm_inflight;
     bool event_semaphore;
 } open_files[OPEN_FILE_COUNT];
+
+enum { OPEN_FILE_BLOCK_COUNT = 64 };
+struct file_handle_block {
+    struct file_handle_block *next;
+    unsigned used;
+    struct file_handle handles[OPEN_FILE_BLOCK_COUNT];
+};
+
+static struct file_handle_block *extra_open_files;
+
+static struct file_handle *next_open_file(struct file_handle *file) {
+    struct file_handle_block *block = file->block;
+    if (block) {
+        if (file != &block->handles[OPEN_FILE_BLOCK_COUNT - 1]) return file + 1;
+        block = block->next;
+    } else {
+        if (file != &open_files[OPEN_FILE_COUNT - 1]) return file + 1;
+        block = extra_open_files;
+    }
+    return block ? block->handles : NULL;
+}
+
+static struct file_handle *alloc_open_file(void) {
+    for (struct file_handle *file = open_files; file; file = next_open_file(file)) {
+        if (file->references) continue;
+        if (file->block) ++file->block->used;
+        return file;
+    }
+    /* Файловые отображения могут удерживать описания дольше всех дескрипторов. */
+    struct file_handle_block *block = storage64_alloc(sizeof(*block));
+    if (!block) return NULL;
+    block->used = 1;
+    block->next = extra_open_files;
+    for (unsigned i = 0; i < OPEN_FILE_BLOCK_COUNT; ++i) block->handles[i].block = block;
+    extra_open_files = block;
+    return block->handles;
+}
+
+static void free_open_file(struct file_handle *file) {
+    struct file_handle_block *block = file->block;
+    *file = (struct file_handle){.block = block};
+    if (!block || --block->used) return;
+    struct file_handle_block **link = &extra_open_files;
+    while (*link != block) link = &(*link)->next;
+    *link = block->next;
+    storage64_free(block);
+}
+
 
 static struct file_handle *file_at(i32 fd) {
     return linux64_current->process->fds[fd].file;
@@ -417,8 +468,7 @@ static void epoll_remove(struct file_handle *epoll, struct epoll_watch **link) {
 
 static void epoll_remove_target(struct file_handle *target) {
     /* Регистрация не удерживает файл. Убираем все ссылки до повторного использования слота. */
-    for (unsigned i = 0; i < OPEN_FILE_COUNT && target->watched_by; ++i) {
-        struct file_handle *epoll = &open_files[i];
+    for (struct file_handle *epoll = open_files; epoll && target->watched_by; epoll = next_open_file(epoll)) {
         for (struct epoll_watch **link = &epoll->watches; *link;) {
             if ((*link)->target == target) epoll_remove(epoll, link);
             else link = &(*link)->next;
@@ -441,7 +491,7 @@ static void destroy_file(struct file_handle *file) {
     if (file->file.myfs_ino) linux64_myfs_release(file->file.myfs_ino);
     if (file->directory_path) pmm64_free(file->directory_path);
     if (file->memfd) release_backing(file->memfd);
-    *file = (struct file_handle){0};
+    free_open_file(file);
 }
 
 static void release_file(struct file_handle *file) {
@@ -464,10 +514,8 @@ static void release_file(struct file_handle *file) {
 }
 
 void linux64_scm_mark_roots(void) {
-    for (unsigned i = 0; i < OPEN_FILE_COUNT; ++i) {
-        struct file_handle *file = &open_files[i];
+    for (struct file_handle *file = open_files; file; file = next_open_file(file))
         if (file->references > file->scm_inflight) linux64_scm_mark_socket(file->socket);
-    }
 }
 
 void linux64_scm_collect_pending(void) {
@@ -485,6 +533,14 @@ void linux64_scm_set_inflight(struct file_handle *file, bool inflight) {
 
 struct linux64_socket *linux64_scm_file_socket(const struct file_handle *file) {
     return file->socket;
+}
+
+void linux64_file_retain(struct file_handle *file) {
+    ++file->references;
+}
+
+void linux64_file_release(struct file_handle *file) {
+    release_file(file);
 }
 
 void linux64_scm_put_file(struct file_handle *file) {
@@ -757,17 +813,18 @@ static long linux_flock(i32 fd, u32 operation) {
 
 long linux64_get_file(i32 fd, struct linux64_fd_view *view) {
     if (!open_file(fd)) return -EBADF;
-    if (kind_of(file_at(fd)) != FILE_REGULAR) return -ENODEV;
-    if ((file_at(fd)->flags & O_ACCMODE) == O_WRONLY) return -EACCES;
-    const struct memfd *memfd = file_at(fd)->memfd;
-    *view = (struct linux64_fd_view){.file = file_at(fd)->file};
+    struct file_handle *handle = file_at(fd);
+    if (kind_of(handle) != FILE_REGULAR) return -ENODEV;
+    if ((handle->flags & O_ACCMODE) == O_WRONLY) return -EACCES;
+    const struct memfd *memfd = handle->memfd;
+    *view = (struct linux64_fd_view){.file = handle->file, .handle = handle};
     if (view->file.myfs_ino) return linux64_myfs_stat(view->file.myfs_ino, &view->file);
     if (memfd) {
         view->file.size = memfd->size;
         if (!view->file.backing) view->file.inode = memfd->inode;
         view->object = memfd;
         view->frame = memfd_frame;
-        view->writable = (file_at(fd)->flags & O_ACCMODE) == O_RDWR;
+        view->writable = (handle->flags & O_ACCMODE) == O_RDWR;
         view->may_grow = !(memfd->seals & F_SEAL_GROW);
     }
     return 0;
@@ -992,29 +1049,29 @@ static long dup_to(i32 source, i32 target, bool cloexec) {
 static long new_handle(const struct linux64_file *file, struct memfd *memfd, u32 flags) {
     unsigned fd = free_fd(0);
     if (fd == FD_COUNT) return -EMFILE;
-    for (unsigned i = 0; i < OPEN_FILE_COUNT; ++i) {
-        struct file_handle *description = &open_files[i];
-        if (description->references) continue;
-        if (file && file->myfs_ino) {
-            long result = linux64_myfs_retain(file->myfs_ino);
-            if (result) return result;
-        }
-        *description = (struct file_handle){.memfd = memfd, .flags = flags & ~O_CLOEXEC,
-                                            .references = 1};
-        if (file) {
-            description->file = *file;
-            if (file->dns_server) {
-                /* Действующая аренда может измениться, пока дескриптор открыт. */
-                description->file.size = linux64_net_resolver_config(file->dns_server,
-                                                                      description->resolver_config);
-                description->file.bytes = (const u8 *)description->resolver_config;
-            }
-        }
-        if (memfd) ++memfd->references;
-        linux64_current->process->fds[fd] = (struct linux64_fd_slot){description, (flags & O_CLOEXEC) != 0};
-        return fd;
+    if (file && file->myfs_ino) {
+        long result = linux64_myfs_retain(file->myfs_ino);
+        if (result) return result;
     }
-    return -ENFILE;
+    struct file_handle *description = alloc_open_file();
+    if (!description) {
+        if (file && file->myfs_ino) linux64_myfs_release(file->myfs_ino);
+        return -ENFILE;
+    }
+    *description = (struct file_handle){.block = description->block, .memfd = memfd,
+                                        .flags = flags & ~O_CLOEXEC, .references = 1};
+    if (file) {
+        description->file = *file;
+        if (file->dns_server) {
+            /* Действующая аренда может измениться, пока дескриптор открыт. */
+            description->file.size = linux64_net_resolver_config(file->dns_server,
+                                                                  description->resolver_config);
+            description->file.bytes = (const u8 *)description->resolver_config;
+        }
+    }
+    if (memfd) ++memfd->references;
+    linux64_current->process->fds[fd] = (struct linux64_fd_slot){description, (flags & O_CLOEXEC) != 0};
+    return fd;
 }
 
 static bool copy_fd_pair(uptr address, i32 left, i32 right) {

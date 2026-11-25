@@ -21,7 +21,10 @@ struct linux64_reserve_range {
     uptr start, end;
 };
 
+struct linux64_file_mapping;
 struct linux64_address_space {
+    struct linux64_file_mapping *file_mappings;
+    uptr file_mapping_count, file_mapping_capacity;
     struct linux64_reserve_range reserves[LINUX64_RESERVE_COUNT];
     uptr root, data_bytes;
     unsigned reserve_count, references;
@@ -252,6 +255,10 @@ u16 linux64_task_count(void);
 void linux64_task_syscall(struct linux64_frame *frame);
 bool linux64_deliver_seccomp_sigsys(struct linux64_frame *frame, u16 trap, u32 arch, uptr *user_frame);
 bool linux64_rt_sigreturn(struct linux64_frame *frame, uptr user_frame);
+void linux64_file_retain(struct file_handle *file);
+void linux64_file_release(struct file_handle *file);
+bool linux64_copy_file_mappings(struct linux64_address_space *child, const struct linux64_address_space *parent);
+void linux64_drop_file_mappings(struct linux64_address_space *memory);
 void linux64_retain_files(struct linux64_process *process);
 void linux64_close_files(struct linux64_process *process);
 void linux64_close_on_exec(struct linux64_process *process);

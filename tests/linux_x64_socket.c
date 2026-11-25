@@ -831,7 +831,7 @@ static long check_high_rights(void) {
     return close_fd(ends[0]) || close_fd(ends[1]) ? 107 : 0;
 }
 
-static long check_global_fd_limit(void) {
+static long check_memfd_pool_and_fd_limit(void) {
     char system[390];
     if (call(63, (word)system, 0, 0, 0, 0)) return 108;
     if (system[0] != 'M') return 0;
@@ -865,7 +865,10 @@ static long check_global_fd_limit(void) {
         if (next < 0) break;
         fds[used++] = (int)next;
     } while (used < sizeof(fds) / sizeof(*fds));
-    if (next != -23 || !used || stream(0) != -23) return 110;
+    if (next != -23 || !used) return 110;
+    /* Исчерпание объектов memfd не должно запрещать другие открытые описания. */
+    long socket = stream(0);
+    if (socket < 3 || close_fd((int)socket)) return 110;
     long high = FD_LIMIT - 1;
     for (long fd = fds[used - 1] + 1; fd < high; ++fd)
         if (call(33, 0, fd, 0, 0, 0) != fd) return 112;
@@ -878,7 +881,7 @@ static long check_global_fd_limit(void) {
         int status;
         if (call(61, children[i], (word)&status, 0, 0, 0) != children[i] || status) return 111;
     }
-    next = stream(0);
+    next = call(319, (word)"pool", 0, 0, 0, 0);
     if (next < 3 || close_fd((int)next)) return 111;
     for (unsigned i = 0; i < used; ++i)
         if (close_fd(fds[i])) return 111;
@@ -901,7 +904,7 @@ static long check(void) {
     if (!status) status = check_rights_wait();
     if (!status) status = check_rights_gc();
     if (!status) status = check_high_rights();
-    if (!status) status = check_global_fd_limit();
+    if (!status) status = check_memfd_pool_and_fd_limit();
     struct unix_address address = {AF_UNIX, "/tmp/myos-socket-0000000000"};
     unsigned pid = (unsigned)call(39, 0, 0, 0, 0, 0);
     for (unsigned i = sizeof("/tmp/myos-socket-0000000000") - 2; pid; --i, pid /= 10)
