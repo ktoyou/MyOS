@@ -1,7 +1,10 @@
 #include "linux.h"
 #include "dhcp.h"
 #include "e1000.h"
+#include "net_bytes.h"
 #include "tcp.h"
+
+enum { ICMP = 1, TCP = 6, UDP = 17, IPV4_DONT_FRAGMENT = 0x4000 };
 
 static bool started, waiting;
 static u64 next_poll;
@@ -50,9 +53,40 @@ static void report_lease(void) {
     print_text("\n");
 }
 
+static void receive_icmp(u32 source, u32 destination, const u8 *icmp, u32 length) {
+    enum { ICMP_HEADER = 8, UDP_HEADER = 8, IPV4_HEADER = 20 };
+    if (length < ICMP_HEADER + IPV4_HEADER + UDP_HEADER ||
+        (icmp[0] != 3 && icmp[0] != 11 && icmp[0] != 12) || net64_checksum(icmp, length, 0)) return;
+
+    const u8 *quoted = icmp + ICMP_HEADER;
+    u32 available = length - ICMP_HEADER;
+    u32 header = (quoted[0] & 15u) * 4, total = net_read16(quoted + 2);
+    if (quoted[0] >> 4 != 4 || header < IPV4_HEADER ||
+        available < header + UDP_HEADER || total < header + UDP_HEADER ||
+        (net_read16(quoted + 6) & ~IPV4_DONT_FRAGMENT) || quoted[9] != UDP ||
+        net_read32(quoted + 12) != destination || net64_checksum(quoted, header, 0)) return;
+
+    /* RFC 4884 отделяет расширения ICMP от процитированного пакета. */
+    if (icmp[5]) {
+        u32 quote_length = (u32)icmp[5] * 4;
+        if (quote_length < header + UDP_HEADER || quote_length > available) return;
+        available = quote_length;
+    }
+    const u8 *udp = quoted + header;
+    u32 udp_length = net_read16(udp + 4);
+    if (udp_length < UDP_HEADER || udp_length > total - header) return;
+    u32 present = available - header;
+    if (present > udp_length) present = udp_length;
+    u32 info = icmp[0] == 3 && icmp[1] == 4 ? net_read16(icmp + 6) : 0;
+    linux64_udp_icmp_error(source, destination, net_read32(quoted + 16),
+                          net_read16(udp), net_read16(udp + 2), icmp[0], icmp[1], info,
+                          udp + UDP_HEADER, present - UDP_HEADER);
+}
+
 static void receive(void *context, u32 source, u32 destination, u8 protocol, const u8 *data, u32 length) {
-    if (protocol == 6) tcp64_input(*(const u64 *)context, source, destination, data, length);
-    else linux64_udp_receive(context, source, destination, protocol, data, length);
+    if (protocol == ICMP) receive_icmp(source, destination, data, length);
+    else if (protocol == TCP) tcp64_input(*(const u64 *)context, source, destination, data, length);
+    else if (protocol == UDP) linux64_udp_receive(context, source, destination, protocol, data, length);
 }
 
 bool linux64_net_poll(void) {
