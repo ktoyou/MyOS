@@ -3,7 +3,7 @@
 
 #include "linux.h"
 
-#define LINUX64_TASK_COUNT 256u
+#define LINUX64_TASK_COUNT 512u
 #define LINUX64_PROCESS_COUNT 64u
 #define LINUX64_RESERVE_COUNT 256u
 #define LINUX64_SIGNAL_COUNT 64u

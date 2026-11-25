@@ -7,7 +7,7 @@ static volatile unsigned timed_word;
 static volatile int parent_tid, result;
 static long pid, pipe_write, inherited_no_new_privs;
 
-enum { MAX_WORKERS = 255, MAX_CHILDREN = 63 };
+enum { MAX_WORKERS = 511, MAX_CHILDREN = 63 };
 static char worker_stacks[MAX_WORKERS + 1][4096] __attribute__((aligned(16)));
 static struct worker_slot {
     word index;
