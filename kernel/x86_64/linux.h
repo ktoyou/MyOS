@@ -13,6 +13,7 @@
 #define LINUX64_STACK_TOP 0x00007ffffff00000ul
 #define LINUX64_STACK_FLOOR (LINUX64_STACK_TOP - 8 * 1024 * 1024ul)
 #define LINUX64_S_IFDIR 0040000u
+#define LINUX64_S_IFREG 0100000u
 #define LINUX64_S_IFLNK 0120000u
 #define LINUX64_S_IFSOCK 0140000u
 #define LINUX64_S_IFMT  0170000u
@@ -25,8 +26,11 @@ enum linux64_poll_events {
     LINUX64_POLL_WRITE = LINUX64_POLLOUT | LINUX64_POLLWRNORM,
 };
 
+struct memfd;
+
 struct linux64_file {
     const u8 *bytes;
+    struct memfd *backing;
     uptr size;
     u64 inode;
     u32 mode, uid, gid;

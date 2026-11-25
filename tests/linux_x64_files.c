@@ -356,6 +356,77 @@ static long check_links(long dir, const char *directory) {
     return 0;
 }
 
+static long check_named_file(long dir) {
+    static const char name[] = "profile-data";
+    static const char alias[] = "profile-alias";
+    word stat[18], original[18];
+    if (call(266, (word)name, dir, (word)alias, 0)) return 156;
+    long old_mask = call(95, 0077, 0, 0, 0);
+    long fd = call(257, dir, (word)alias, 0x80042, 0666);
+    if (call(95, old_mask, 0, 0, 0) != 0077 || fd < 3 ||
+        call(72, fd, 1, 0, 0) != 1 || call(262, dir, (word)name, (word)original, 0) ||
+        (original[3] & 0177777) != 0100600 || original[2] != 1 || original[6] ||
+        call(257, dir, (word)name, 0xc2, 0600) != -17) return 157;
+    long write_only = call(257, dir, (word)name, 1, 0);
+    long read_only = call(257, dir, (word)name, 0, 0);
+    if (write_only < 3 || read_only < 3 || call(0, write_only, (word)buffer, 1, 0) != -9 ||
+        call(1, read_only, (word)"x", 1, 0) != -9 || call(77, write_only, 2, 0, 0) ||
+        call(18, fd, (word)"AB", 2, 0) != 2 || call(8, fd, 4097, 0, 0) != 4097 ||
+        call(1, fd, (word)"Z", 1, 0) != 1) return 158;
+    long duplicate = call(32, fd, 0, 0, 0);
+    if (duplicate < 3 || call(8, duplicate, 0, 1, 0) != 4098 ||
+        call(8, read_only, 0, 1, 0) || call(17, read_only, (word)buffer, 2, 4096) != 2 ||
+        buffer[0] || buffer[1] != 'Z') return 159;
+    long append = call(257, dir, (word)name, 0x401, 0);
+    if (append < 3 || call(18, append, (word)"X", 1, 0) != 1 || call(8, append, 0, 1, 0) ||
+        call(8, fd, 0, 2, 0) != 4099 || call(17, fd, (word)buffer, 2, 4097) != 2 ||
+        buffer[0] != 'Z' || buffer[1] != 'X' || call(17, fd, (word)buffer, 2, 0) != 2 ||
+        buffer[0] != 'A' || buffer[1] != 'B') return 160;
+    register word offset __asm__("r9") = 0;
+    register word descriptor __asm__("r8") = (word)fd;
+    register word flags __asm__("r10") = 1;
+    word mapped = 9;
+    __asm__ volatile("syscall" : "+a"(mapped) : "D"(0), "S"(4096), "d"(1),
+                     "r"(flags), "r"(descriptor), "r"(offset) : "rcx", "r11", "memory");
+    if ((long)mapped < 0 || *(const char *)mapped != 'A' ||
+        call(18, fd, (word)"C", 1, 0) != 1 || *(const char *)mapped != 'C') return 161;
+    if (call(263, dir, (word)name, 0, 0) || call(5, fd, (word)stat, 0, 0) ||
+        stat[1] != original[1] || stat[2] || stat[6] != 4099 ||
+        call(262, dir, (word)alias, (word)stat, 0) != -2) return 162;
+    char proc[] = "/proc/self/fd/0";
+    if (fd > 9) return 163;
+    proc[sizeof(proc) - 2] += (char)fd;
+    long reopen = call(2, (word)proc, 0, 0, 0);
+    long next = call(257, dir, (word)name, 0xc2, 0600);
+    if (reopen < 3 || next < 3 || call(0, reopen, (word)buffer, 1, 0) != 1 || buffer[0] != 'C' ||
+        call(5, reopen, (word)stat, 0, 0) || stat[1] != original[1] || stat[2] ||
+        call(5, next, (word)stat, 0, 0) || stat[1] == original[1] || stat[2] != 1 ||
+        call(1, next, (word)"D", 1, 0) != 1) return 164;
+    if (call(3, fd, 0, 0, 0) || call(3, write_only, 0, 0, 0) || call(3, read_only, 0, 0, 0) ||
+        call(3, duplicate, 0, 0, 0) || call(3, append, 0, 0, 0) || call(3, reopen, 0, 0, 0) ||
+        *(const char *)mapped != 'C' || call(11, mapped, 4096, 0, 0)) return 165;
+    long empty = call(257, dir, (word)name, 0x202, 0);
+    if (empty < 3 || call(8, next, 0, 2, 0) || call(5, empty, (word)stat, 0, 0) || stat[6] ||
+        call(3, empty, 0, 0, 0) || call(1, next, (word)"Q", 1, 0) != 1) return 166;
+    int descriptors[256];
+    unsigned count = 0;
+    long fd_result;
+    while ((fd_result = call(32, next, 0, 0, 0)) >= 0) {
+        if (count == sizeof(descriptors) / sizeof(*descriptors)) return 167;
+        descriptors[count++] = (int)fd_result;
+    }
+    if (fd_result != -24 || call(257, dir, (word)"uncreated", 0xc2, 0600) != -24 ||
+        call(257, dir, (word)name, 0x202, 0) != -24 ||
+        call(262, dir, (word)"uncreated", (word)stat, 0) != -2 ||
+        call(17, next, (word)buffer, 1, 0) != 1 || buffer[0] != 'Q') return 168;
+    for (unsigned i = 0; i < count; ++i) {
+        if (call(3, (word)descriptors[i], 0, 0, 0)) return 169;
+    }
+    if (call(3, next, 0, 0, 0) || call(263, dir, (word)alias, 0, 0) ||
+        call(263, dir, (word)name, 0, 0)) return 169;
+    return 0;
+}
+
 static long check_directories(void) {
     static char path[] = "/tmp/myos-dir-0000000000";
     unsigned pid = (unsigned)call(39, 0, 0, 0, 0);
@@ -403,6 +474,8 @@ static long check_directories(void) {
         (opened[3] & 0170777) != 0040700) return 51;
     long links = check_links(dir, path);
     if (links) return links;
+    long named = check_named_file(dir);
+    if (named) return named;
     if (call(3, dir, 0, 0, 0)) return 51;
     if (call(63, (word)buffer, 0, 0, 0)) return 52;
     if (buffer[0] == 'M') {
