@@ -1,5 +1,5 @@
 #include "../kernel/x86_64/dhcp.h"
-#include "../kernel/x86_64/e1000.h"
+#include "../kernel/x86_64/ethernet.h"
 #include "../kernel/x86_64/net_bytes.h"
 
 #define SECOND 1000000000ull
@@ -18,11 +18,29 @@ static net64_receiver dhcp_receive;
 
 extern int puts(const char *text);
 
-bool e1000_link(void) { return link_up; }
+static bool fake_init(void) { return true; }
+static bool fake_link(void) { return link_up; }
 
-void e1000_mac(u8 out[6]) {
+static void fake_mac(u8 out[6]) {
     for (unsigned i = 0; i < sizeof(mac); ++i) out[i] = mac[i];
 }
+
+static bool fake_send(const void *frame, u32 length) {
+    (void)frame;
+    (void)length;
+    return false;
+}
+
+static u32 fake_receive(void *frame, u32 capacity) {
+    (void)frame;
+    (void)capacity;
+    return 0;
+}
+
+static const struct ethernet64_driver driver = {
+    .name = "DHCP fixture", .init = fake_init, .link = fake_link,
+    .mac = fake_mac, .send = fake_send, .receive = fake_receive,
+};
 
 bool net64_enable_dhcp(net64_receiver receive) {
     dhcp_receive = receive;
@@ -91,7 +109,7 @@ static u8 *begin_reply(u8 type, u32 xid, u32 server) {
     bootp[2] = sizeof(mac);
     net_write32(bootp + 4, xid);
     net_write32(bootp + 16, type == NAK ? 0 : address);
-    e1000_mac(bootp + 28);
+    fake_mac(bootp + 28);
     net_write32(bootp + 236, 0x63825363);
     u8 *p = rx + BOOTP_OPTIONS;
     *p++ = 53;
@@ -237,6 +255,7 @@ static bool check_renewal(void) {
 }
 
 int main(void) {
+    if (!ethernet64_attach(&driver)) { puts("DHCPv4: Ethernet attachment FAIL"); return 3; }
     if (!check_dora()) { puts("DHCPv4: DORA or reply validation FAIL"); return 1; }
     if (!check_renewal()) { puts("DHCPv4: renewal, rebinding or restart FAIL"); return 2; }
     puts("DHCPv4: DORA, T1/T2, partial ACK, expiry, NAK and link down PASS");

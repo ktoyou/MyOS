@@ -1,4 +1,5 @@
 #include "../kernel/x86_64/e1000.h"
+#include "../kernel/x86_64/ethernet.h"
 #include "../kernel/x86_64/net.h"
 
 extern void kernel64_serial_char(char ch);
@@ -74,10 +75,11 @@ static bool check_echo(bool *reply) {
 
 bool net64_check(void) {
     struct net64_config config = {.address = address, .mask = IPV4(255, 255, 255, 0), .gateway = gateway};
-    if (!e1000_init() || !net64_configure(config)) return stage(false, "IPv4 test: initialization failed");
+    if (!ethernet64_attach(&e1000_driver) || !net64_configure(config))
+        return stage(false, "IPv4 test: initialization failed");
     stage(true, "IPv4 test: waiting for link");
     u64 end = deadline();
-    while (!e1000_link()) {
+    while (!ethernet64_link()) {
         if (tsc() >= end) return stage(false, "IPv4 test: link timed out");
         __asm__ volatile("pause");
     }

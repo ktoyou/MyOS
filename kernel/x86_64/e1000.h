@@ -1,7 +1,9 @@
 #ifndef X86_64_E1000_H
 #define X86_64_E1000_H
 
-#include "../types.h"
+#include "ethernet.h"
+
+extern const struct ethernet64_driver e1000_driver;
 
 bool e1000_init(void);
 bool e1000_link(void);

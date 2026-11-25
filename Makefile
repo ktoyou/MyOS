@@ -1590,7 +1590,7 @@ X64BUILD := $(BUILD)/x86_64
 X64_HEADERS := kernel/x86_64/paging.h kernel/x86_64/pmm.h kernel/x86_64/segments.h kernel/x86_64/framebuffer.h kernel/bootinfo.h kernel/types.h
 X64_CORE := $(X64BUILD)/entry.o $(X64BUILD)/paging.o $(X64BUILD)/pmm.o $(X64BUILD)/segments.o $(X64BUILD)/framebuffer.o
 X64_ETHERNET := $(X64BUILD)/pci.o $(X64BUILD)/e1000.o
-X64_NETWORK := $(X64_ETHERNET) $(X64BUILD)/net.o
+X64_NETWORK := $(X64_ETHERNET) $(X64BUILD)/ethernet.o $(X64BUILD)/net.o
 X64_LINUX_NET := $(X64_NETWORK) $(X64BUILD)/dhcp.o $(X64BUILD)/tcp.o $(X64BUILD)/linux_net.o
 X64_NVME := $(X64BUILD)/nvme.o $(X64BUILD)/storage-pci.o $(X64BUILD)/storage-string.o
 X64_MYFS := $(X64BUILD)/storage-block.o $(X64BUILD)/storage-myfs.o $(X64BUILD)/storage-alloc.o
@@ -1632,15 +1632,17 @@ $(X64BUILD)/paging.o: kernel/x86_64/paging.c $(X64_HEADERS) | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
 $(X64BUILD)/pci.o: kernel/x86_64/pci.c kernel/x86_64/pci.h kernel/types.h | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
-$(X64BUILD)/e1000.o: kernel/x86_64/e1000.c kernel/x86_64/e1000.h kernel/x86_64/pci.h $(X64_HEADERS) | $(X64BUILD)
+$(X64BUILD)/e1000.o: kernel/x86_64/e1000.c kernel/x86_64/e1000.h kernel/x86_64/ethernet.h kernel/x86_64/pci.h $(X64_HEADERS) | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
-$(X64BUILD)/net.o: kernel/x86_64/net.c kernel/x86_64/net.h kernel/x86_64/net_bytes.h kernel/x86_64/e1000.h kernel/types.h | $(X64BUILD)
+$(X64BUILD)/ethernet.o: kernel/x86_64/ethernet.c kernel/x86_64/ethernet.h kernel/types.h | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
-$(X64BUILD)/dhcp.o: kernel/x86_64/dhcp.c kernel/x86_64/dhcp.h kernel/x86_64/net.h kernel/x86_64/net_bytes.h kernel/x86_64/e1000.h kernel/types.h | $(X64BUILD)
+$(X64BUILD)/net.o: kernel/x86_64/net.c kernel/x86_64/net.h kernel/x86_64/net_bytes.h kernel/x86_64/ethernet.h kernel/types.h | $(X64BUILD)
+	$(CC) $(X64CFLAGS) -c $< -o $@
+$(X64BUILD)/dhcp.o: kernel/x86_64/dhcp.c kernel/x86_64/dhcp.h kernel/x86_64/net.h kernel/x86_64/net_bytes.h kernel/x86_64/ethernet.h kernel/types.h | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
 $(X64BUILD)/tcp.o: kernel/x86_64/tcp.c kernel/x86_64/tcp.h kernel/x86_64/linux.h kernel/x86_64/net.h kernel/x86_64/net_bytes.h $(X64_HEADERS) | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
-$(X64BUILD)/linux_net.o: kernel/x86_64/linux_net.c kernel/x86_64/net_bytes.h kernel/x86_64/linux.h kernel/x86_64/dhcp.h kernel/x86_64/tcp.h kernel/x86_64/net.h kernel/x86_64/e1000.h $(X64_HEADERS) | $(X64BUILD)
+$(X64BUILD)/linux_net.o: kernel/x86_64/linux_net.c kernel/x86_64/net_bytes.h kernel/x86_64/linux.h kernel/x86_64/dhcp.h kernel/x86_64/tcp.h kernel/x86_64/net.h kernel/x86_64/ethernet.h $(X64_HEADERS) | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
 $(X64BUILD)/segments.o: kernel/x86_64/segments.c kernel/x86_64/segments.h kernel/types.h | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
@@ -1650,13 +1652,13 @@ $(X64BUILD)/ring3-check.o: tests/kernel_x64_ring3_check.c $(X64_HEADERS) | $(X64
 	$(CC) $(X64CFLAGS) -c $< -o $@
 $(X64BUILD)/gop-check.o: tests/kernel_x64_gop_check.c $(X64_HEADERS) user/lib/video_mode.h | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
-$(X64BUILD)/ethernet-check.o: tests/kernel_x64_ethernet_check.c kernel/x86_64/e1000.h kernel/types.h | $(X64BUILD)
+$(X64BUILD)/ethernet-check.o: tests/kernel_x64_ethernet_check.c kernel/x86_64/e1000.h kernel/x86_64/ethernet.h kernel/types.h | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
-$(X64BUILD)/ipv4-check.o: tests/kernel_x64_ipv4_check.c kernel/x86_64/net.h kernel/x86_64/e1000.h kernel/types.h | $(X64BUILD)
+$(X64BUILD)/ipv4-check.o: tests/kernel_x64_ipv4_check.c kernel/x86_64/net.h kernel/x86_64/e1000.h kernel/x86_64/ethernet.h kernel/types.h | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
-$(X64BUILD)/ipv4-test: tests/kernel_x64_ipv4_test.c kernel/x86_64/net.c kernel/x86_64/net.h kernel/x86_64/net_bytes.h kernel/x86_64/e1000.h kernel/types.h | $(X64BUILD)
+$(X64BUILD)/ipv4-test: tests/kernel_x64_ipv4_test.c kernel/x86_64/net.c kernel/x86_64/ethernet.c kernel/x86_64/net.h kernel/x86_64/net_bytes.h kernel/x86_64/ethernet.h kernel/types.h | $(X64BUILD)
 	$(HOSTCC) -O2 -Wall -Wextra -fno-builtin -DHOST_TEST $(filter %.c,$^) -o $@
-$(X64BUILD)/dhcp-test: tests/kernel_x64_dhcp_test.c kernel/x86_64/dhcp.c kernel/x86_64/dhcp.h kernel/x86_64/net.h kernel/x86_64/net_bytes.h kernel/x86_64/e1000.h kernel/types.h | $(X64BUILD)
+$(X64BUILD)/dhcp-test: tests/kernel_x64_dhcp_test.c kernel/x86_64/dhcp.c kernel/x86_64/ethernet.c kernel/x86_64/dhcp.h kernel/x86_64/net.h kernel/x86_64/net_bytes.h kernel/x86_64/ethernet.h kernel/types.h | $(X64BUILD)
 	$(HOSTCC) -O2 -Wall -Wextra -fno-builtin -DHOST_TEST $(filter %.c,$^) -o $@
 $(X64BUILD)/tcp-test: tests/kernel_x64_tcp_test.c kernel/x86_64/tcp.c kernel/x86_64/tcp.h kernel/x86_64/linux.h kernel/x86_64/net.h kernel/x86_64/net_bytes.h $(X64_HEADERS) | $(X64BUILD)
 	$(HOSTCC) -O2 -Wall -Wextra -fno-builtin -DHOST_TEST $(filter %.c,$^) -o $@
@@ -1678,11 +1680,11 @@ $(X64_PAGING_TESTS:.bin=.elf): $(X64BUILD)/kernel-paging-%.elf: $(X64_CORE) $(X6
 	$(LD) -m elf_x86_64 -T kernel/x86_64/linker.ld -nostdlib $(filter %.o,$^) -o $@
 $(X64_RING3_TESTS:.bin=.elf): $(X64BUILD)/kernel-ring3-%.elf: $(X64_CORE) $(X64BUILD)/early-ring3-%.o $(X64BUILD)/ring3-check.o $(X64BUILD)/ring3-code.o kernel/x86_64/linker.ld
 	$(LD) -m elf_x86_64 -T kernel/x86_64/linker.ld -nostdlib $(filter %.o,$^) -o $@
-$(X64BUILD)/early-linux.o: kernel/x86_64/early.c kernel/x86_64/linux.h $(X64_HEADERS) | $(X64BUILD)
+$(X64BUILD)/early-linux.o: kernel/x86_64/early.c kernel/x86_64/linux.h kernel/x86_64/ethernet.h kernel/x86_64/e1000.h $(X64_HEADERS) | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -DX64_TEST_LINUX -c $< -o $@
-$(X64BUILD)/early-nvme.o: kernel/x86_64/early.c kernel/x86_64/linux.h $(X64_HEADERS) | $(X64BUILD)
+$(X64BUILD)/early-nvme.o: kernel/x86_64/early.c kernel/x86_64/linux.h kernel/x86_64/ethernet.h kernel/x86_64/e1000.h $(X64_HEADERS) | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -DX64_TEST_LINUX -DX64_TEST_NVME -c $< -o $@
-$(X64BUILD)/early-myfs.o: kernel/x86_64/early.c kernel/x86_64/linux.h $(X64_HEADERS) | $(X64BUILD)
+$(X64BUILD)/early-myfs.o: kernel/x86_64/early.c kernel/x86_64/linux.h kernel/x86_64/ethernet.h kernel/x86_64/e1000.h $(X64_HEADERS) | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -DX64_TEST_LINUX -DX64_TEST_MYFS -c $< -o $@
 $(X64BUILD)/storage-block.o: kernel/block.c kernel/block.h kernel/nvme.h kernel/string.h kernel/x86_64/storage_alloc.h $(X64_HEADERS) | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -DMYOS_STORAGE_X64 -c $< -o $@

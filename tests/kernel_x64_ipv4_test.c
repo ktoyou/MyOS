@@ -1,4 +1,4 @@
-#include "../kernel/x86_64/e1000.h"
+#include "../kernel/x86_64/ethernet.h"
 #include "../kernel/x86_64/net.h"
 
 #define SECOND 1000000000ull
@@ -13,6 +13,7 @@ static const u8 payload[] = {0xa5, 0x5a, 0x11};
 static bool link_up = true;
 static u8 rx[64], tx[64];
 static u32 rx_size, tx_size, tx_count;
+static unsigned init_count, failed_init_count;
 
 extern int puts(const char *text);
 
@@ -25,15 +26,25 @@ static bool equal(const u8 *a, const u8 *b, u32 size) {
     return true;
 }
 
-bool e1000_link(void) {
+static bool fake_init(void) {
+    ++init_count;
+    return true;
+}
+
+static bool failed_init(void) {
+    ++failed_init_count;
+    return false;
+}
+
+static bool fake_link(void) {
     return link_up;
 }
 
-void e1000_mac(u8 out[MAC_BYTES]) {
+static void fake_mac(u8 out[MAC_BYTES]) {
     copy(out, guest_mac, MAC_BYTES);
 }
 
-bool e1000_send(const void *frame, u32 size) {
+static bool fake_send(const void *frame, u32 size) {
     if (!link_up || size > sizeof(tx)) return false;
     copy(tx, frame, size);
     tx_size = size;
@@ -41,12 +52,43 @@ bool e1000_send(const void *frame, u32 size) {
     return true;
 }
 
-u32 e1000_receive(void *frame, u32 capacity) {
+static u32 fake_receive(void *frame, u32 capacity) {
     if (rx_size > capacity) return 0;
     u32 size = rx_size;
     copy(frame, rx, size);
     rx_size = 0;
     return size;
+}
+
+static const struct ethernet64_driver driver = {
+    .name = "IPv4 fixture", .init = fake_init, .link = fake_link,
+    .mac = fake_mac, .send = fake_send, .receive = fake_receive,
+};
+
+static bool absent_driver(void) {
+    static const u8 zeros[MAC_BYTES] = {0};
+    u8 mac[MAC_BYTES] = {1, 2, 3, 4, 5, 6}, frame[ETH_HEADER] = {0x5a};
+    ethernet64_mac(mac);
+    return !ethernet64_name() && !ethernet64_link() && equal(mac, zeros, sizeof(mac)) &&
+           !ethernet64_send(frame, sizeof(frame)) &&
+           !ethernet64_receive(frame, sizeof(frame)) && frame[0] == 0x5a;
+}
+
+static bool check_driver(void) {
+    struct ethernet64_driver failed = driver;
+    failed.init = NULL;
+    if (!absent_driver() || ethernet64_attach(NULL) || ethernet64_attach(&failed)) return false;
+    failed.init = failed_init;
+    if (ethernet64_attach(&failed) || failed_init_count != 1 || !absent_driver()) return false;
+
+    if (!ethernet64_attach(&driver) || ethernet64_name() != driver.name ||
+        !ethernet64_link() || init_count != 1) return false;
+    link_up = false;
+    bool kept = ethernet64_attach(&driver) && !ethernet64_attach(&failed) &&
+                !ethernet64_link() && ethernet64_name() == driver.name &&
+                init_count == 1 && failed_init_count == 1;
+    link_up = true;
+    return kept;
 }
 
 static void queue_arp_reply(const u8 mac[MAC_BYTES]) {
@@ -175,6 +217,7 @@ static bool check_ipv4(void) {
 }
 
 int main(void) {
+    if (!check_driver()) { puts("Ethernet: driver attachment FAIL"); return 4; }
     if (!check_retries()) { puts("IPv4: ARP retries/negative cache FAIL"); return 1; }
     if (!check_arp()) { puts("IPv4: ARP replies/link reset FAIL"); return 2; }
     if (!check_ipv4()) { puts("IPv4: packet validation/dispatch FAIL"); return 3; }

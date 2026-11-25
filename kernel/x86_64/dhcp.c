@@ -1,5 +1,5 @@
 #include "dhcp.h"
-#include "e1000.h"
+#include "ethernet.h"
 #include "net_bytes.h"
 
 #define SECOND 1000000000ull
@@ -226,7 +226,7 @@ static void receive(void *context, u32 source, u32 dest, u8 protocol, const u8 *
 bool dhcp64_start(u32 seed) {
     if (client.state != OFF) return true;
     if (!net64_enable_dhcp(receive)) return false;
-    e1000_mac(client.mac);
+    ethernet64_mac(client.mac);
     client.random = seed ? seed : 1;
     client.state = WAIT_LINK;
     return true;
@@ -234,7 +234,7 @@ bool dhcp64_start(u32 seed) {
 
 bool dhcp64_poll(u64 now, net64_receiver receiver) {
     if (client.state == OFF) return false;
-    if (!e1000_link()) {
+    if (!ethernet64_link()) {
         clear_lease();
         client.state = WAIT_LINK;
         return false;
