@@ -382,6 +382,12 @@ static long check_named_file(long dir) {
         call(8, fd, 0, 2, 0) != 4099 || call(17, fd, (word)buffer, 2, 4097) != 2 ||
         buffer[0] != 'Z' || buffer[1] != 'X' || call(17, fd, (word)buffer, 2, 0) != 2 ||
         buffer[0] != 'A' || buffer[1] != 'B') return 160;
+    int pipe[2];
+    if (call(22, (word)pipe, 0, 0, 0) || call(74, pipe[0], 0, 0, 0) != -22 ||
+        call(75, pipe[1], 0, 0, 0) != -22 || call(3, pipe[0], 0, 0, 0) ||
+        call(3, pipe[1], 0, 0, 0) || call(74, fd, 0, 0, 0) || call(75, read_only, 0, 0, 0) ||
+        call(74, dir, 0, 0, 0) || call(75, dir, 0, 0, 0) ||
+        call(74, -1, 0, 0, 0) != -9 || call(75, -1, 0, 0, 0) != -9) return 183;
     register word offset __asm__("r9") = 0;
     register word descriptor __asm__("r8") = (word)fd;
     register word flags __asm__("r10") = 1;
