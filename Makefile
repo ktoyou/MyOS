@@ -1671,7 +1671,7 @@ $(X64_RING3_TESTS:.bin=.elf): $(X64BUILD)/kernel-ring3-%.elf: $(X64_CORE) $(X64B
 	$(LD) -m elf_x86_64 -T kernel/x86_64/linker.ld -nostdlib $(filter %.o,$^) -o $@
 $(X64BUILD)/early-linux.o: kernel/x86_64/early.c kernel/x86_64/linux.h $(X64_HEADERS) | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -DX64_TEST_LINUX -c $< -o $@
-$(X64BUILD)/linux_elf.o $(X64BUILD)/linux_syscall.o $(X64BUILD)/linux_file.o $(X64BUILD)/linux_fb.o $(X64BUILD)/linux_mmap.o $(X64BUILD)/linux_random.o $(X64BUILD)/linux_time.o $(X64BUILD)/linux_signal.o $(X64BUILD)/linux_socket.o $(X64BUILD)/linux_pipe.o $(X64BUILD)/linux_userns.o $(X64BUILD)/linux_pidns.o $(X64BUILD)/linux_vfs.o $(X64BUILD)/linux_task.o: $(X64BUILD)/%.o: kernel/x86_64/%.c kernel/x86_64/linux.h kernel/x86_64/linux_task.h $(X64_HEADERS) | $(X64BUILD)
+$(X64BUILD)/linux_elf.o $(X64BUILD)/linux_syscall.o $(X64BUILD)/linux_file.o $(X64BUILD)/linux_fb.o $(X64BUILD)/linux_mmap.o $(X64BUILD)/linux_random.o $(X64BUILD)/linux_time.o $(X64BUILD)/linux_signal.o $(X64BUILD)/linux_socket.o $(X64BUILD)/linux_pipe.o $(X64BUILD)/linux_userns.o $(X64BUILD)/linux_pidns.o $(X64BUILD)/linux_vfs.o $(X64BUILD)/linux_seccomp.o $(X64BUILD)/linux_seccomp_bpf.o $(X64BUILD)/linux_task.o: $(X64BUILD)/%.o: kernel/x86_64/%.c kernel/x86_64/linux.h kernel/x86_64/linux_task.h $(X64_HEADERS) | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
 $(X64BUILD)/linux_syscall.o: X64CFLAGS += -I$(BUILD)
 $(X64BUILD)/linux_syscall.o: $(BUILD)/build_info.h
@@ -1679,10 +1679,12 @@ $(X64BUILD)/linux-entry.o: kernel/x86_64/linux_syscall.asm | $(X64BUILD)
 	$(NASM) -f elf64 $< -o $@
 $(X64BUILD)/early-linux.o $(X64BUILD)/linux_file.o $(X64BUILD)/linux_fb.o: kernel/x86_64/linux_fb.h
 $(X64BUILD)/linux_file.o: kernel/x86_64/linux_input.h
+$(X64BUILD)/linux_task.o $(X64BUILD)/linux_seccomp.o: kernel/x86_64/linux_seccomp.h
+$(X64BUILD)/linux_seccomp.o $(X64BUILD)/linux_seccomp_bpf.o: kernel/x86_64/linux_seccomp_bpf.h
 $(X64BUILD)/linux_socket.o: kernel/x86_64/net.h kernel/x86_64/net_bytes.h kernel/x86_64/tcp.h
 $(X64BUILD)/linux_input.o: kernel/x86_64/linux_input.c kernel/x86_64/linux_input.h kernel/x86_64/linux.h kernel/x86_64/linux_task.h $(X64_HEADERS) | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
-$(X64BUILD)/kernel-linux.elf: $(X64_CORE) $(X64_LINUX_NET) $(X64BUILD)/early-linux.o $(X64BUILD)/linux_elf.o $(X64BUILD)/linux_syscall.o $(X64BUILD)/linux_file.o $(X64BUILD)/linux_fb.o $(X64BUILD)/linux_input.o $(X64BUILD)/linux_mmap.o $(X64BUILD)/linux_random.o $(X64BUILD)/linux_time.o $(X64BUILD)/linux_signal.o $(X64BUILD)/linux_socket.o $(X64BUILD)/linux_pipe.o $(X64BUILD)/linux_userns.o $(X64BUILD)/linux_pidns.o $(X64BUILD)/linux_vfs.o $(X64BUILD)/linux_task.o $(X64BUILD)/linux-entry.o kernel/x86_64/linker.ld
+$(X64BUILD)/kernel-linux.elf: $(X64_CORE) $(X64_LINUX_NET) $(X64BUILD)/early-linux.o $(X64BUILD)/linux_elf.o $(X64BUILD)/linux_syscall.o $(X64BUILD)/linux_file.o $(X64BUILD)/linux_fb.o $(X64BUILD)/linux_input.o $(X64BUILD)/linux_mmap.o $(X64BUILD)/linux_random.o $(X64BUILD)/linux_time.o $(X64BUILD)/linux_signal.o $(X64BUILD)/linux_socket.o $(X64BUILD)/linux_pipe.o $(X64BUILD)/linux_userns.o $(X64BUILD)/linux_pidns.o $(X64BUILD)/linux_vfs.o $(X64BUILD)/linux_seccomp.o $(X64BUILD)/linux_seccomp_bpf.o $(X64BUILD)/linux_task.o $(X64BUILD)/linux-entry.o kernel/x86_64/linker.ld
 	$(LD) -m elf_x86_64 -T kernel/x86_64/linker.ld -nostdlib $(filter %.o,$^) -o $@
 $(X64BUILD)/linux-probe.o: tests/linux_x64_probe.S | $(X64BUILD)
 	$(CC) -m64 -c $< -o $@
@@ -1701,6 +1703,10 @@ $(X64BUILD)/linux-udp-recverr-probe.elf: $(X64BUILD)/linux-udp-recverr-probe.o
 $(X64BUILD)/linux-tcp-probe.o: tests/kernel_x64_tcp_probe.c | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
 $(X64BUILD)/linux-tcp-probe.elf: $(X64BUILD)/linux-tcp-probe.o
+	$(LD) -m elf_x86_64 -static -no-pie $< -o $@
+$(X64BUILD)/linux-seccomp-probe.o: tests/kernel_x64_seccomp_probe.c | $(X64BUILD)
+	$(CC) $(X64CFLAGS) -c $< -o $@
+$(X64BUILD)/linux-seccomp-probe.elf: $(X64BUILD)/linux-seccomp-probe.o
 	$(LD) -m elf_x86_64 -static -no-pie $< -o $@
 $(X64BUILD)/linux-dns-probe.elf: tests/kernel_x64_dns_probe.c | $(X64BUILD)
 	$(CC) -m64 -O2 -Wall -Wextra $< -o $@
@@ -1807,6 +1813,9 @@ kernel-x64-tcp-smoke: $(X64BUILD)/kernel-linux.bin $(X64BUILD)/linux-tcp-probe.e
 	python3 tests/kernel_x64_tcp_smoke.py
 kernel-x64-dns-smoke: $(X64BUILD)/kernel-linux.bin $(X64BUILD)/linux-dns-probe.elf
 	python3 tests/kernel_x64_dns_smoke.py $(X64BUILD)/linux-dns-probe.elf
+.PHONY: kernel-x64-seccomp-smoke
+kernel-x64-seccomp-smoke: $(X64BUILD)/kernel-linux.bin $(X64BUILD)/linux-seccomp-probe.elf
+	python3 tests/kernel_x64_seccomp_smoke.py
 kernel-x64-ring3-smoke: $(X64_RING3_TESTS)
 	python3 tests/kernel_x64_smoke.py --ring3
 .PHONY: kernel-x64-linux-smoke

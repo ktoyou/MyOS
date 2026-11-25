@@ -174,6 +174,9 @@ struct linux64_poll_wait {
     bool input;
 };
 
+struct linux64_seccomp_filter;
+struct linux64_sigsys_state;
+
 struct linux64_task {
     struct linux64_frame frame;
     u64 cpu_ns;
@@ -194,6 +197,8 @@ struct linux64_task {
     i32 tid, visible_tid, vfork_child;
     u16 ds_selector, es_selector, fs_selector, gs_selector;
     enum linux64_task_state state;
+    struct linux64_seccomp_filter *seccomp;
+    struct linux64_sigsys_state *sigsys;
     bool finish_wait, no_new_privs;
     uptr xstate_physical;
 };
@@ -234,6 +239,8 @@ bool linux64_task_cpu_ns(u64 *nanos);
 const struct linux64_process *linux64_process_by_pid(i32 pid);
 u16 linux64_task_count(void);
 void linux64_task_syscall(struct linux64_frame *frame);
+bool linux64_deliver_seccomp_sigsys(struct linux64_frame *frame, u16 trap, u32 arch, uptr *user_frame);
+bool linux64_rt_sigreturn(struct linux64_frame *frame, uptr user_frame);
 void linux64_retain_files(struct linux64_process *process);
 void linux64_close_files(struct linux64_process *process);
 void linux64_close_on_exec(struct linux64_process *process);
