@@ -482,6 +482,86 @@ static long check_flock(long dir) {
     return 0;
 }
 
+enum { RECORD_READ = 0, RECORD_WRITE = 1, RECORD_UNLOCK = 2, RECORD_GET = 5, RECORD_SET = 6 };
+
+struct record_request {
+    short type, whence;
+    long start, length;
+    int pid;
+};
+
+static long set_record(long fd, short type, short whence, long start, long length) {
+    struct record_request lock = {.type = type, .whence = whence, .start = start, .length = length};
+    return call(72, fd, RECORD_SET, (word)&lock, 0);
+}
+
+static int record_matches(long fd, short requested, long start, long length, short type,
+                          long first, long extent, long owner) {
+    struct record_request lock = {.type = requested, .start = start, .length = length, .pid = 123};
+    if (call(72, fd, RECORD_GET, (word)&lock, 0) || lock.type != type || lock.whence) return 0;
+    if (type == RECORD_UNLOCK) return lock.start == start && lock.length == length && lock.pid == 123;
+    return lock.start == first && lock.length == extent && lock.pid == owner;
+}
+
+static long check_record_locks(long dir) {
+    static const char name[] = "profile-record-lock";
+    long fd = call(257, dir, (word)name, 0xc2, 0600);
+    long independent = call(257, dir, (word)name, 0, 0);
+    long owner = call(39, 0, 0, 0, 0);
+    word stat[18];
+    if (fd < 3 || independent < 3 || set_record(independent, RECORD_WRITE, 0, 0, 0) != -9 ||
+        call(72, fd, RECORD_SET, 1, 0) != -14 || set_record(fd, RECORD_WRITE, 0, -1, 1) != -22 ||
+        set_record(fd, RECORD_WRITE, 0, 0x7fffffffffffffffL, 2) != -75 ||
+        set_record(fd, RECORD_READ, 0, 0x40000000, 1) ||
+        call(5, fd, (word)stat, 0, 0) || stat[6]) return 177;
+    if (set_record(fd, RECORD_WRITE, 0, 0, 0) || call(8, fd, 30, 0, 0) != 30 ||
+        set_record(fd, RECORD_READ, 1, 0, -10) || set_record(fd, RECORD_UNLOCK, 2, 24, 2) ||
+        !record_matches(fd, RECORD_WRITE, 0, 0, RECORD_UNLOCK, 0, 0, 0)) return 178;
+
+    long child = call(57, 0, 0, 0, 0);
+    if (!child) {
+        unsigned result = 0;
+        if (call(3, independent, 0, 0, 0) ||
+            !record_matches(fd, RECORD_READ, 0, 1, RECORD_WRITE, 0, 20, owner) ||
+            !record_matches(fd, RECORD_WRITE, 21, 1, RECORD_READ, 20, 4, owner) ||
+            !record_matches(fd, RECORD_WRITE, 24, 2, RECORD_UNLOCK, 0, 0, 0) ||
+            !record_matches(fd, RECORD_WRITE, 26, 1, RECORD_READ, 26, 4, owner) ||
+            !record_matches(fd, RECORD_READ, 30, 1, RECORD_WRITE, 30, 0, owner) ||
+            set_record(fd, RECORD_WRITE, 0, 0, 0) != -11 || set_record(fd, RECORD_WRITE, 0, 24, 2))
+            result = 1;
+        call(60, result, 0, 0, 0);
+        __builtin_trap();
+    }
+    int status = 0;
+    if (child < 0 || call(61, child, (word)&status, 0, 0) != child || status ||
+        set_record(fd, RECORD_WRITE, 0, 20, 10)) return 179;
+
+    long duplicate = call(32, fd, 0, 0, 0);
+    if (duplicate < 3) return 180;
+    child = call(57, 0, 0, 0, 0);
+    if (!child) {
+        call(60, !record_matches(fd, RECORD_READ, 24, 1, RECORD_WRITE, 0, 0, owner), 0, 0, 0);
+        __builtin_trap();
+    }
+    if (child < 0 || call(61, child, (word)&status, 0, 0) != child || status ||
+        call(73, fd, 2, 0, 0) || call(3, duplicate, 0, 0, 0)) return 180;
+    child = call(57, 0, 0, 0, 0);
+    if (!child) {
+        call(60, set_record(fd, RECORD_WRITE, 0, 0, 0) != 0, 0, 0, 0);
+        __builtin_trap();
+    }
+    if (child < 0 || call(61, child, (word)&status, 0, 0) != child || status ||
+        set_record(fd, RECORD_WRITE, 0, 0, 0) || call(3, independent, 0, 0, 0)) return 181;
+    child = call(57, 0, 0, 0, 0);
+    if (!child) {
+        call(60, set_record(fd, RECORD_WRITE, 0, 0, 0) != 0, 0, 0, 0);
+        __builtin_trap();
+    }
+    if (child < 0 || call(61, child, (word)&status, 0, 0) != child || status ||
+        call(3, fd, 0, 0, 0) || call(263, dir, (word)name, 0, 0)) return 182;
+    return 0;
+}
+
 static long check_directories(void) {
     static char path[] = "/tmp/myos-dir-0000000000";
     unsigned pid = (unsigned)call(39, 0, 0, 0, 0);
@@ -533,6 +613,8 @@ static long check_directories(void) {
     if (named) return named;
     long locks = check_flock(dir);
     if (locks) return locks;
+    long records = check_record_locks(dir);
+    if (records) return records;
     if (call(3, dir, 0, 0, 0)) return 51;
     if (call(63, (word)buffer, 0, 0, 0)) return 52;
     if (buffer[0] == 'M') {

@@ -7,7 +7,7 @@
 enum {
     EPERM = 1, ENOENT = 2, EIO = 5, EBADF = 9, EAGAIN = 11, ENOMEM = 12, EACCES = 13, EFAULT = 14,
     EBUSY = 16, EEXIST = 17, ENOTDIR = 20, EISDIR = 21, EINVAL = 22, ENFILE = 23, EMFILE = 24,
-    ENOTTY = 25, EFBIG = 27, EROFS = 30,
+    ENOTTY = 25, EFBIG = 27, EROFS = 30, ENOLCK = 37, EOVERFLOW = 75,
     ENODEV = 19, ENXIO = 6, ESPIPE = 29, ENAMETOOLONG = 36, ENOSYS = 38, ELOOP = 40, ENOTSOCK = 88,
     EOPNOTSUPP = 95, EADDRINUSE = 98, ECONNREFUSED = 111, AF_UNIX = 1, MSG_DONTWAIT = 0x40,
     SOCK_TYPE_MASK = 0xf,
@@ -18,6 +18,7 @@ enum {
     O_DIRECT = 0x4000, O_LARGEFILE = 0x8000, O_DIRECTORY = 0x10000, O_NOFOLLOW = 0x20000,
     O_CLOEXEC = 0x80000,
     F_DUPFD = 0, F_GETFD = 1, F_SETFD = 2, F_GETFL = 3, F_SETFL = 4,
+    F_GETLK = 5, F_SETLK = 6, F_RDLCK = 0, F_WRLCK = 1, F_UNLCK = 2,
     F_DUPFD_CLOEXEC = 1030, F_ADD_SEALS = 1033, F_GET_SEALS = 1034,
     LOCK_SH = 1, LOCK_EX = 2, LOCK_NB = 4, LOCK_UN = 8,
     F_SEAL_SEAL = 1, F_SEAL_SHRINK = 2, F_SEAL_GROW = 4, F_SEAL_EXEC = 0x20,
@@ -59,9 +60,35 @@ static struct memfd {
     u32 seals;
     unsigned references;
     unsigned shared_locks;
+    unsigned record_lock_count;
     bool exclusive_lock;
     bool linked;
 } memfds[OPEN_FILE_COUNT];
+
+struct record_lock_range { long first, last; };
+
+static struct record_lock {
+    struct memfd *backing;
+    const struct linux64_process *owner;
+    struct record_lock_range range;
+    i16 type;
+} record_locks[1024];
+
+struct linux_flock_record {
+    i16 type, whence;
+    u32 padding0;
+    long start, length;
+    i32 pid;
+    u32 padding1;
+};
+
+_Static_assert(sizeof(struct linux_flock_record) == 32 &&
+               __builtin_offsetof(struct linux_flock_record, start) == 8 &&
+               __builtin_offsetof(struct linux_flock_record, pid) == 24, "Linux x86-64 flock");
+
+enum { RECORD_LOCK_COUNT = sizeof(record_locks) / sizeof(*record_locks) };
+#define RECORD_LOCK_EOF __LONG_MAX__
+
 static u64 next_memfd_inode = 1;
 static u64 next_special_inode = 1;
 static u64 next_pid_ns_link_inode = 1ull << 33;
@@ -421,6 +448,23 @@ static void close_slot(struct linux64_fd_slot *slot) {
     *slot = (struct linux64_fd_slot){0};
 }
 
+static void remove_record_lock(struct record_lock *lock) {
+    --lock->backing->record_lock_count;
+    lock->backing = NULL;
+}
+
+static void close_descriptor(struct linux64_process *owner, unsigned fd) {
+    struct linux64_fd_slot *slot = &owner->fds[fd];
+    struct memfd *backing = slot->file ? slot->file->memfd : NULL;
+    if (backing && backing->record_lock_count) {
+        for (unsigned i = 0; i < RECORD_LOCK_COUNT; ++i) {
+            struct record_lock *lock = &record_locks[i];
+            if (lock->backing == backing && lock->owner == owner) remove_record_lock(lock);
+        }
+    }
+    close_slot(slot);
+}
+
 void linux64_pipe_finish(struct linux64_task *task) {
     release_file(task->pipe_io.file);
     task->pipe_io.file = NULL;
@@ -543,12 +587,12 @@ static void close_file(i32 fd) {
 }
 
 void linux64_close_files(struct linux64_process *process) {
-    for (unsigned fd = 0; fd < FD_COUNT; ++fd) close_slot(&process->fds[fd]);
+    for (unsigned fd = 0; fd < FD_COUNT; ++fd) close_descriptor(process, fd);
 }
 
 void linux64_close_on_exec(struct linux64_process *process) {
     for (unsigned fd = 0; fd < FD_COUNT; ++fd)
-        if (process->fds[fd].cloexec) close_slot(&process->fds[fd]);
+        if (process->fds[fd].cloexec) close_descriptor(process, fd);
 }
 
 void linux64_retain_files(struct linux64_process *process) {
@@ -816,10 +860,10 @@ void linux64_scm_close(i32 fd) {
 }
 
 static long install_file(struct file_handle *file, unsigned target, bool cloexec) {
-    struct linux64_fd_slot *slot = &linux64_current->process->fds[target];
+    struct linux64_process *process = linux64_current->process;
     ++file->references;
-    close_slot(slot);
-    *slot = (struct linux64_fd_slot){file, cloexec};
+    close_descriptor(process, target);
+    process->fds[target] = (struct linux64_fd_slot){file, cloexec};
     return target;
 }
 
@@ -1195,8 +1239,127 @@ static long linux_ftruncate(i32 fd, uptr size) {
     return resize_backing(handle->memfd, size);
 }
 
-static long linux_fcntl(i32 fd, i32 command, u32 value) {
+static long record_range(const struct file_handle *file, const struct linux_flock_record *request,
+                         struct record_lock_range *range) {
+    long base = 0;
+    switch (request->whence) {
+    case 0: break;
+    case 1: base = (long)file->offset; break;
+    case 2: base = (long)file->memfd->size; break;
+    default: return -EINVAL;
+    }
+    if (__builtin_add_overflow(base, request->start, &range->first)) return -EOVERFLOW;
+    if (range->first < 0) return -EINVAL;
+    if (request->length < 0) {
+        range->last = range->first - 1;
+        range->first += request->length;
+        return range->first < 0 ? -EINVAL : 0;
+    }
+    if (!request->length) range->last = RECORD_LOCK_EOF;
+    else if (__builtin_add_overflow(range->first, request->length - 1, &range->last)) return -EOVERFLOW;
+    return 0;
+}
+
+static bool ranges_overlap(struct record_lock_range a, struct record_lock_range b) {
+    return a.first <= b.last && b.first <= a.last;
+}
+
+static bool ranges_touch(struct record_lock_range a, struct record_lock_range b) {
+    return a.first - b.last <= 1 && b.first - a.last <= 1;
+}
+
+static const struct record_lock *record_conflict(const struct record_lock *request) {
+    if (request->type == F_UNLCK || !request->backing->record_lock_count) return NULL;
+    for (unsigned i = 0; i < RECORD_LOCK_COUNT; ++i) {
+        const struct record_lock *lock = &record_locks[i];
+        if (lock->backing == request->backing && lock->owner != request->owner &&
+            (lock->type == F_WRLCK || request->type == F_WRLCK) &&
+            ranges_overlap(lock->range, request->range)) return lock;
+    }
+    return NULL;
+}
+
+static long replace_record_lock(struct record_lock request) {
+    if (request.type != F_UNLCK) {
+        /* Соседние диапазоны одного владельца и типа уже объединены. */
+        for (unsigned i = 0; i < RECORD_LOCK_COUNT; ++i) {
+            const struct record_lock *lock = &record_locks[i];
+            if (lock->backing != request.backing || lock->owner != request.owner ||
+                lock->type != request.type || !ranges_touch(lock->range, request.range)) continue;
+            if (lock->range.first < request.range.first) request.range.first = lock->range.first;
+            if (lock->range.last > request.range.last) request.range.last = lock->range.last;
+        }
+    }
+
+    struct record_lock pieces[3];
+    unsigned count = 0, available = 0;
+    if (request.type != F_UNLCK) pieces[count++] = request;
+    for (unsigned i = 0; i < RECORD_LOCK_COUNT; ++i) {
+        const struct record_lock *lock = &record_locks[i];
+        if (!lock->backing) {
+            ++available;
+        } else if (lock->backing == request.backing && lock->owner == request.owner &&
+                   ranges_overlap(lock->range, request.range)) {
+            ++available;
+            /* У непересекающихся диапазонов остаётся не более двух краёв. */
+            if (lock->range.first < request.range.first) {
+                pieces[count] = *lock;
+                pieces[count++].range.last = request.range.first - 1;
+            }
+            if (lock->range.last > request.range.last) {
+                pieces[count] = *lock;
+                pieces[count++].range.first = request.range.last + 1;
+            }
+        }
+    }
+    if (available < count) return -ENOLCK;
+    for (unsigned i = 0; i < RECORD_LOCK_COUNT; ++i) {
+        struct record_lock *lock = &record_locks[i];
+        if (lock->backing == request.backing && lock->owner == request.owner &&
+            ranges_overlap(lock->range, request.range)) remove_record_lock(lock);
+    }
+    for (unsigned i = 0, added = 0; i < RECORD_LOCK_COUNT && added < count; ++i) {
+        if (record_locks[i].backing) continue;
+        record_locks[i] = pieces[added++];
+        ++request.backing->record_lock_count;
+    }
+    return 0;
+}
+
+static long linux_record_lock(const struct file_handle *file, i32 command, uptr address) {
+    if (!file->memfd) return -EINVAL;
+    struct linux_flock_record input;
+    if (paging64_copy_from_user(&input, address, sizeof(input)) != sizeof(input)) return -EFAULT;
+    if (input.type != F_RDLCK && input.type != F_WRLCK &&
+        (input.type != F_UNLCK || command == F_GETLK)) return -EINVAL;
+    const struct linux64_process *owner = linux64_current->process;
+    struct record_lock request = {.backing = file->memfd, .owner = owner, .type = input.type};
+    long result = record_range(file, &input, &request.range);
+    if (result) return result;
+    if (command == F_SETLK) {
+        u32 access = file->flags & O_ACCMODE;
+        if ((input.type == F_RDLCK && access == O_WRONLY) || (input.type == F_WRLCK && !access))
+            return -EBADF;
+        if (record_conflict(&request)) return -EAGAIN;
+        return replace_record_lock(request);
+    }
+    const struct record_lock *conflict = record_conflict(&request);
+    if (conflict) {
+        input.type = conflict->type;
+        input.whence = 0;
+        input.start = conflict->range.first;
+        input.length = conflict->range.last == RECORD_LOCK_EOF ? 0 : conflict->range.last - input.start + 1;
+        input.pid = linux64_pid_number(conflict->owner->pid_identity, owner->pid_ns);
+    } else {
+        input.type = F_UNLCK;
+    }
+    return paging64_copy_to_user(address, &input, sizeof(input)) == sizeof(input) ? 0 : -EFAULT;
+}
+
+static long linux_fcntl(i32 fd, i32 command, uptr argument) {
     if (!open_file(fd)) return -EBADF;
+    if (command == F_GETLK || command == F_SETLK) return linux_record_lock(file_at(fd), command, argument);
+    u32 value = (u32)argument;
     if (command == F_DUPFD || command == F_DUPFD_CLOEXEC)
         return dup_fd(fd, value, command == F_DUPFD_CLOEXEC);
     struct memfd *memfd = file_at(fd)->memfd;
@@ -1911,7 +2074,7 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
         return linux_open(AT_FDCWD, arg0, (u32)arg1, (u32)arg2);
     case 3: /* close */
         if (!open_file(fd)) return -EBADF;
-        close_file(fd);
+        close_descriptor(linux64_current->process, (unsigned)fd);
         return 0;
     case 4: /* stat */
     case 6: /* lstat */
@@ -2028,7 +2191,7 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
     case 53: /* socketpair */
         return linux_socketpair(fd, (u32)arg1, (i32)arg2, arg3);
     case 72: /* fcntl */
-        return linux_fcntl(fd, (i32)arg1, (u32)arg2);
+        return linux_fcntl(fd, (i32)arg1, arg2);
     case 73: /* flock */
         return linux_flock(fd, (u32)arg1);
     case 74: /* fsync */
