@@ -25,12 +25,18 @@ static struct wl_output *output;
 static struct wl_seat *seat;
 static struct wl_keyboard *keyboard;
 static struct wl_pointer *pointer;
+static struct wl_data_device_manager *data_manager;
+static struct wl_data_device *source_device;
+static struct wl_data_source *selection_source;
 static struct wl_surface *input_surface;
 static int output_width, output_height, output_scale, width, height;
 static bool output_ready, configured, presented, released, xrgb;
 static bool keymap_ready, focused, repeat_ready, shift_down, shift_active;
 static unsigned key_events;
 static const uint32_t window_colors[2][2] = {{0xf14c88, 0x13c5a2}, {0x8254ec, 0xd49d12}};
+static const char clipboard_mime[] = "text/plain;charset=utf-8";
+static const char clipboard_text[] = "MyOS Wayland clipboard\n";
+static bool clipboard_sent;
 
 enum {
     SUBSURFACE_X = 61, SUBSURFACE_MOVED_X = 103, SUBSURFACE_Y = 54,
@@ -162,12 +168,17 @@ static void keyboard_key(void *data, struct wl_keyboard *obj, uint32_t serial,
                          uint32_t time, uint32_t key, uint32_t state) {
     (void)data;
     (void)obj;
-    (void)serial;
     (void)time;
     static const uint32_t expected_keys[] = {42, 30, 30, 42};
     static const uint32_t expected_states[] = {1, 1, 0, 0};
     if (!focused || !repeat_ready || key_events >= 4 || key != expected_keys[key_events] ||
         state != expected_states[key_events] || (key == 30 && !shift_active)) fail("keyboard key sequence");
+    if (key == KEY_A && state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+        if (!serial) fail("clipboard key serial");
+        wl_data_device_set_selection(source_device, selection_source, serial);
+        /* Повтор номера того же нажатия не должен очистить новый буфер. */
+        wl_data_device_set_selection(source_device, NULL, serial);
+    }
     if (key == 42) shift_down = state != 0;
     ++key_events;
 }
@@ -330,6 +341,8 @@ static void global(void *data, struct wl_registry *registry, uint32_t id,
     } else if (!strcmp(interface, "wl_seat") && version >= 7) {
         seat = wl_registry_bind(registry, id, &wl_seat_interface, 7);
         wl_seat_add_listener(seat, &seat_events, NULL);
+    } else if (!strcmp(interface, "wl_data_device_manager")) {
+        data_manager = wl_registry_bind(registry, id, &wl_data_device_manager_interface, 1);
     }
 }
 
@@ -432,7 +445,7 @@ static struct wl_display *start_compositor(void) {
     return NULL;
 }
 
-static struct wl_buffer *create_buffer(int width, int height, const uint32_t colors[2][2]) {
+static struct wl_buffer *create_buffer(struct wl_shm *shared, int width, int height, const uint32_t colors[2][2]) {
     const int offset = 64;
     int stride = width * 4 + 32;
     size_t length = offset + (size_t)stride * height;
@@ -445,7 +458,7 @@ static struct wl_buffer *create_buffer(int width, int height, const uint32_t col
         uint32_t *row = (uint32_t *)(memory + offset + (size_t)y * stride);
         for (int x = 0; x < width; ++x) row[x] = colors[y >= height / 2][x >= width / 2];
     }
-    struct wl_shm_pool *pool = wl_shm_create_pool(shm, fd, length);
+    struct wl_shm_pool *pool = wl_shm_create_pool(shared, fd, length);
     struct wl_buffer *buffer = wl_shm_pool_create_buffer(pool, offset, width, height, stride, WL_SHM_FORMAT_XRGB8888);
     wl_shm_pool_destroy(pool);
     if (munmap(memory, length) || close(fd)) fail("close local shared memory");
@@ -557,7 +570,7 @@ static void check_popup(struct wl_display *display, struct xdg_surface *parent, 
         fail("configure and acknowledge popup");
     check_popup_pixels(fb, &layout, &mode, &state, false);
 
-    struct wl_buffer *buffer = create_buffer(POPUP_WIDTH, POPUP_HEIGHT, popup_colors);
+    struct wl_buffer *buffer = create_buffer(shm, POPUP_WIDTH, POPUP_HEIGHT, popup_colors);
     commit_frame(display, surface, buffer, POPUP_WIDTH, POPUP_HEIGHT);
     check_popup_pixels(fb, &layout, &mode, &state, true);
     wl_surface_commit(surface);
@@ -599,8 +612,8 @@ static void check_subsurface(struct wl_display *display, struct wl_surface *pare
 
     struct wl_surface *child = wl_compositor_create_surface(compositor);
     struct wl_subsurface *role = wl_subcompositor_get_subsurface(subcompositor, child, parent);
-    struct wl_buffer *buffer = create_buffer(SUBSURFACE_WIDTH, SUBSURFACE_HEIGHT, subsurface_colors);
-    struct wl_buffer *next = create_buffer(SUBSURFACE_WIDTH, SUBSURFACE_HEIGHT, subsurface_desync_colors);
+    struct wl_buffer *buffer = create_buffer(shm, SUBSURFACE_WIDTH, SUBSURFACE_HEIGHT, subsurface_colors);
+    struct wl_buffer *next = create_buffer(shm, SUBSURFACE_WIDTH, SUBSURFACE_HEIGHT, subsurface_desync_colors);
     const uint32_t background = window_colors[0][0];
     wl_subsurface_set_position(role, SUBSURFACE_X, SUBSURFACE_Y);
     wl_surface_attach(child, buffer, 0, 0);
@@ -636,13 +649,222 @@ static void check_subsurface(struct wl_display *display, struct wl_surface *pare
     if (wl_display_roundtrip(display) < 0) fail("destroy subsurface resources");
 }
 
+struct clipboard_selection {
+    struct wl_data_offer *pending, *current;
+    unsigned updates;
+    bool has_mime;
+};
+
+static struct clipboard_selection owner_selection;
+
+static void clipboard_mime_offered(void *data, struct wl_data_offer *offer, const char *mime) {
+    struct clipboard_selection *selection = data;
+    if (offer != selection->pending) fail("clipboard MIME without offer");
+    if (!strcmp(mime, clipboard_mime)) selection->has_mime = true;
+}
+
+static const struct wl_data_offer_listener clipboard_offer_events = {.offer = clipboard_mime_offered};
+
+static void clipboard_offer(void *data, struct wl_data_device *device, struct wl_data_offer *offer) {
+    (void)device;
+    struct clipboard_selection *selection = data;
+    if (selection->pending) fail("unclaimed clipboard offer");
+    selection->pending = offer;
+    selection->has_mime = false;
+    wl_data_offer_add_listener(offer, &clipboard_offer_events, data);
+}
+
+static void clipboard_selected(void *data, struct wl_data_device *device, struct wl_data_offer *offer) {
+    (void)device;
+    struct clipboard_selection *selection = data;
+    if (offer && (offer != selection->pending || !selection->has_mime)) fail("clipboard selection MIME");
+    if (selection->current) wl_data_offer_destroy(selection->current);
+    selection->current = offer;
+    selection->pending = NULL;
+    ++selection->updates;
+}
+
+static const struct wl_data_device_listener clipboard_device_events = {
+    .data_offer = clipboard_offer, .selection = clipboard_selected,
+};
+
+static void clipboard_send(void *data, struct wl_data_source *source, const char *mime, int32_t fd) {
+    (void)data;
+    if (source != selection_source || clipboard_sent || strcmp(mime, clipboard_mime) ||
+        write(fd, clipboard_text, sizeof(clipboard_text) - 1) != sizeof(clipboard_text) - 1 || close(fd))
+        fail("write clipboard pipe");
+    clipboard_sent = true;
+}
+
+static const struct wl_data_source_listener clipboard_source_events = {.send = clipboard_send};
+
+struct clipboard_receiver {
+    struct wl_compositor *compositor;
+    struct wl_shm *shm;
+    struct xdg_wm_base *shell;
+    struct wl_seat *seat;
+    struct wl_data_device_manager *manager;
+    struct wl_surface *surface;
+    struct clipboard_selection selection;
+    bool configured, focused;
+    unsigned key_events;
+};
+
+static void receiver_global(void *data, struct wl_registry *registry, uint32_t id,
+                            const char *interface, uint32_t version) {
+    struct clipboard_receiver *receiver = data;
+    if (!strcmp(interface, "wl_compositor") && version >= 4)
+        receiver->compositor = wl_registry_bind(registry, id, &wl_compositor_interface, 4);
+    else if (!strcmp(interface, "wl_shm"))
+        receiver->shm = wl_registry_bind(registry, id, &wl_shm_interface, 1);
+    else if (!strcmp(interface, "xdg_wm_base")) {
+        receiver->shell = wl_registry_bind(registry, id, &xdg_wm_base_interface, 1);
+        xdg_wm_base_add_listener(receiver->shell, &shell_events, NULL);
+    } else if (!strcmp(interface, "wl_seat") && version >= 7)
+        receiver->seat = wl_registry_bind(registry, id, &wl_seat_interface, 7);
+    else if (!strcmp(interface, "wl_data_device_manager"))
+        receiver->manager = wl_registry_bind(registry, id, &wl_data_device_manager_interface, 1);
+}
+
+static const struct wl_registry_listener receiver_registry_events = {
+    .global = receiver_global, .global_remove = global_remove,
+};
+
+static void receiver_configure(void *data, struct xdg_surface *surface, uint32_t serial) {
+    struct clipboard_receiver *receiver = data;
+    xdg_surface_ack_configure(surface, serial);
+    receiver->configured = true;
+}
+
+static const struct xdg_surface_listener receiver_surface_events = {.configure = receiver_configure};
+
+static void receiver_keyboard_enter(void *data, struct wl_keyboard *object, uint32_t serial,
+                                    struct wl_surface *surface, struct wl_array *keys) {
+    (void)object;
+    struct clipboard_receiver *receiver = data;
+    if (!serial || keys->size || surface != receiver->surface || receiver->focused) fail("clipboard focus enter");
+    receiver->focused = true;
+}
+
+static void receiver_keyboard_leave(void *data, struct wl_keyboard *object, uint32_t serial,
+                                    struct wl_surface *surface) {
+    (void)object;
+    (void)serial;
+    struct clipboard_receiver *receiver = data;
+    if (surface != receiver->surface || !receiver->focused) fail("clipboard focus leave");
+    receiver->focused = false;
+}
+
+static void receiver_keyboard_key(void *data, struct wl_keyboard *object, uint32_t serial,
+                                  uint32_t time, uint32_t key, uint32_t state) {
+    (void)object;
+    (void)time;
+    struct clipboard_receiver *receiver = data;
+    uint32_t expected = receiver->key_events ? WL_KEYBOARD_KEY_STATE_RELEASED : WL_KEYBOARD_KEY_STATE_PRESSED;
+    if (!receiver->focused || !serial || key != KEY_B || receiver->key_events >= 2 || state != expected)
+        fail("clipboard receiver key sequence");
+    ++receiver->key_events;
+}
+
+static void receiver_keyboard_modifiers(void *data, struct wl_keyboard *object, uint32_t serial,
+                                        uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t group) {
+    (void)data;
+    (void)object;
+    (void)serial;
+    if (depressed || latched || locked || group) fail("clipboard keyboard modifiers");
+}
+
+static const struct wl_keyboard_listener receiver_keyboard_events = {
+    .keymap = keyboard_keymap, .enter = receiver_keyboard_enter, .leave = receiver_keyboard_leave,
+    .key = receiver_keyboard_key, .modifiers = receiver_keyboard_modifiers, .repeat_info = keyboard_repeat,
+};
+
+static void read_clipboard(struct wl_display *owner, struct wl_display *reader,
+                           struct wl_data_offer *offer, bool expected) {
+    int pipe_fd[2];
+    if (pipe2(pipe_fd, O_NONBLOCK | O_CLOEXEC)) fail("clipboard pipe");
+    wl_data_offer_receive(offer, clipboard_mime, pipe_fd[1]);
+    if (close(pipe_fd[1]) || wl_display_roundtrip(reader) < 0 ||
+        (owner != reader && wl_display_roundtrip(owner) < 0)) fail("dispatch clipboard receive");
+    char received[sizeof(clipboard_text)];
+    ssize_t length = read(pipe_fd[0], received, sizeof(received));
+    if (expected) {
+        if (!clipboard_sent || length != sizeof(clipboard_text) - 1 || memcmp(received, clipboard_text, length) ||
+            read(pipe_fd[0], received, sizeof(received))) fail("clipboard payload or EOF");
+    } else if (clipboard_sent || length) {
+        fail("stale clipboard offer was readable");
+    }
+    if (close(pipe_fd[0])) fail("close clipboard pipe");
+}
+
+static void check_clipboard(struct wl_display *owner, struct wl_surface *owner_surface, struct wl_buffer *owner_buffer) {
+    struct wl_display *display = wl_display_connect(socket_path);
+    if (!display) fail("connect clipboard receiver");
+    struct clipboard_receiver receiver = {0};
+    struct wl_registry *registry = wl_display_get_registry(display);
+    wl_registry_add_listener(registry, &receiver_registry_events, &receiver);
+    if (wl_display_roundtrip(display) < 0 || !receiver.compositor || !receiver.shm || !receiver.shell ||
+        !receiver.seat || !receiver.manager) fail("bind clipboard receiver globals");
+
+    struct wl_data_device *device = wl_data_device_manager_get_data_device(receiver.manager, receiver.seat);
+    wl_data_device_add_listener(device, &clipboard_device_events, &receiver.selection);
+    struct wl_keyboard *reader_keyboard = wl_seat_get_keyboard(receiver.seat);
+    wl_keyboard_add_listener(reader_keyboard, &receiver_keyboard_events, &receiver);
+    receiver.surface = wl_compositor_create_surface(receiver.compositor);
+    struct xdg_surface *role = xdg_wm_base_get_xdg_surface(receiver.shell, receiver.surface);
+    xdg_surface_add_listener(role, &receiver_surface_events, &receiver);
+    struct xdg_toplevel *toplevel = xdg_surface_get_toplevel(role);
+    xdg_toplevel_add_listener(toplevel, &toplevel_events, NULL);
+    wl_surface_commit(receiver.surface);
+    if (wl_display_roundtrip(display) < 0 || !receiver.configured || receiver.focused || receiver.selection.current)
+        fail("clipboard exposed before receiver focus");
+
+    struct wl_buffer *frame = create_buffer(receiver.shm, width, height, window_colors);
+    commit_frame(display, receiver.surface, frame, width, height);
+    if (wl_display_roundtrip(owner) < 0 || focused || !receiver.focused || !receiver.selection.current)
+        fail("clipboard offer after keyboard focus change");
+    wl_surface_attach(owner_surface, owner_buffer, 0, 0);
+    wl_surface_damage_buffer(owner_surface, 0, 0, width, height);
+    wl_surface_commit(owner_surface);
+    if (wl_display_roundtrip(owner) < 0 || wl_display_roundtrip(display) < 0 || focused || !receiver.focused)
+        fail("clipboard keyboard focus after background repaint");
+    if (!owner_selection.current) fail("missing stale clipboard offer");
+    read_clipboard(owner, owner, owner_selection.current, false);
+    read_clipboard(owner, display, receiver.selection.current, false);
+    static const char ready[] = "Wayland clipboard receiver focused\n";
+    if (write(1, ready, sizeof(ready) - 1) != sizeof(ready) - 1) fail("clipboard receiver marker");
+    while (receiver.key_events != 2)
+        if (wl_display_dispatch(display) < 0) fail("dispatch clipboard receiver keyboard");
+    read_clipboard(owner, display, receiver.selection.current, true);
+
+    unsigned updates = receiver.selection.updates;
+    wl_data_source_destroy(selection_source);
+    selection_source = NULL;
+    if (wl_display_roundtrip(owner) < 0 || wl_display_roundtrip(display) < 0 || receiver.selection.current ||
+        receiver.selection.updates == updates) fail("clear clipboard after source destruction");
+
+    wl_keyboard_release(reader_keyboard);
+    xdg_toplevel_destroy(toplevel);
+    xdg_surface_destroy(role);
+    wl_surface_destroy(receiver.surface);
+    wl_buffer_destroy(frame);
+    if (wl_display_roundtrip(display) < 0) fail("close clipboard receiver");
+    wl_display_disconnect(display);
+}
+
 int main(void) {
     struct wl_display *display = start_compositor();
     struct wl_registry *registry = wl_display_get_registry(display);
     wl_registry_add_listener(registry, &registry_events, NULL);
-    if (wl_display_roundtrip(display) < 0 || !compositor || !subcompositor || !shm || !shell || !output ||
+    if (wl_display_roundtrip(display) < 0 || !compositor || !subcompositor || !shm || !shell || !output || !data_manager ||
         wl_display_roundtrip(display) < 0 || !output_ready || !xrgb || output_scale != 1)
         fail("bind display globals");
+
+    source_device = wl_data_device_manager_get_data_device(data_manager, seat);
+    wl_data_device_add_listener(source_device, &clipboard_device_events, &owner_selection);
+    selection_source = wl_data_device_manager_create_data_source(data_manager);
+    wl_data_source_add_listener(selection_source, &clipboard_source_events, NULL);
+    wl_data_source_offer(selection_source, clipboard_mime);
 
     struct wl_surface *surface = wl_compositor_create_surface(compositor);
     input_surface = surface;
@@ -656,11 +878,16 @@ int main(void) {
         width != output_width || height != output_height || width > 8192 || height > 8192)
         fail("configure toplevel");
 
-    struct wl_buffer *buffer = create_buffer(width, height, window_colors);
+    struct wl_buffer *buffer = create_buffer(shm, width, height, window_colors);
     commit_frame(display, surface, buffer, width, height);
     if (!keyboard || !focused || !pointer || !pointer_focused || pointer_frames != 1) fail("missing input focus");
     static const char ready[] = "Wayland keyboard focused\n";
     if (write(1, ready, sizeof(ready) - 1) != sizeof(ready) - 1) fail("keyboard marker");
+    while (key_events < 2)
+        if (wl_display_dispatch(display) < 0) fail("dispatch clipboard key press");
+    static const char published[] = "Wayland clipboard serial published\n";
+    if (wl_display_roundtrip(display) < 0 || !owner_selection.current ||
+        write(1, published, sizeof(published) - 1) != sizeof(published) - 1) fail("publish clipboard selection");
     while (key_events != 4 || shift_active)
         if (wl_display_dispatch(display) < 0) fail("dispatch keyboard events");
 
@@ -706,6 +933,18 @@ int main(void) {
     commit_frame(display, surface, buffer, width, height);
     if (!focused || !pointer_focused || pointer_frames != 8) fail("focus remapped toplevel");
     wl_surface_destroy(cursor);
+    wl_pointer_release(pointer);
+    check_clipboard(display, surface, buffer);
+    static const char clipboard_marker[] = "Wayland clipboard received and cleared\n";
+    if (write(1, clipboard_marker, sizeof(clipboard_marker) - 1) != sizeof(clipboard_marker) - 1)
+        fail("clipboard completion marker");
+    wl_surface_attach(surface, NULL, 0, 0);
+    wl_surface_commit(surface);
+    if (wl_display_roundtrip(display) < 0) fail("detach clipboard owner");
+    configured = false;
+    wl_surface_commit(surface);
+    if (wl_display_roundtrip(display) < 0 || !configured) fail("configure clipboard owner again");
+    commit_frame(display, surface, buffer, width, height);
 
     /* Выход исходного процесса останавливает гостя с последним кадром для QMP. */
     static const char marker[] = "Wayland shared memory frame presented\n";

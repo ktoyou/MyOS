@@ -93,9 +93,15 @@ def main():
 
         def input_events(vm):
             vm.wait('Wayland keyboard focused')
-            events = [{'type': 'key', 'data': {'down': down, 'key': {'type': 'qcode', 'data': key}}}
-                      for key, down in (('shift', True), ('a', True), ('a', False), ('shift', False))]
-            vm.qmp('input-send-event', {'events': events})
+
+            def send_keys(keys, down):
+                events = [{'type': 'key', 'data': {'down': down, 'key': {'type': 'qcode', 'data': key}}}
+                          for key in keys]
+                vm.qmp('input-send-event', {'events': events})
+
+            send_keys(('shift', 'a'), True)
+            vm.wait('Wayland clipboard serial published')
+            send_keys(('a', 'shift'), False)
 
             vm.wait('Wayland pointer focused')
             initial = directory / 'cursor-initial.ppm'
@@ -126,16 +132,20 @@ def main():
                     {'type': 'btn', 'data': {'button': button, 'down': down}} for down in states
                 ]})
                 vm.wait(marker)
+            vm.wait('Wayland clipboard receiver focused')
+            send_keys(('b',), True)
+            send_keys(('b',), False)
 
         serial = boot_x64(directory, 'x64-linux-wayland', payload, kernel_end,
                           ['Wayland popup configured, presented and restored',
                            'Wayland subsurface synchronized, presented and restored',
+                           'Wayland clipboard received and cleared',
                            'Wayland shared memory frame presented', 'Linux x86-64 exit status=0x00'],
                           live_root_header=root, screenshot=shot, interact=input_events)
         assert 'x86-64 exception' not in serial, serial
         check_pixels(shot)
         check_fallback_cursor(shot, POINTER_DX + CURSOR_DX, POINTER_DY + CURSOR_DY)
-    print('OVMF: Wayland xdg-shell, popups, subsurfaces, shared memory, framebuffer, keyboard and pointer: PASS', flush=True)
+    print('OVMF: Wayland xdg-shell, popups, subsurfaces, shared memory, framebuffer, input and clipboard: PASS', flush=True)
 
 
 if __name__ == '__main__':

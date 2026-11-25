@@ -1,4 +1,5 @@
 #include "seat.h"
+#include "clipboard.h"
 #include "keyboard.h"
 
 #include <stdlib.h>
@@ -9,6 +10,7 @@ struct wayland_seat {
     struct wl_list clients;
     struct wayland_keyboard *keyboard;
     struct wayland_pointer *pointer;
+    struct wayland_clipboard *clipboard;
 };
 
 struct seat_client {
@@ -71,6 +73,22 @@ static const struct wl_seat_interface seat_requests = {
     .release = release_request,
 };
 
+static bool owns_seat(void *data, struct wl_resource *resource) {
+    if (!wl_resource_instance_of(resource, &wl_seat_interface, &seat_requests)) return false;
+    struct seat_client *entry = wl_resource_get_user_data(resource);
+    return entry->seat == data;
+}
+
+static void keyboard_focused(void *data, struct wl_client *client) {
+    struct wayland_seat *seat = data;
+    wayland_clipboard_focus(seat->clipboard, client);
+}
+
+static void input_pressed(void *data, struct wl_client *client, uint32_t serial) {
+    struct wayland_seat *seat = data;
+    wayland_clipboard_input(seat->clipboard, client, serial);
+}
+
 static void bind_seat(struct wl_client *client, void *data, uint32_t version, uint32_t id) {
     struct wayland_seat *seat = data;
     struct seat_client *entry = calloc(1, sizeof(*entry));
@@ -92,14 +110,16 @@ bool wayland_seat_init(struct wayland_seat **result, struct wl_display *display,
     struct wayland_seat *seat = calloc(1, sizeof(*seat));
     if (!seat) return false;
     wl_list_init(&seat->clients);
-    if (!wayland_keyboard_init(&seat->keyboard, display, keymap_path, capabilities_changed, seat) ||
-        !wayland_pointer_init(&seat->pointer, display, width, height, ops, data, capabilities_changed, seat)) {
+    if (!wayland_keyboard_init(&seat->keyboard, display, keymap_path, capabilities_changed,
+                               keyboard_focused, input_pressed, seat) ||
+        !wayland_pointer_init(&seat->pointer, display, width, height, ops, data,
+                              capabilities_changed, input_pressed, seat)) {
         wayland_seat_destroy(seat);
         return false;
     }
     if (seat->keyboard || seat->pointer) {
         seat->global = wl_global_create(display, &wl_seat_interface, 7, seat, bind_seat);
-        if (!seat->global) {
+        if (!seat->global || !wayland_clipboard_init(&seat->clipboard, display, owns_seat, seat)) {
             wayland_seat_destroy(seat);
             return false;
         }
@@ -122,6 +142,7 @@ void wayland_seat_pointer_detach(struct wayland_seat *seat, struct wl_resource *
 
 void wayland_seat_destroy(struct wayland_seat *seat) {
     if (!seat) return;
+    wayland_clipboard_destroy(seat->clipboard);
     if (seat->global) wl_global_destroy(seat->global);
     wayland_pointer_destroy(seat->pointer);
     wayland_keyboard_destroy(seat->keyboard);

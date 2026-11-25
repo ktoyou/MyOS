@@ -24,6 +24,8 @@ struct wayland_keyboard {
     struct wl_display *display;
     struct wl_event_source *input;
     void (*changed)(void *);
+    void (*focused)(void *, struct wl_client *);
+    void (*pressed)(void *, struct wl_client *, uint32_t);
     void *data;
     struct wl_resource *focus;
     struct wl_listener focus_destroy;
@@ -65,6 +67,7 @@ static void focus_destroyed(struct wl_listener *listener, void *data) {
     struct wayland_keyboard *keyboard = wl_container_of(listener, keyboard, focus_destroy);
     wl_list_remove(&listener->link);
     keyboard->focus = NULL;
+    keyboard->focused(keyboard->data, NULL);
 }
 
 void wayland_keyboard_focus(struct wayland_keyboard *keyboard, struct wl_resource *surface) {
@@ -78,6 +81,7 @@ void wayland_keyboard_focus(struct wayland_keyboard *keyboard, struct wl_resourc
         wl_list_remove(&keyboard->focus_destroy.link);
     }
     keyboard->focus = surface;
+    keyboard->focused(keyboard->data, surface ? wl_resource_get_client(surface) : NULL);
     if (!surface) return;
     wl_resource_add_destroy_listener(surface, &keyboard->focus_destroy);
     uint32_t serial = wl_display_next_serial(keyboard->display);
@@ -94,13 +98,17 @@ static void set_key(struct wayland_keyboard *keyboard, uint32_t code, bool down,
     if (!keyboard->focus) return;
     uint32_t serial = wl_display_next_serial(keyboard->display);
     struct keyboard_client *client;
+    bool delivered = false;
     wl_list_for_each(client, &keyboard->clients, link) {
         if (!client_owns(client->resource, keyboard->focus)) continue;
+        delivered = true;
         wl_keyboard_send_key(client->resource, serial, time, code,
             down ? WL_KEYBOARD_KEY_STATE_PRESSED : WL_KEYBOARD_KEY_STATE_RELEASED);
         if (changes & (XKB_STATE_MODS_DEPRESSED | XKB_STATE_MODS_LATCHED | XKB_STATE_MODS_LOCKED |
                        XKB_STATE_LAYOUT_EFFECTIVE)) send_modifiers(keyboard, client->resource, serial);
     }
+    if (down && delivered && !keyboard->dropped)
+        keyboard->pressed(keyboard->data, wl_resource_get_client(keyboard->focus), serial);
 }
 
 static bool sync_keys(struct wayland_keyboard *keyboard, uint32_t time) {
@@ -205,7 +213,9 @@ static bool load_keymap(struct wayland_keyboard *keyboard, const char *path) {
 }
 
 bool wayland_keyboard_init(struct wayland_keyboard **result, struct wl_display *display,
-                           const char *keymap_path, void (*changed)(void *), void *data) {
+                           const char *keymap_path, void (*changed)(void *),
+                           void (*focused)(void *, struct wl_client *),
+                           void (*pressed)(void *, struct wl_client *, uint32_t), void *data) {
     if (!keymap_path) return true;
     int fd = open("/dev/input/event0", O_RDONLY | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0) {
@@ -220,6 +230,8 @@ bool wayland_keyboard_init(struct wayland_keyboard **result, struct wl_display *
     }
     keyboard->display = display;
     keyboard->changed = changed;
+    keyboard->focused = focused;
+    keyboard->pressed = pressed;
     keyboard->data = data;
     keyboard->fd = fd;
     keyboard->keymap_fd = -1;
