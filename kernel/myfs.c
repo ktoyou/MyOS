@@ -922,6 +922,26 @@ static int myfs_readdir_impl(u32 dir, u32 *pos, struct fs_dirent *out) {
 
 /* ---------------------------------------------------------------- пути */
 
+static int check_child_name(const char *name) {
+    unsigned len = 0;
+    while (name[len]) {
+        if (name[len] == '/') return FS_EINVAL;
+        if (++len > name_max()) return FS_ENAMETOOLONG;
+    }
+    return len ? FS_OK : FS_EINVAL;
+}
+
+int myfs_lookup_child(u32 parent, const char *name, u32 *ino) {
+    if (!mounted) return FS_ENODEV;
+    int r = check_child_name(name);
+    if (r) return r;
+    r = dir_check(parent);
+    if (r) return r;
+    r = dir_lookup(parent, name, ino, NULL);
+    if (r) return r;
+    return *ino ? FS_OK : FS_ENOENT;
+}
+
 /* Разбор пути: "/a/b", "a/b", "../x", "." — относительно cwd */
 static int myfs_resolve_impl(u32 cwd, const char *path, u32 *ino) {
     if (!mounted) return FS_ENODEV;
@@ -1024,91 +1044,139 @@ static int myfs_remove_impl(u32 cwd, const char *path,bool keep) {
     return r;
 }
 
-static int myfs_rename_impl(u32 cwd, const char *src, const char *dst,bool keep_victim) {
-    if (!mounted) return FS_ENODEV;
-    u32 sparent, soff, dparent, existing;
-    char sname[FS_NAME_MAX + 1], dname[FS_NAME_MAX + 1];
-    int r = resolve_parent(cwd, src, &sparent, sname);
-    if (r) return r;
-    u32 ino;
-    r = dir_lookup(sparent, sname, &ino, &soff);
-    if (r) return r;
-    if (!ino) return FS_ENOENT;
-
-    /* mv file dir  ->  dir/file */
-    if (myfs_resolve(cwd, dst, &existing) == FS_OK && dir_check(existing) == FS_OK) {
-        dparent = existing;
-        memcpy(dname, sname, sizeof(sname));
-    } else if ((r = resolve_parent(cwd, dst, &dparent, dname))) {
-        return r;
-    }
+static int rename_entry(u32 sparent, u32 soff, u32 ino, u32 dparent, const char *dname,
+                        bool keep_victim, bool exact) {
     u32 taken, toff = 0;
-    r = dir_lookup(dparent, dname, &taken, &toff);
+    int r = dir_lookup(dparent, dname, &taken, &toff);
+    if (r || taken == ino) return r;
+
+    struct inode source, victim;
+    r = iread(ino, &source);
     if (r) return r;
+    bool moving_directory = source.type == FS_TYPE_DIR;
     if (taken) {
-        /* POSIX: rename поверх существующего файла заменяет его. */
-        if (taken == ino) return FS_OK;
-        if (dir_check(taken) == FS_OK) return FS_EEXIST; /* каталог не затираем */
-        struct inode victim;
-        if ((r = iread(taken, &victim))) return r;
-        if ((r = dir_set(dparent, toff, 0, NULL))) return r;
-        struct inode source;if((r=iread(ino,&source)))return r;
-        if(source.type==FS_TYPE_DIR)return FS_ENOTDIR;
-        victim.links = 0;
-        if(!keep_victim) {free_all_blocks(&victim);victim.type=FS_TYPE_FREE;ino_note_free(taken);}
-        if ((r = iwrite(taken, &victim))) return r;
-        if(!keep_victim)available_inodes++;
+        r = iread(taken, &victim);
+        if (r) return r;
+        if (victim.type == FS_TYPE_DIR) {
+            if (!exact) return FS_EEXIST;
+            if (!moving_directory) return FS_EISDIR;
+            int empty = dir_empty(taken);
+            if (empty < 0) return empty;
+            if (!empty) return FS_ENOTEMPTY;
+        } else if (moving_directory) return FS_ENOTDIR;
     }
 
-    /* нельзя переместить каталог внутрь самого себя */
-    for (u32 p = dparent; ;) {
-        if (p == ino) return FS_EINVAL;
-        if (p == FS_ROOT) break;
+    bool changed_parent = moving_directory && sparent != dparent;
+    u32 dotdot = 0;
+    if (changed_parent) {
+        /* Повреждённый цикл в цепочке родителей не должен зациклить ядро. */
+        for (u32 p = dparent, depth = 0; p != FS_ROOT; ++depth) {
+            if (p == ino) return FS_EINVAL;
+            if (depth == sb.inode_count) return FS_EIO;
+            u32 parent;
+            r = dir_lookup(p, "..", &parent, NULL);
+            if (r) return r;
+            if (!parent) return FS_EIO;
+            p = parent;
+        }
         u32 parent;
-        r = dir_lookup(p, "..", &parent, NULL);
+        r = dir_lookup(ino, "..", &parent, &dotdot);
         if (r) return r;
-        if (!parent) return FS_EIO;
-        p = parent;
+        if (parent != sparent) return FS_EIO;
     }
 
-    if ((r = dir_add(dparent, dname, ino))) return r;
+    r = taken ? dir_set(dparent, toff, ino, dname) : dir_add(dparent, dname, ino);
+    if (r) return r;
     if ((r = dir_set(sparent, soff, 0, NULL))) return r;
+    if (changed_parent && (r = dir_set(ino, dotdot, dparent, ".."))) return r;
 
-    u32 dotdot, dotdot_ino;
-    if (dir_check(ino) == FS_OK && dparent != sparent) {
-        r = dir_lookup(ino, "..", &dotdot_ino, &dotdot);
-        if (r) return r;
-        if (dotdot_ino) return dir_set(ino, dotdot, dparent, "..");
+    if (taken) {
+        victim.links = 0;
+        if (!keep_victim) {
+            free_all_blocks(&victim);
+            victim.type = FS_TYPE_FREE;
+            ino_note_free(taken);
+        }
+        if ((r = iwrite(taken, &victim))) return r;
+        if (!keep_victim) ++available_inodes;
     }
     return FS_OK;
 }
 
-static int myfs_getpath_impl(u32 ino, char *buf, u32 len) {
-    u32 chain[32];
-    int depth = 0, r;
-    while (ino != FS_ROOT) {
-        if (depth == 32) return FS_EINVAL;
-        chain[depth++] = ino;
-        r = dir_lookup(ino, "..", &ino, NULL);
+static int myfs_rename_impl(u32 cwd, const char *src, const char *dst, bool keep_victim) {
+    if (!mounted) return FS_ENODEV;
+    u32 sparent, soff, ino, dparent;
+    char sname[FS_NAME_MAX + 1], dname[FS_NAME_MAX + 1];
+    int r = resolve_parent(cwd, src, &sparent, sname);
+    if (r) return r;
+    r = dir_lookup(sparent, sname, &ino, &soff);
+    if (r) return r;
+    if (!ino) return FS_ENOENT;
+
+    /* Для mv существующий каталог назначения означает перенос внутрь него. */
+    if (myfs_resolve(cwd, dst, &dparent) == FS_OK && dir_check(dparent) == FS_OK)
+        return rename_entry(sparent, soff, ino, dparent, sname, keep_victim, false);
+    r = resolve_parent(cwd, dst, &dparent, dname);
+    if (r) return r;
+    return rename_entry(sparent, soff, ino, dparent, dname, keep_victim, false);
+}
+
+static int rename_parent_check(u32 ino) {
+    struct inode parent;
+    int r = iread(ino, &parent);
+    if (r) return r;
+    if (!parent.links) return FS_ENOENT;
+    return parent.type == FS_TYPE_DIR ? FS_OK : FS_ENOTDIR;
+}
+
+static int myfs_rename_at_impl(u32 sparent, const char *src, u32 dparent, const char *dst,
+                               bool keep_victim) {
+    if (!mounted) return FS_ENODEV;
+    int r = check_child_name(src);
+    if (r) return r;
+    r = check_child_name(dst);
+    if (r) return r;
+    if (!strcmp(src, ".") || !strcmp(src, "..") || !strcmp(dst, ".") || !strcmp(dst, ".."))
+        return FS_EINVAL;
+    r = rename_parent_check(sparent);
+    if (r) return r;
+    if (sparent != dparent) {
+        r = rename_parent_check(dparent);
         if (r) return r;
-        if (!ino) return FS_ENOENT;
     }
-    u32 pos = 0;
-    buf[pos++] = '/';
-    for (int i = depth - 1; i >= 0; i--) {
-        u32 parent = (i == depth - 1) ? FS_ROOT : chain[i + 1];
-        struct fs_dirent de;
-        u32 p = 0;
-        bool found = false;
-        while (myfs_readdir(parent, &p, &de) == 1) if (de.ino == chain[i]) { found = true; break; }
-        if (!found) return FS_ENOENT;
-        u32 n = strlen(de.name);
-        if (pos + n + 2 > len) return FS_ENAMETOOLONG;
-        memcpy(buf + pos, de.name, n);
-        pos += n;
-        if (i) buf[pos++] = '/';
-    }
+    u32 ino, soff;
+    r = dir_lookup(sparent, src, &ino, &soff);
+    if (r) return r;
+    if (!ino) return FS_ENOENT;
+    return rename_entry(sparent, soff, ino, dparent, dst, keep_victim, true);
+}
+
+static int myfs_getpath_impl(u32 ino, char *buf, u32 len) {
+    if (len < 2) return FS_ENAMETOOLONG;
+    u32 pos = len - 1;
     buf[pos] = 0;
+    if (ino == FS_ROOT) buf[--pos] = '/';
+    for (u32 depth = 0; ino != FS_ROOT; ++depth) {
+        if (depth == sb.inode_count) return FS_EIO;
+        u32 parent;
+        int r = dir_lookup(ino, "..", &parent, NULL);
+        if (r) return r;
+        if (!parent) return FS_ENOENT;
+        if (parent == ino) return FS_EIO;
+        struct fs_dirent de;
+        u32 entry = 0;
+        do {
+            r = myfs_readdir(parent, &entry, &de);
+            if (r <= 0) return r ? r : FS_ENOENT;
+        } while (de.ino != ino);
+        u32 n = strlen(de.name);
+        if (!n || n >= pos) return FS_ENAMETOOLONG;
+        pos -= n;
+        memcpy(buf + pos, de.name, n);
+        buf[--pos] = '/';
+        ino = parent;
+    }
+    memmove(buf, buf + pos, len - pos);
     return FS_OK;
 }
 
@@ -1468,3 +1536,7 @@ int myfs_set_time(u32 ino,u32 when) {int r=transaction_begin();return r?r:transa
 int myfs_set_size(u32 ino,u32 size) {int r=transaction_begin();return r?r:transaction_end(myfs_set_size_impl(ino,size));}
 
 int myfs_rename_keep(u32 cwd,const char *src,const char *dst,bool keep) {int r=transaction_begin();return r?r:transaction_end(myfs_rename_impl(cwd,src,dst,keep));}
+int myfs_rename_at(u32 src_parent, const char *src, u32 dst_parent, const char *dst, bool keep_victim) {
+    int r = transaction_begin();
+    return r ? r : transaction_end(myfs_rename_at_impl(src_parent, src, dst_parent, dst, keep_victim));
+}

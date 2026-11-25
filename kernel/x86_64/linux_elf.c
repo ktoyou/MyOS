@@ -1,6 +1,7 @@
 #include "linux_task.h"
 #include "paging.h"
 #include "segments.h"
+#include "linux_myfs.h"
 
 #define USER_MIN        0x400000ul
 #define BOOT_STACK_SIZE (4 * PMM_PAGE_SIZE)
@@ -323,7 +324,7 @@ long linux64_execve(struct linux64_frame *frame, uptr filename, uptr argv, uptr 
 }
 
 bool linux64_run(const struct linux64_file *file, const char *path, uptr path_length,
-                 const struct linux64_file_source *source) {
+                 const struct linux64_file_source *source, const struct boot_info *boot) {
     if (!path || !path_length || path_length >= LINUX64_PATH_LIMIT || path[0] != '/' ||
         path[path_length]) return false;
     const unsigned offset = 0;
@@ -337,6 +338,7 @@ bool linux64_run(const struct linux64_file *file, const char *path, uptr path_le
     linux64_use_files(source, path, path_length);
     linux64_reset_signals();
     linux64_clock_init();
+    linux64_myfs_mount(boot, source);
     linux64_task_clock_resume();
     segments64_enter_user(entry, stack);
 }

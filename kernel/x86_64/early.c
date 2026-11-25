@@ -194,7 +194,8 @@ static u64 linux_test_directory(const void *context, const char *path) {
     return 0;
 }
 
-static void linux_test_boot(uptr root_phys, uptr root_bytes) {
+static void linux_test_boot(const struct boot_info *boot) {
+    uptr root_phys = boot->root_phys, root_bytes = boot->root_bytes;
     /* Заголовок, путь запуска, основной ELF и записи дополнительных файлов. */
     if (!root_phys || root_bytes < 32) return;
     const u64 *header = pmm64_pointer(root_phys);
@@ -224,7 +225,7 @@ static void linux_test_boot(uptr root_phys, uptr root_bytes) {
         .lookup = linux_test_lookup, .context = &test_files, .directory = linux_test_directory,
         .entry_path = linux_test_entry_path,
     };
-    linux64_run(&test_files.executable, path, header[3] - 1, &source);
+    linux64_run(&test_files.executable, path, header[3] - 1, &source, boot);
 }
 #endif
 
@@ -420,7 +421,7 @@ __attribute__((noreturn)) void kernel64_main(const struct boot_info *boot, u32 e
 #ifdef X64_TEST_LINUX
     if (linux64_net_init()) serial_puts("MyOS x86-64: e1000 Ethernet ready\n");
     linux64_fb_init(&fb.surface);
-    linux_test_boot(boot->root_phys, boot->root_bytes);
+    linux_test_boot(boot);
     serial_puts("Linux x86-64 ELF rejected\n");
 #endif
 #endif

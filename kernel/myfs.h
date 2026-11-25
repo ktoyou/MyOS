@@ -14,12 +14,14 @@ int myfs_transaction_end(int result);
 int myfs_unmount(void);
 
 int  myfs_resolve(u32 cwd, const char *path, u32 *ino);
+int  myfs_lookup_child(u32 parent, const char *name, u32 *ino);
 int  myfs_create(u32 cwd, const char *path, int type, u32 *ino);
 int  myfs_remove(u32 cwd, const char *path);
 int myfs_remove_keep(u32 cwd,const char *path,bool keep);
 int myfs_reap_orphan(u32 ino);
 int myfs_rename_keep(u32 cwd,const char *src,const char *dst,bool keep);
 int  myfs_rename(u32 cwd, const char *src, const char *dst);
+int  myfs_rename_at(u32 src_parent, const char *src, u32 dst_parent, const char *dst, bool keep_victim);
 
 int  myfs_read(u32 ino, u32 off, void *buf, u32 n);         /* -> прочитано байт */
 int  myfs_write(u32 ino, u32 off, const void *buf, u32 n);  /* -> записано байт */

@@ -39,6 +39,7 @@ struct linux64_file {
     u32 mode, uid, gid;
     i32 proc_fd_owner, proc_fd_number;
     u32 dns_server;
+    u32 myfs_ino, myfs_links, myfs_blocks, myfs_times[3];
     bool writable_directory, live_pages, private_directory;
     bool proc_fd_directory, proc_exe;
 };
@@ -50,8 +51,9 @@ struct linux64_file_source {
     const char *(*entry_path)(const void *context, uptr index);
 };
 
+struct boot_info;
 bool linux64_run(const struct linux64_file *file, const char *path, uptr path_length,
-                 const struct linux64_file_source *source);
+                 const struct linux64_file_source *source, const struct boot_info *boot);
 void linux64_use_files(const struct linux64_file_source *source, const char *path, uptr path_length);
 struct linux64_fd_view {
     struct linux64_file file;
