@@ -8,8 +8,16 @@ static u8 pool[32][4096] __attribute__((aligned(4096)));
 static u64 addresses[256];
 static unsigned allocated,freed,disabled[256],order[32],norder,fail_slot;
 static unsigned codes[64],ncodes,buttons;
+static u32 event_dequeue;
 u32 xhci_test_read(u32 offset) { (void)offset;return 0; }
-void xhci_test_write(u32 offset,u32 value) { (void)offset;(void)value; }
+void xhci_test_write(u32 offset,u32 value) {
+    if (offset == rt + 0x38) event_dequeue = value;
+}
+u32 xhci_test_dma_address(const volatile void *pointer) {
+    uptr address = (uptr)pointer;
+    CHECK(address >= (uptr)pool && address < (uptr)(pool + allocated));
+    return 0x00100000u + (u32)(address - (uptr)pool);
+}
 void kprintf(const char *fmt,...) { (void)fmt; }
 void kb_scancode(u8 code) { CHECK(ncodes<64);codes[ncodes++]=code; }
 void mouse_usb_report(u32 value,i32 x,i32 y,i32 wheel) { (void)x;(void)y;(void)wheel;buttons=value; }
@@ -32,6 +40,7 @@ static void reset(void) {
     memset(devices,0,sizeof(devices));memset(hids,0,sizeof(hids));memset(inventory,0,sizeof(inventory));
     memset(key_refs,0,sizeof(key_refs));memset(mod_refs,0,sizeof(mod_refs));memset(disabled,0,sizeof(disabled));
     allocated=freed=norder=fail_slot=ncodes=buttons=0;poisoned=false;events=0;dcbaa=addresses;
+    event_index=waiting=event_dequeue=0;event_cycle=1;rt=0x1000;
 }
 static void device(unsigned index,int parent,unsigned slot) {
     struct usbdev *d=&devices[index];d->used=d->published=true;d->parent=parent;d->slot=slot;d->port=1;
@@ -39,6 +48,24 @@ static void device(unsigned index,int parent,unsigned slot) {
     hids[index].dev=d;hids[index].protocol=index?2:1;hids[index].active=true;
     hids[index].report=page();CHECK(ring_init(&hids[index].ring));
 }
+static void check_dma_addresses(void) {
+    reset();
+    device(0,-1,1);
+    events = page();
+    struct hid *h = &hids[0];
+    h->dci = 3;
+    h->packet = 8;
+    arm(h);
+
+    CHECK(h->pending == dma_address(h->ring.base) && h->pending != (u32)(uptr)h->ring.base);
+    CHECK(h->ring.base[0].lo == dma_address(h->report) && !h->ring.base[0].hi);
+    h->report[2] = 4;
+    events[0] = (struct trb){h->pending, 0, 1u << 24, TYPE(32) | (1u << 24) | (3u << 16) | 1};
+    pump();
+    CHECK(event_dequeue == (dma_address(&events[1]) | 8u));
+    CHECK(ncodes == 1 && codes[0] == 30 && h->pending == dma_address(&h->ring.base[1]));
+}
+
 int main(void) {
     reset();device(0,-1,1);device(1,0,2);
     const u8 pressed[8]={3,0,4,0,0,0,0,0};keyboard_apply(&hids[0],pressed);
@@ -59,6 +86,8 @@ int main(void) {
     /* Control TDs can wrap early without splitting setup/data/status. */
     struct ring r;CHECK(ring_init(&r));r.next=254;ring_link(&r);
     CHECK(r.next==0 && r.cycle==0 && ((r.base[254].control>>10)&63)==6);
+    CHECK(r.base[254].lo == dma_address(r.base) && !r.base[254].hi);
+    check_dma_addresses();
     reset();
     devices[0].used=true;devices[0].port=7;devices[0].depth=2;devices[0].route=0x21;
     devices[0].speed=3;devices[0].slot=9;
@@ -69,6 +98,6 @@ int main(void) {
     CHECK(routed.route==0x421 && routed.tt_slot==9 && routed.tt_port==3);
     devices[0].depth=5;CHECK(!device_route(&routed,0,1,1));
     CHECK(!device_route(&routed,0,16,1) && !device_route(&routed,NDEV,1,1));
-    puts("USB lifecycle: child-first DMA stop, page reclamation, quarantine, key/button release and reusable rings: PASS");
+    puts("USB lifecycle: child-first DMA stop, page reclamation, quarantine, input release and separate DMA addresses: PASS");
     return 0;
 }
