@@ -10,7 +10,7 @@ enum {
     EBUSY = 16, EEXIST = 17, ENOTDIR = 20, EISDIR = 21, EINVAL = 22, ENFILE = 23, EMFILE = 24,
     ENOTTY = 25, EFBIG = 27, EROFS = 30, ENOLCK = 37, EOVERFLOW = 75,
     ENODEV = 19, ENXIO = 6, ESPIPE = 29, ENAMETOOLONG = 36, ENOSYS = 38, ELOOP = 40, ENOTSOCK = 88,
-    EOPNOTSUPP = 95, EADDRINUSE = 98, ECONNREFUSED = 111, AF_UNIX = 1, MSG_DONTWAIT = 0x40,
+    EOPNOTSUPP = 95, EADDRINUSE = 98, ECONNREFUSED = 111, EINPROGRESS = 115, AF_UNIX = 1, MSG_DONTWAIT = 0x40,
     SOCK_TYPE_MASK = 0xf,
     AT_FDCWD = -100, AT_SYMLINK_NOFOLLOW = 0x100, AT_REMOVEDIR = 0x200, AT_NO_AUTOMOUNT = 0x800,
     AT_EMPTY_PATH = 0x1000,
@@ -179,13 +179,18 @@ static bool epoll_ready(const struct file_handle *file) {
     return false;
 }
 
+static bool socket_needs_poll(const struct linux64_socket *socket, u16 events) {
+    return linux64_socket_is_inet(socket) &&
+           (linux64_socket_is_tcp(socket) || (events & (LINUX64_POLL_READ | LINUX64_POLL_WRITE)));
+}
+
 static u16 poll_fd(const struct linux64_process *process, i32 fd, u16 events, bool *input) {
     if (fd < 0) return 0;
     if (fd >= FD_COUNT) return LINUX64_POLLNVAL;
     const struct file_handle *file = process->fds[fd].file;
     if (!file) return LINUX64_POLLNVAL;
     if (is_input(file->device) && (events & LINUX64_POLL_READ)) *input = true;
-    if (linux64_socket_is_udp(file->socket) && (events & (LINUX64_POLL_READ | LINUX64_POLL_WRITE))) *input = true;
+    if (socket_needs_poll(file->socket, events)) *input = true;
     if (file->device == FILE_EPOLL && (events & LINUX64_POLL_READ) && epoll_needs_poll(file)) *input = true;
     return file_ready(file) & (events | LINUX64_POLLERR | LINUX64_POLLHUP);
 }
@@ -528,8 +533,7 @@ static bool epoll_needs_poll(const struct file_handle *file) {
     for (const struct epoll_watch *watch = file->watches; watch; watch = watch->next)
         if (watch->armed &&
             ((is_input(watch->target->device) && (watch->event.events & LINUX64_POLL_READ)) ||
-             (linux64_socket_is_udp(watch->target->socket) &&
-              (watch->event.events & (LINUX64_POLL_READ | LINUX64_POLL_WRITE))))) return true;
+             socket_needs_poll(watch->target->socket, (u16)watch->event.events))) return true;
     return false;
 }
 
@@ -1130,6 +1134,7 @@ static long socket_attempt(struct linux64_socket_wait *wait) {
     struct linux64_socket *socket = wait->file->socket;
     switch (wait->operation) {
     case SOCKET_CONNECT: {
+        if (linux64_socket_is_tcp(socket)) return linux64_tcp_connect_complete(socket);
         struct linux64_file node;
         long result = linux64_vfs_walk(NULL, wait->path, &node, NULL, true);
         if (result) return result;
@@ -1162,6 +1167,7 @@ static long socket_attempt(struct linux64_socket_wait *wait) {
         if (linux64_socket_is_udp(socket)) return linux64_udp_io(socket, false, wait);
         return socket_write(wait);
     case SOCKET_RECVFROM:
+        if (linux64_socket_is_tcp(socket)) return linux64_tcp_recvfrom(socket, wait);
         return linux64_udp_io(socket, true, wait);
     case SOCKET_SENDMSG:
     case SOCKET_RECVMSG:
@@ -1174,7 +1180,7 @@ static long socket_run(struct linux64_socket_wait wait) {
     bool per_call = wait.operation == SOCKET_WRITE || wait.operation == SOCKET_SENDMSG ||
                     wait.operation == SOCKET_RECVMSG || wait.operation == SOCKET_RECVFROM;
     wait.blocking = !(wait.file->flags & O_NONBLOCK) && !(per_call && (wait.flags & MSG_DONTWAIT));
-    if (wait.operation == SOCKET_SENDMSG && !linux64_socket_is_udp(wait.file->socket)) {
+    if (wait.operation == SOCKET_SENDMSG && !linux64_socket_is_inet(wait.file->socket)) {
         long result = linux64_socket_prepare_rights(wait.address, wait.flags, &wait.rights);
         if (result) return result;
     }
@@ -1212,7 +1218,7 @@ long linux64_recvfrom(i32 fd, uptr buffer, uptr length, u32 flags, uptr address,
     if (!open_file(fd)) return -EBADF;
     struct file_handle *file = file_at(fd);
     if (!file->socket) return -ENOTSOCK;
-    if (!linux64_socket_is_udp(file->socket)) return -EOPNOTSUPP;
+    if (!linux64_socket_is_inet(file->socket)) return -EOPNOTSUPP;
     return socket_run((struct linux64_socket_wait){.file = file, .operation = SOCKET_RECVFROM,
                           .address = buffer, .length = length, .flags = flags, .name = address,
                           .name_length = address_length});
@@ -1221,14 +1227,16 @@ long linux64_recvfrom(i32 fd, uptr buffer, uptr length, u32 flags, uptr address,
 bool linux64_socket_wait_ready(const struct linux64_task *task) {
     const struct linux64_socket_wait *wait = &task->socket_wait;
     const struct linux64_socket *socket = wait->file->socket;
-    if (wait->operation == SOCKET_CONNECT) return linux64_socket_connect_ready(socket, wait->inode);
+    if (wait->operation == SOCKET_CONNECT)
+        return linux64_socket_is_tcp(socket) ? linux64_tcp_connect_result(socket) != -EINPROGRESS :
+                                              linux64_socket_connect_ready(socket, wait->inode);
     if (wait->operation == SOCKET_ACCEPT) return linux64_socket_accept_ready(socket);
     return linux64_socket_io_ready(socket, wait->operation == SOCKET_READ ||
                                          wait->operation == SOCKET_RECVMSG || wait->operation == SOCKET_RECVFROM);
 }
 
 bool linux64_socket_waits_for_network(const struct linux64_task *task) {
-    return linux64_socket_is_udp(task->socket_wait.file->socket);
+    return linux64_socket_is_inet(task->socket_wait.file->socket);
 }
 
 long linux64_socket_wait_resume(void) {
@@ -1239,6 +1247,11 @@ long linux64_socket_wait_resume(void) {
 
 static long socket_path(struct file_handle *file, bool bind, uptr address, u32 length) {
     if (linux64_socket_is_udp(file->socket)) return linux64_udp_path(file->socket, bind, address, length);
+    if (linux64_socket_is_tcp(file->socket)) {
+        long result = linux64_tcp_path(file->socket, bind, address, length);
+        if (result != -EINPROGRESS || (file->flags & O_NONBLOCK)) return result;
+        return socket_run((struct linux64_socket_wait){.file = file, .operation = SOCKET_CONNECT});
+    }
     struct linux64_sockaddr name = {0};
     if (length <= 2 || length > 2 + sizeof(name.path) - 1) return -EINVAL;
     if (paging64_copy_from_user(&name, address, length) != length) return -EFAULT;
