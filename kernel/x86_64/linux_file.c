@@ -2257,8 +2257,12 @@ static long file_stat(const struct linux64_file *file, const struct memfd *memfd
         .rdev = rdev, .size = size, .blksize = PMM_PAGE_SIZE,
         .blocks = file->myfs_ino ? file->myfs_blocks : kind == FILE_SYMLINK ? 0 : (size + 511) / 512,
     };
-    if (file->myfs_ino)
-        for (unsigned i = 0; i < 3; ++i) stat.times[i * 2] = file->myfs_times[i];
+    if (file->myfs_ino) {
+        for (unsigned i = 0; i < 3; ++i) {
+            stat.times[i * 2] = file->myfs_times[i];
+            stat.times[i * 2 + 1] = file->myfs_time_nsec;
+        }
+    }
     return paging64_copy_to_user(stat_address, &stat, sizeof(stat)) == sizeof(stat) ? 0 : -EFAULT;
 }
 

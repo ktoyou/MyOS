@@ -19,12 +19,17 @@ enum {
     PROT_READ = 1, PROT_WRITE = 2, PROT_EXEC = 4, MAP_SHARED = 1, MAP_PRIVATE = 2, MAP_FIXED = 0x10,
 };
 
+struct file_time {
+    long seconds, nanos;
+};
+
 struct file_stat {
     word device, inode, links;
     unsigned mode, uid, gid, padding;
     word rdev;
-    long size;
-    word remaining[11];
+    long size, block_size, blocks;
+    struct file_time accessed, modified, changed;
+    word reserved[3];
 };
 
 struct filesystem_info {
@@ -48,7 +53,8 @@ struct file_lock {
     int pid;
 };
 
-_Static_assert(sizeof(struct file_stat) == 144 && __builtin_offsetof(struct file_stat, size) == 48,
+_Static_assert(sizeof(struct file_stat) == 144 && __builtin_offsetof(struct file_stat, size) == 48 &&
+               __builtin_offsetof(struct file_stat, modified) == 88,
                "Linux x86-64 stat ABI");
 _Static_assert(__builtin_offsetof(struct directory_entry, name) == 19, "Linux x86-64 linux_dirent64 ABI");
 _Static_assert(sizeof(struct file_lock) == 32 && __builtin_offsetof(struct file_lock, pid) == 24,
@@ -605,15 +611,92 @@ static int check_resize(long parent) {
     return 0;
 }
 
+static void hex_word(char *out, word number) {
+    static const char digits[] = "0123456789abcdef";
+    for (unsigned i = 16; i; --i) {
+        out[i - 1] = digits[number & 15];
+        number >>= 4;
+    }
+}
+
+static int change_directory_mtime(long directory) {
+    static const char before[] = "pending", after[] = "indexed";
+    for (unsigned attempt = 0; attempt < 8; ++attempt) {
+        struct file_stat created, renamed;
+        long file = open_at(directory, before, O_CREAT | O_EXCL | O_RDWR, 0600);
+        if (file < 0 || close_fd(file) || stat_fd(directory, &created) ||
+            call(SYS_FSYNC, directory, 0, 0, 0) ||
+            call(SYS_RENAMEAT, directory, (word)before, directory, (word)after) ||
+            stat_fd(directory, &renamed)) return 81;
+        if (created.modified.seconds == renamed.modified.seconds) {
+            if (created.modified.seconds <= 0 || created.modified.nanos < 0 ||
+                renamed.modified.nanos >= 1000000000 ||
+                renamed.modified.nanos - created.modified.nanos < 1000) return 82;
+            return call(SYS_FSYNC, directory, 0, 0, 0) ? 83 : 0;
+        }
+        /* Переход через границу секунды не проверяет дробную часть времени. */
+        if (call(SYS_UNLINKAT, directory, (word)after, 0, 0)) return 81;
+    }
+    return 82;
+}
+
+static int check_precise_mtime(long parent, int first_boot) {
+    static const char name[] = "precise-mtime";
+    if (first_boot && call(SYS_MKDIRAT, parent, (word)name, 0700, 0)) return 80;
+    long directory = open_at(parent, name, O_RDONLY | O_DIRECTORY, 0);
+    if (directory < 0) return 80;
+    if (first_boot) {
+        int result = change_directory_mtime(directory);
+        if (result) return result;
+    }
+    struct file_stat by_fd, by_path;
+    if (stat_fd(directory, &by_fd) || stat_at(parent, name, &by_path, 0) ||
+        !same_bytes(&by_fd.modified, &by_path.modified, sizeof(by_fd.modified)) ||
+        by_fd.modified.seconds <= 0 || by_fd.modified.nanos <= 0 || by_fd.modified.nanos >= 1000000000 ||
+        stat_at(directory, "indexed", &by_path, 0) || close_fd(directory)) return 84;
+
+    static const char prefix[] = "Linux MyFS directory mtime ";
+    char report[] = "Linux MyFS directory mtime 0000000000000000 0000000000000000\n";
+    hex_word(report + sizeof(prefix) - 1, (word)by_fd.modified.seconds);
+    hex_word(report + sizeof(prefix) + 16, (word)by_fd.modified.nanos);
+    return call(SYS_WRITE, 1, (word)report, sizeof(report) - 1, 0) == sizeof(report) - 1 ? 0 : 85;
+}
+
+static int check_legacy_profile(long parent) {
+    static const char seed[] = "group can read\n";
+    struct file_stat directory, by_path, by_fd;
+    struct filesystem_info fs;
+    if (stat_fd(parent, &directory) || !valid_stat(&directory, 0040700, 1000, 1000) ||
+        directory.modified.seconds <= 0 || directory.modified.nanos ||
+        call(SYS_FSTATFS, parent, (word)&fs, 0, 0) || fs.type != 0x5346594d ||
+        stat_at(parent, "group", &by_path, 0) || !valid_stat(&by_path, 0100640, 1001, 1000) ||
+        by_path.modified.seconds <= 0 || by_path.modified.nanos) return 86;
+    long file = open_at(parent, "group", O_RDONLY, 0);
+    if (file < 0 || stat_fd(file, &by_fd) || by_fd.inode != by_path.inode ||
+        !same_bytes(&by_fd.modified, &by_path.modified, sizeof(by_fd.modified)) ||
+        call(SYS_PREAD, file, (word)buffer, sizeof(seed), 0) != sizeof(seed) - 1 ||
+        !same_bytes(buffer, seed, sizeof(seed) - 1) || close_fd(file)) return 87;
+    return 0;
+}
+
 void _start(void) {
     int status = 1;
     char phase;
     long phase_fd = open_at(AT_FDCWD, "/myos/myfs-test-phase", O_RDONLY, 0);
     if (phase_fd >= 0 && call(SYS_READ, phase_fd, (word)&phase, 1, 0) == 1 && !close_fd(phase_fd) &&
-        (phase == '1' || phase == '2')) {
+        (phase == '0' || phase == '1' || phase == '2')) {
         long parent = open_at(AT_FDCWD, "/profile/owned", O_RDONLY | O_DIRECTORY, 0);
+        if (phase == '0') {
+            status = parent < 0 ? 2 : check_legacy_profile(parent);
+            if (!status && close_fd(parent)) status = 3;
+            static const char marker[] = "Linux MyFS guest read v5 profile PASS\n";
+            if (!status && call(SYS_WRITE, 1, (word)marker, sizeof(marker) - 1, 0) != sizeof(marker) - 1)
+                status = 24;
+            finish(status);
+        }
         prepare_long_target();
         status = parent < 0 ? 2 : check_permissions(parent);
+        if (!status) status = check_precise_mtime(parent, phase == '1');
         if (!status) status = check_filesystem_space(parent);
         if (!status && phase == '1') status = check_creat(parent);
         if (!status && phase == '1') status = check_resize(parent);

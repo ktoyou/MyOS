@@ -83,6 +83,7 @@ static int journal_write(u32 b,const void *p,bool data) {
 #define COMMIT_ROOM 48u
 static struct journal_entry *undo_log;
 static unsigned undo_count;
+static struct superblock saved_super;
 static bool undo_armed, undo_lost;
 static u32 pending_data, saved_blocks, saved_inodes, saved_hint, saved_ino_hint;
 static u32 bitmap_undo_sec[32];
@@ -113,6 +114,7 @@ static int transaction_begin(void) {
             int c=commit_pending();
             if(c)return c;
         }
+        saved_super=sb;
         undo_count=transaction_count;
         if(undo_count)memcpy(undo_log,transaction,undo_count*sizeof(*transaction));
         bitmap_undo_n=0;undo_lost=false;undo_armed=true;transaction_error=0;

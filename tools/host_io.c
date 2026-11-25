@@ -1,6 +1,8 @@
 /* host_io.c — та часть утилиты myfs, что работает с файлами компьютера.
  * Отдельный файл, потому что здесь стандартные заголовки ОС, а в myfs.c —
  * заголовки ядра MyOS (у них свой size_t, вместе их не скрестить). */
+#include <fcntl.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,6 +35,21 @@ int host_write_sector(unsigned lba, const void *buf) {
     return fwrite(buf, 1, 512, img) == 512 ? 0 : -1;
 }
 
+int host_read_trailing_sector(unsigned filesystem_sectors, void *buf) {
+    if (!img || fseeko(img, 0, SEEK_END)) return -1;
+    off_t size = ftello(img);
+    if (size < 0) return -1;
+    if (size != ((off_t)filesystem_sectors + 1) * 512) return 0;
+    return host_read_sector(filesystem_sectors, buf) ? -1 : 1;
+}
+
+int host_append_sector(const void *buf) {
+    if (!img || fseeko(img, 0, SEEK_END) || ftello(img) != (off_t)img_sectors * 512 ||
+        fwrite(buf, 1, 512, img) != 512 || host_flush_image()) return -1;
+    ++img_sectors;
+    return 0;
+}
+
 void host_close_image(void) {
     extern int block_flush(void);
     extern void block_cache_invalidate(void);
@@ -42,12 +59,28 @@ void host_close_image(void) {
 }
 
 /* новый пустой образ: его размер и станет размером ФС при форматировании */
-int host_create_image(const char *path, unsigned sectors) {
-    FILE *f = fopen(path, "w+b");
+int host_create_image(const char *path, unsigned sectors, bool private_image) {
+    host_close_image();
+    FILE *f;
+    if (private_image) {
+        int fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
+        if (fd < 0) return -1;
+        f = fdopen(fd, "w+b");
+        if (!f) {
+            close(fd);
+            unlink(path);
+            return -1;
+        }
+    } else f = fopen(path, "w+b");
     if (!f) return -1;
-    if (ftruncate(fileno(f), (off_t)sectors * 512)) { fclose(f); return -1; }
-    fclose(f);
-    return host_open_image(path);
+    if (ftruncate(fileno(f), (off_t)sectors * 512)) {
+        fclose(f);
+        if (private_image) unlink(path);
+        return -1;
+    }
+    img = f;
+    img_sectors = sectors;
+    return 0;
 }
 
 void host_remove_file(const char *path) { remove(path); }
