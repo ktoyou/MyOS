@@ -17,6 +17,8 @@ typedef void (*net64_receiver)(void *context, u32 source, u32 destination, u8 pr
                                const u8 *data, u32 length);
 
 bool net64_configure(struct net64_config config);
+u32 net64_address(void);
+bool net64_has_route(u32 destination);
 void net64_clear_config(void);
 bool net64_enable_dhcp(net64_receiver receive);
 bool net64_dhcp_broadcast(u32 source, const u8 *datagram, u32 length);

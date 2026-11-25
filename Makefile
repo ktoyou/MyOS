@@ -1675,6 +1675,7 @@ $(X64BUILD)/linux-entry.o: kernel/x86_64/linux_syscall.asm | $(X64BUILD)
 	$(NASM) -f elf64 $< -o $@
 $(X64BUILD)/early-linux.o $(X64BUILD)/linux_file.o $(X64BUILD)/linux_fb.o: kernel/x86_64/linux_fb.h
 $(X64BUILD)/linux_file.o: kernel/x86_64/linux_input.h
+$(X64BUILD)/linux_socket.o: kernel/x86_64/net.h kernel/x86_64/net_bytes.h
 $(X64BUILD)/linux_input.o: kernel/x86_64/linux_input.c kernel/x86_64/linux_input.h kernel/x86_64/linux.h kernel/x86_64/linux_task.h $(X64_HEADERS) | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
 $(X64BUILD)/kernel-linux.elf: $(X64_CORE) $(X64_LINUX_NET) $(X64BUILD)/early-linux.o $(X64BUILD)/linux_elf.o $(X64BUILD)/linux_syscall.o $(X64BUILD)/linux_file.o $(X64BUILD)/linux_fb.o $(X64BUILD)/linux_input.o $(X64BUILD)/linux_mmap.o $(X64BUILD)/linux_random.o $(X64BUILD)/linux_time.o $(X64BUILD)/linux_signal.o $(X64BUILD)/linux_socket.o $(X64BUILD)/linux_pipe.o $(X64BUILD)/linux_userns.o $(X64BUILD)/linux_pidns.o $(X64BUILD)/linux_vfs.o $(X64BUILD)/linux_task.o $(X64BUILD)/linux-entry.o kernel/x86_64/linker.ld
@@ -1684,6 +1685,10 @@ $(X64BUILD)/linux-probe.o: tests/linux_x64_probe.S | $(X64BUILD)
 $(X64BUILD)/linux-dhcp-probe.o: tests/kernel_x64_dhcp_probe.c | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
 $(X64BUILD)/linux-dhcp-probe.elf: $(X64BUILD)/linux-dhcp-probe.o
+	$(LD) -m elf_x86_64 -static -no-pie $< -o $@
+$(X64BUILD)/linux-udp-probe.o: tests/kernel_x64_udp_probe.c | $(X64BUILD)
+	$(CC) $(X64CFLAGS) -c $< -o $@
+$(X64BUILD)/linux-udp-probe.elf: $(X64BUILD)/linux-udp-probe.o
 	$(LD) -m elf_x86_64 -static -no-pie $< -o $@
 $(X64BUILD)/linux-bad-stack.o: tests/linux_x64_probe.S | $(X64BUILD)
 	$(CC) -m64 -DBAD_STACK -c $< -o $@
@@ -1766,7 +1771,7 @@ kernel-x64-pmm-smoke: $(X64BUILD)/kernel-pmm.bin
 	python3 tests/kernel_x64_smoke.py --pmm
 kernel-x64-paging-smoke: $(X64_PAGING_TESTS)
 	python3 tests/kernel_x64_smoke.py --paging
-.PHONY: kernel-x64-gop-smoke kernel-x64-ethernet-smoke kernel-x64-ipv4-smoke kernel-x64-dhcp-smoke
+.PHONY: kernel-x64-gop-smoke kernel-x64-ethernet-smoke kernel-x64-ipv4-smoke kernel-x64-dhcp-smoke kernel-x64-udp-smoke
 kernel-x64-gop-smoke: $(X64BUILD)/kernel-gop.bin
 	python3 tests/kernel_x64_smoke.py --gop
 kernel-x64-ethernet-smoke: $(X64BUILD)/kernel-ethernet.bin $(X64BUILD)/kernel-linux.bin $(X64BUILD)/linux-probe.elf
@@ -1777,6 +1782,8 @@ kernel-x64-ipv4-smoke: $(X64BUILD)/kernel-ipv4.bin $(X64BUILD)/ipv4-test
 kernel-x64-dhcp-smoke: $(X64BUILD)/kernel-linux.bin $(X64BUILD)/linux-dhcp-probe.elf $(X64BUILD)/dhcp-test
 	$(X64BUILD)/dhcp-test
 	python3 tests/kernel_x64_dhcp_smoke.py
+kernel-x64-udp-smoke: $(X64BUILD)/kernel-linux.bin $(X64BUILD)/linux-udp-probe.elf
+	python3 tests/kernel_x64_udp_smoke.py
 kernel-x64-ring3-smoke: $(X64_RING3_TESTS)
 	python3 tests/kernel_x64_smoke.py --ring3
 .PHONY: kernel-x64-linux-smoke

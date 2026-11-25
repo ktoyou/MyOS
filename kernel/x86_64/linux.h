@@ -58,8 +58,15 @@ struct linux64_fd_view {
 long linux64_get_file(i32 fd, struct linux64_fd_view *view);
 long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg3);
 long linux64_sendto(i32 fd, uptr buffer, uptr length, u32 flags, uptr address, i32 address_length);
+long linux64_recvfrom(i32 fd, uptr buffer, uptr length, u32 flags, uptr address, uptr address_length);
 long linux64_sockopt(bool get, i32 fd, i32 level, i32 option, uptr value, uptr length);
 struct linux64_socket;
+struct linux64_udp_address { u32 ip; u16 port; };
+bool linux64_socket_is_udp(const struct linux64_socket *socket);
+long linux64_udp_address(uptr address, u32 length, struct linux64_udp_address *result, bool disconnect);
+long linux64_udp_path(struct linux64_socket *socket, bool bind, uptr address, u32 length);
+void linux64_udp_receive(void *context, u32 source, u32 destination, u8 protocol, const u8 *data, u32 length);
+bool linux64_udp_flush(u64 now);
 #define LINUX64_UNIX_PATH_LIMIT 108u
 struct linux64_sockaddr { u16 family; char path[LINUX64_UNIX_PATH_LIMIT + 1]; };
 long linux64_socket_create(i32 domain, u32 type, i32 protocol, struct linux64_socket **socket);

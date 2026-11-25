@@ -54,7 +54,8 @@ bool linux64_net_poll(void) {
     if (!started || !linux64_monotonic_ns(&now)) return false;
     if (now >= next_poll) {
         next_poll = now + 10000000ull;
-        waiting = dhcp64_poll(now);
+        bool dhcp_waiting = dhcp64_poll(now, linux64_udp_receive);
+        waiting = linux64_udp_flush(now) || dhcp_waiting;
         report_lease();
     }
     return waiting;

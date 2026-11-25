@@ -232,7 +232,7 @@ bool dhcp64_start(u32 seed) {
     return true;
 }
 
-bool dhcp64_poll(u64 now) {
+bool dhcp64_poll(u64 now, net64_receiver receiver) {
     if (client.state == OFF) return false;
     if (!e1000_link()) {
         clear_lease();
@@ -256,7 +256,7 @@ bool dhcp64_poll(u64 now) {
         cooldown(now);
         return false;
     }
-    net64_poll(now, NULL, NULL);
+    net64_poll(now, receiver, NULL);
     acquiring = client.state == SELECTING || client.state == REQUESTING;
     if ((acquiring || client.state == RENEWING || client.state == REBINDING) && now >= client.next) {
         if (send_message(now)) {

@@ -149,29 +149,29 @@ static bool request_is(u8 type, u32 dest, u32 source) {
 }
 
 static bool check_dora(void) {
-    if (!dhcp64_start(0x12fe8349) || dhcp64_poll(0) || tx_count || configured) return false;
+    if (!dhcp64_start(0x12fe8349) || dhcp64_poll(0, NULL) || tx_count || configured) return false;
     link_up = true;
-    dhcp64_poll(SECOND);
+    dhcp64_poll(SECOND, NULL);
     if (tx_count != 1 || !request_is(DISCOVER, BROADCAST, 0) || !xid()) return false;
     u32 first = xid();
     reply(OFFER, first ^ 1u, gateway);
-    dhcp64_poll(SECOND + 1);
+    dhcp64_poll(SECOND + 1, NULL);
     if (tx_count != 1) return false;
     reply(OFFER, first, gateway);
     rx[UDP_HEADER + 28] ^= 1;
-    dhcp64_poll(SECOND + 2);
+    dhcp64_poll(SECOND + 2, NULL);
     if (tx_count != 1) return false;
     reply(OFFER, first, gateway);
-    dhcp64_poll(request_time);
+    dhcp64_poll(request_time, NULL);
     const u8 *want = find_option(50, 4), *server = find_option(54, 4);
     if (configured || tx_count != 2 || !request_is(REQUEST, BROADCAST, 0) || xid() != first ||
         !want || net_read32(want) != address || !server || net_read32(server) != gateway) return false;
 
     reply(ACK, first, gateway ^ 1u);
-    dhcp64_poll(SECOND + 4);
+    dhcp64_poll(SECOND + 4, NULL);
     if (configured) return false;
     reply(ACK, first, gateway);
-    dhcp64_poll(2 * SECOND);
+    dhcp64_poll(2 * SECOND, NULL);
     struct dhcp64_lease lease;
     return configured == 1 && tx_count == 2 && dhcp64_get_lease(&lease) && active.address == address &&
            active.mask == mask && active.gateway == gateway && lease.network.address == address &&
@@ -182,58 +182,58 @@ static bool check_renewal(void) {
     const u64 t1 = request_time + 2 * SECOND, t2 = request_time + 5 * SECOND;
     const u64 nak_time = t2 + 1, restart = nak_time + 4 * SECOND;
     u32 initial = xid();
-    dhcp64_poll(t1 - 1);
+    dhcp64_poll(t1 - 1, NULL);
     if (tx_count != 2) return false;
-    dhcp64_poll(t1);
+    dhcp64_poll(t1, NULL);
     if (tx_count != 3 || !request_is(REQUEST, gateway, address) || xid() == initial || find_option(50, 4) ||
         find_option(54, 4)) return false;
     u32 renewal = xid();
-    dhcp64_poll(t2 - 1);
+    dhcp64_poll(t2 - 1, NULL);
     if (tx_count != 3) return false;
-    dhcp64_poll(t2);
+    dhcp64_poll(t2, NULL);
     if (tx_count != 4 || !request_is(REQUEST, BROADCAST, address) || xid() != renewal ||
         find_option(50, 4) || find_option(54, 4)) return false;
 
     reply(NAK, renewal, gateway ^ 1u);
-    dhcp64_poll(nak_time);
+    dhcp64_poll(nak_time, NULL);
     struct dhcp64_lease lease;
     if (cleared != 1 || active.address || dhcp64_get_lease(&lease) || tx_count != 4) return false;
-    dhcp64_poll(restart - 1);
+    dhcp64_poll(restart - 1, NULL);
     if (tx_count != 4) return false;
-    dhcp64_poll(restart);
+    dhcp64_poll(restart, NULL);
     if (tx_count != 5 || !request_is(DISCOVER, BROADCAST, 0) || xid() == renewal) return false;
 
     const u64 new_request = restart + 1, renew = new_request + 2 * SECOND;
     const u32 new_gateway = gateway + 1;
     reply(OFFER, xid(), gateway);
-    dhcp64_poll(new_request);
+    dhcp64_poll(new_request, NULL);
     if (tx_count != 6 || !request_is(REQUEST, BROADCAST, 0)) return false;
     reply(ACK, xid(), gateway);
-    dhcp64_poll(new_request + 1);
+    dhcp64_poll(new_request + 1, NULL);
     if (configured != 2 || active.mask != mask || active.gateway != gateway) return false;
 
-    dhcp64_poll(renew);
+    dhcp64_poll(renew, NULL);
     if (tx_count != 7 || !request_is(REQUEST, gateway, address)) return false;
     u8 *p = begin_reply(ACK, xid(), gateway);
     p = option32(p, 3, new_gateway);
     p = option32(p, 51, 8);
     finish_reply(p);
-    dhcp64_poll(renew + SECOND);
+    dhcp64_poll(renew + SECOND, NULL);
     if (configured != 3 || active.address != address || active.mask != mask || active.gateway != new_gateway ||
         !dhcp64_get_lease(&lease) || lease.network.mask != mask || lease.network.gateway != new_gateway ||
         lease.dns != dns) return false;
 
     /* Срок аренды отсчитывается от отправленного REQUEST, хотя ACK пришёл секундой позже. */
     const u64 expiry = renew + 8 * SECOND;
-    dhcp64_poll(expiry - 1);
+    dhcp64_poll(expiry - 1, NULL);
     if (cleared != 1 || !dhcp64_get_lease(&lease)) return false;
     unsigned before = tx_count;
-    dhcp64_poll(expiry);
+    dhcp64_poll(expiry, NULL);
     if (cleared != 2 || active.address || dhcp64_get_lease(&lease) || tx_count != before + 1 ||
         !request_is(DISCOVER, BROADCAST, 0)) return false;
 
     link_up = false;
-    return !dhcp64_poll(expiry + SECOND) && !dhcp64_poll(60 * SECOND) && tx_count == before + 1;
+    return !dhcp64_poll(expiry + SECOND, NULL) && !dhcp64_poll(60 * SECOND, NULL) && tx_count == before + 1;
 }
 
 int main(void) {

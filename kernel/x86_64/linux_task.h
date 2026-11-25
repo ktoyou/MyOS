@@ -71,13 +71,15 @@ struct linux64_pipe_io {
 };
 
 enum linux64_socket_operation { SOCKET_CONNECT, SOCKET_ACCEPT, SOCKET_READ, SOCKET_WRITE,
-                                SOCKET_SENDMSG, SOCKET_RECVMSG };
+                                SOCKET_SENDMSG, SOCKET_RECVMSG, SOCKET_RECVFROM };
 struct linux64_scm_rights;
 
 struct linux64_socket_wait {
     struct file_handle *file;
     struct linux64_scm_rights *rights;
     uptr address, length, transferred;
+    uptr name, name_length;
+    struct linux64_udp_address destination;
     u64 inode;
     u32 flags;
     enum linux64_socket_operation operation;
@@ -253,6 +255,8 @@ void linux64_socket_wait_finish(struct linux64_task *task);
 long linux64_socket_wait_resume(void);
 long linux64_socket_prepare_rights(uptr message, u32 flags, struct linux64_scm_rights **rights);
 long linux64_socket_message(struct linux64_socket *socket, struct linux64_socket_wait *wait);
+long linux64_udp_io(struct linux64_socket *socket, bool receive, struct linux64_socket_wait *wait);
+bool linux64_socket_waits_for_network(const struct linux64_task *task);
 void linux64_scm_release(struct linux64_scm_rights *rights);
 struct file_handle *linux64_scm_get_file(i32 fd);
 void linux64_scm_put_file(struct file_handle *file);

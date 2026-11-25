@@ -83,6 +83,10 @@ void net64_clear_config(void) {
     clear_neighbors();
 }
 
+u32 net64_address(void) {
+    return config.address;
+}
+
 bool net64_enable_dhcp(net64_receiver receive) {
     u8 mac[MAC_BYTES];
     e1000_mac(mac);
@@ -111,6 +115,10 @@ static u32 next_hop(u32 dst) {
     if (!config.address || dst == config.address || !unicast_ip(dst)) return 0;
     if (same_subnet(&config, dst)) return subnet_host(dst, config.mask) ? dst : 0;
     return config.gateway;
+}
+
+bool net64_has_route(u32 destination) {
+    return next_hop(destination) != 0;
 }
 
 static bool ethernet_send(const u8 *mac, u16 type, u32 size) {
