@@ -64,24 +64,41 @@ def check_framebuffer(build):
     print('OVMF: ring-3 /dev/fb0 scanout, framebuffer ABI and I/O bounds: PASS', flush=True)
 
 
-def check_keyboard(build):
-    def send_keys(vm):
-        for marker, key, down in (('PS2 keyboard ready', 'a', True),
-                                  ('PS2 KEY_A down', 'a', False),
-                                  ('PS2 KEY_A up', 'right', True),
-                                  ('PS2 KEY_RIGHT down', 'right', False)):
+def check_input(build):
+    def key(name, down):
+        return {'type': 'key', 'data': {'down': down, 'key': {'type': 'qcode', 'data': name}}}
+
+    def button(name, down):
+        return {'type': 'btn', 'data': {'down': down, 'button': name}}
+
+    def relative(axis, value):
+        return {'type': 'rel', 'data': {'axis': axis, 'value': value}}
+
+    def send_input(vm):
+        buttons = ('left', 'right', 'middle')
+        for marker, events in (
+            ('PS2 mouse ready', [key('a', True), relative('x', -18), relative('y', 11)]),
+            ('PS2 mouse moved', [key('a', False), relative('x', 4), relative('y', -7)]
+             + [button(name, True) for name in buttons]),
+            ('PS2 mouse buttons down', [button(name, False) for name in buttons]),
+            ('PS2 mouse buttons up', [button('wheel-up', True), button('wheel-up', False)]),
+            ('PS2 mouse wheel up', [button('wheel-down', True), button('wheel-down', False)]),
+            ('PS2 keyboard ready', [key('a', True)]),
+            ('PS2 KEY_A down', [key('a', False)]),
+            ('PS2 KEY_A up', [key('right', True)]),
+            ('PS2 KEY_RIGHT down', [key('right', False)]),
+        ):
             vm.wait(marker)
-            event = {'type': 'key', 'data': {'down': down, 'key': {'type': 'qcode', 'data': key}}}
-            vm.qmp('input-send-event', {'events': [event]})
+            vm.qmp('input-send-event', {'events': events})
 
     payload, kernel_end = image('kernel-linux')
-    root = linux_root((build / 'linux-keyboard.elf').read_bytes(), {})
-    with tempfile.TemporaryDirectory(prefix='myos-linux-keyboard-') as temp:
-        serial = boot_x64(pathlib.Path(temp), 'x64-linux-keyboard', payload, kernel_end,
-                          ['PS2 KEY_RIGHT up', 'Linux x86-64 exit status=0x00'],
-                          live_root_header=root, interact=send_keys)
+    root = linux_root((build / 'linux-input.elf').read_bytes(), {})
+    with tempfile.TemporaryDirectory(prefix='myos-linux-input-') as temp:
+        serial = boot_x64(pathlib.Path(temp), 'x64-linux-input', payload, kernel_end,
+                          ['PS2 mouse wheel down', 'PS2 KEY_RIGHT up', 'Linux x86-64 exit status=0x00'],
+                          live_root_header=root, interact=send_input)
     assert 'x86-64 exception' not in serial, serial
-    print('OVMF: PS/2 press and release delivered to ring 3 through evdev read, poll and epoll: PASS', flush=True)
+    print('OVMF: PS/2 keyboard and mouse delivered to ring 3 via evdev read, poll and epoll: PASS', flush=True)
 
 
 def check_shared_elf(build):
@@ -450,7 +467,7 @@ def main():
     check_interpreter(build)
     check_files(build)
     check_framebuffer(build)
-    check_keyboard(build)
+    check_input(build)
     check_mmap(build)
     check_socket(build)
     check_pipe(build)
