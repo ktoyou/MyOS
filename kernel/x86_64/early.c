@@ -2,7 +2,6 @@
 #include "framebuffer.h"
 #include "segments.h"
 #ifdef X64_TEST_LINUX
-#include "e1000.h"
 #include "linux_fb.h"
 #include "linux.h"
 #endif
@@ -403,7 +402,7 @@ __attribute__((noreturn)) void kernel64_main(const struct boot_info *boot, u32 e
     serial_puts(net64_check() ? "x86-64 IPv4 PASS\n" : "x86-64 IPv4 FAIL\n");
 #endif
 #ifdef X64_TEST_LINUX
-    if (e1000_init()) serial_puts("MyOS x86-64: e1000 Ethernet ready\n");
+    if (linux64_net_init()) serial_puts("MyOS x86-64: e1000 Ethernet ready\n");
     linux64_fb_init(&fb.surface);
     linux_test_boot(boot->root_phys, boot->root_bytes);
     serial_puts("Linux x86-64 ELF rejected\n");
