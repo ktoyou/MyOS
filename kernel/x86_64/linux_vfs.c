@@ -24,6 +24,7 @@ struct rename_entry {
 static struct temporary_node temporary[TEMP_NODES];
 static u64 next_inode = 1ull << 32;
 static const u64 etc_inode = 1ull << 36;
+static const u64 shm_inode = 1ull << 37;
 
 struct linux64_fs *linux64_initial_fs(void) {
     static struct linux64_fs initial = {
@@ -75,9 +76,11 @@ static bool find_node(const struct linux64_file_source *source, const char *path
         *file = (struct linux64_file){.mode = LINUX64_S_IFDIR | 0555, .inode = 1};
         return true;
     }
-    if (same_path(path, "/tmp")) {
+    bool temporary_root = same_path(path, "/tmp");
+    if (temporary_root || same_path(path, "/dev/shm")) {
         *file = (struct linux64_file){
-            .mode = LINUX64_S_IFDIR | 01777, .inode = 2, .writable_directory = true,
+            .mode = LINUX64_S_IFDIR | 01777, .inode = temporary_root ? 2 : shm_inode,
+            .writable_directory = true,
         };
         return true;
     }
@@ -192,6 +195,9 @@ bool linux64_vfs_next_entry(const struct linux64_directory *dir, uptr *position,
                    file->dns_server) {
             child = "resolv.conf";
             size = sizeof("resolv.conf") - 1;
+        } else if (same_path(dir->path, "/dev") && find_node(source, "/dev/shm", file)) {
+            child = "shm";
+            size = sizeof("shm") - 1;
         }
     }
     if (!child) {
@@ -201,7 +207,8 @@ bool linux64_vfs_next_entry(const struct linux64_directory *dir, uptr *position,
         while (live_child(source, dir->path, &index, &child, &size)) {
             for (uptr i = 0; i < size; ++i) path[length + i] = child[i];
             path[length + size] = 0;
-            if (find_node(source, path, file)) break;
+            /* /dev/shm уже перечислен в зарезервированной позиции. */
+            if (!same_path(path, "/dev/shm") && find_node(source, path, file)) break;
             child = NULL;
         }
         if (!child) return false;

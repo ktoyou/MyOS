@@ -1704,6 +1704,10 @@ $(X64BUILD)/linux-tcp-probe.o: tests/kernel_x64_tcp_probe.c | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
 $(X64BUILD)/linux-tcp-probe.elf: $(X64BUILD)/linux-tcp-probe.o
 	$(LD) -m elf_x86_64 -static -no-pie $< -o $@
+$(X64BUILD)/linux-shm-probe.o: tests/kernel_x64_shm_probe.c | $(X64BUILD)
+	$(CC) $(X64CFLAGS) -c $< -o $@
+$(X64BUILD)/linux-shm-probe.elf: $(X64BUILD)/linux-shm-probe.o
+	$(LD) -m elf_x86_64 -static -no-pie $< -o $@
 $(X64BUILD)/linux-seccomp-probe.o: tests/kernel_x64_seccomp_probe.c | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
 $(X64BUILD)/linux-seccomp-probe.elf: $(X64BUILD)/linux-seccomp-probe.o
@@ -1816,6 +1820,9 @@ kernel-x64-dns-smoke: $(X64BUILD)/kernel-linux.bin $(X64BUILD)/linux-dns-probe.e
 .PHONY: kernel-x64-seccomp-smoke
 kernel-x64-seccomp-smoke: $(X64BUILD)/kernel-linux.bin $(X64BUILD)/linux-seccomp-probe.elf
 	python3 tests/kernel_x64_seccomp_smoke.py
+.PHONY: kernel-x64-shm-smoke
+kernel-x64-shm-smoke: $(X64BUILD)/kernel-linux.bin $(X64BUILD)/linux-shm-probe.elf
+	python3 tests/kernel_x64_shm_smoke.py
 kernel-x64-ring3-smoke: $(X64_RING3_TESTS)
 	python3 tests/kernel_x64_smoke.py --ring3
 .PHONY: kernel-x64-linux-smoke
