@@ -26,7 +26,7 @@ from uefi_x64_smoke import VM, clean
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / 'tools'))
 import make_uefi
-from chrome_x64_live import chrome_files, firmware, make_image, qemu_path
+from chrome_x64_live import CHROME_ML_LIBRARY, chrome_files, firmware, make_image, qemu_path
 
 
 HOST = 'chrome-https.test'
@@ -173,7 +173,7 @@ def firmware_args(directory):
             '-drive', f'if=pflash,format=raw,unit=1,file={qemu_path(variables)}']
 
 
-def examine_browser(directory, run_name, disk, certificate, key, trusted, artifacts, timeout):
+def examine_browser(directory, run_name, disk, certificate, key, trusted, artifacts, timeout, *, chrome_ml):
     egress, forward, injector, pcap = (directory / name for name in ('egress', 'forward', 'inject', 'wire.pcap'))
     shot = artifacts / f'{run_name}.ppm'
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -197,7 +197,7 @@ def examine_browser(directory, run_name, disk, certificate, key, trusted, artifa
             vm = VM(run_name, firmware_args(directory) + [
                 '-S', '-drive', f'if=none,id=root,format=raw,file={qemu_path(disk)}',
                 '-device', 'nvme,drive=root,serial=UEFIX64,bootindex=1', *args,
-            ], memory='960M', binary='qemu-system-x86_64', cpu='max')
+            ], memory='1024M', binary='qemu-system-x86_64', cpu='max')
             try:
                 with ExitStack() as stack:
                     peers = [connect(stack, path) for path in (egress, forward, injector)]
@@ -208,6 +208,8 @@ def examine_browser(directory, run_name, disk, certificate, key, trusted, artifa
                     vm.wait('UEFI video: V=mode menu', timeout=20)
                     vm.key('s')
                     wait_for_page(vm, server, trusted, shot, deadline, errors)
+                    if chrome_ml:
+                        assert 'ChromeML library loaded' in clean(vm.log), 'Гость не подтвердил загрузку ChromeML'
             finally:
                 vm.stop()
                 if pcap.exists():
@@ -247,8 +249,12 @@ def main():
         directory = pathlib.Path(temp)
         wrapper = directory / 'chrome-test-launch'
         source = pathlib.Path(__file__).with_name('kernel_x64_chrome_launch.c')
-        subprocess.run([*shlex.split(args.cc), '-O2', '-Wall', '-Wextra', source, '-o', wrapper], check=True)
-        base = chrome_files(args.chrome.resolve(), args.compositor.resolve(), wrapper)
+        subprocess.run([*shlex.split(args.cc), '-O2', '-Wall', '-Wextra', source, '-o', wrapper, '-ldl'], check=True)
+        chrome = args.chrome.resolve()
+        base = chrome_files(chrome, args.compositor.resolve(), wrapper)
+        chrome_ml = chrome.with_name(CHROME_ML_LIBRARY).is_file()
+        if chrome_ml:
+            base['/myos/chrome-test-ml'] = b''
         base.update({'/myos/chrome-launch-real': args.launcher.read_bytes(),
                      '/myos/chrome-url': f'https://{ORIGIN}{TARGET}\n'.encode(), '/myos/chrome-debug': b''})
         certificate, key, root = generate_certificates(directory)
@@ -259,7 +265,8 @@ def main():
             make_uefi.DIRECTORY = case / 'firmware'
             disk = case / 'chrome.img'
             make_image(disk, args.kernel, wrapper, base | nss_files(case, root, certutil, trusted))
-            examine_browser(case, name, disk, certificate, key, trusted, args.artifacts, args.timeout)
+            examine_browser(case, name, disk, certificate, key, trusted, args.artifacts, args.timeout,
+                            chrome_ml=chrome_ml)
     print('OVMF Linux x86-64 Chrome: DHCP DNS, trusted HTTPS rendering and untrusted certificate rejection: PASS', flush=True)
 
 

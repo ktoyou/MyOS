@@ -19,6 +19,7 @@ else:
 
 REPO = Path(__file__).resolve().parents[1]
 CHROME_GUEST = '/opt/google/chrome'
+CHROME_ML_LIBRARY = 'liboptimization_guide_internal.so'
 LAUNCHER_GUEST = '/myos/chrome-launch'
 URL_GUEST = '/myos/chrome-url'
 PROFILE_TOKEN_GUEST = '/myos/myfs-volume'
@@ -78,7 +79,12 @@ def chrome_files(chrome: Path, compositor: Path, launcher: Path) -> dict[str, by
     directory = chrome.parent
     crashpad = directory / 'chrome_crashpad_handler'
     libs = {}
-    for executable in (chrome, crashpad, compositor, launcher):
+    # Вспомогательный процесс Chrome загружает ChromeML через dlopen.
+    chrome_ml = directory / CHROME_ML_LIBRARY
+    executables = (chrome, crashpad, compositor, launcher)
+    if chrome_ml.is_file():
+        executables += (chrome_ml,)
+    for executable in executables:
         merge_dependencies(libs, dependencies(executable))
 
     if 'libc.so.6' not in libs or 'libnss3.so' not in libs:
@@ -102,7 +108,8 @@ def chrome_files(chrome: Path, compositor: Path, launcher: Path) -> dict[str, by
     files[f'{CHROME_GUEST}/chrome'] = chrome.read_bytes()
     required = ('chrome_crashpad_handler', 'icudtl.dat', 'resources.pak', 'chrome_100_percent.pak',
                 'chrome_200_percent.pak', 'v8_context_snapshot.bin')
-    optional = ('CHROME_VERSION_EXTRA', 'libvk_swiftshader.so', 'libvulkan.so.1', 'vk_swiftshader_icd.json')
+    optional = ('CHROME_VERSION_EXTRA', 'libvk_swiftshader.so', 'libvulkan.so.1', 'vk_swiftshader_icd.json',
+                chrome_ml.name)
     for name in required:
         files[f'{CHROME_GUEST}/{name}'] = (directory / name).read_bytes()
     for name in optional:
@@ -321,7 +328,7 @@ def main() -> None:
 
     try:
         inputs = (args.chrome, args.compositor, args.launcher, args.kernel.with_suffix('.bin'),
-                  args.kernel.with_suffix('.elf'))
+                  args.kernel.with_suffix('.elf'), args.chrome.with_name(CHROME_ML_LIBRARY))
         profile = Path(args.profile) if args.profile else None
         if profile is not None:
             inputs = (*inputs, args.myfs)
