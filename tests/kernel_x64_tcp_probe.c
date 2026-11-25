@@ -2,7 +2,7 @@ typedef unsigned long word;
 typedef unsigned int u32;
 typedef unsigned short u16;
 
-enum { INET = 2, STREAM = 1, NONBLOCK = 0x800, EAGAIN = 11, EINPROGRESS = 115,
+enum { INET = 2, STREAM = 1, NONBLOCK = 0x800, EAGAIN = 11, ECONNREFUSED = 111, EINPROGRESS = 115,
        ENETUNREACH = 101, EPOLLIN = 1, EPOLLOUT = 4, SOL_SOCKET = 1, SO_ERROR = 4,
        LOCAL_PORT = 41997, SERVER_PORT = 41998, TX_BYTES = 5003, RX_BYTES = 7001 };
 
@@ -50,6 +50,18 @@ static int write_all(long fd, long epoll, const void *buffer, word length) {
     return 1;
 }
 
+static int check_refused(void) {
+    static const char marker[] = "TCP guest connection refused\n";
+    u16 port;
+    long config = call(2, (word)"/myos/closed-port", 0, 0, 0, 0);
+    if (config < 0 || call(0, config, (word)&port, sizeof(port), 0, 0) != sizeof(port) ||
+        call(3, config, 0, 0, 0, 0)) return 0;
+    const struct address remote = address(0x0a2c0005u, port);
+    long fd = call(41, INET, STREAM, 0, 0, 0);
+    return fd >= 0 && call(42, fd, (word)&remote, sizeof(remote), 0, 0) == -ECONNREFUSED &&
+           !call(3, fd, 0, 0, 0, 0) && mark(marker, sizeof(marker) - 1);
+}
+
 static int check_tcp(void) {
     const struct address local = address(0, LOCAL_PORT), remote = address(0x0a2c0051u, SERVER_PORT);
     long fd = call(41, INET, STREAM | NONBLOCK, 0, 0, 0);
@@ -88,7 +100,7 @@ static int check_tcp(void) {
     if (received != RX_BYTES || !mark(peer_eof, sizeof(peer_eof) - 1) ||
         !watch(epoll, fd, EPOLLOUT, 3) || !write_all(fd, epoll, trailer, sizeof(trailer) - 1) ||
         call(48, fd, 1, 0, 0, 0) || call(3, fd, 0, 0, 0, 0) || call(3, epoll, 0, 0, 0, 0)) return 6;
-    return 0;
+    return check_refused() ? 0 : 8;
 }
 
 __attribute__((noreturn)) void _start(void) {

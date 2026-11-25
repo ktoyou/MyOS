@@ -143,18 +143,21 @@ def check_capture(pcap):
 def main():
     payload, kernel_end = image('kernel-linux')
     elf = pathlib.Path('build/x86_64/linux-tcp-probe.elf').read_bytes()
-    with tempfile.TemporaryDirectory(prefix='myos-tcp-x64-') as temp, socket.socket() as listener:
+    with tempfile.TemporaryDirectory(prefix='myos-tcp-x64-') as temp, socket.socket() as listener, socket.socket() as closed:
         directory = pathlib.Path(temp)
         pcap = directory / 'tcp.pcap'
         listener.bind(('127.0.0.1', 0))
         listener.listen(1)
         listener.settimeout(8)
+        # Адрес шлюза slirp ведёт на loopback хоста. Порт занят сокетом без listen.
+        closed.bind(('127.0.0.1', 0))
+        files = {'/myos/closed-port': struct.pack('<H', closed.getsockname()[1])}
         # Старые версии slirp делят команду guestfwd по пробелам без обработки кавычек.
         command = f'python3 tests/kernel_x64_tcp_smoke.py --relay {listener.getsockname()[1]}'
         forwarded = f'guestfwd=tcp:{socket.inet_ntoa(SERVER)}:{SERVER_PORT}-cmd:{command}'
         serial = boot_x64(directory, 'x64-kernel-tcp', payload, kernel_end,
-                          ['TCP guest received EOF', 'TCP guest PASS'],
-                          live_root_header=linux_root(elf, {}), before_boot=lambda vm: set_link(vm, False),
+                          ['TCP guest received EOF', 'TCP guest connection refused', 'TCP guest PASS'],
+                          live_root_header=linux_root(elf, files), before_boot=lambda vm: set_link(vm, False),
                           interact=lambda vm: exercise_tcp(vm, listener), extra=[
                               '-netdev', 'user,id=wire,ipv6=off,net=10.44.0.0/24,host=10.44.0.5,'
                                          'dhcpstart=10.44.0.20,dns=10.44.0.53,' + forwarded,
@@ -163,7 +166,7 @@ def main():
                           ])
         assert 'x86-64 exception' not in serial, serial
         check_capture(pcap)
-    print('OVMF Linux x86-64: TCP connect, streaming, epoll and bidirectional FIN: PASS', flush=True)
+    print('OVMF Linux x86-64: TCP connect, streaming, epoll, bidirectional FIN and refused port: PASS', flush=True)
 
 
 if __name__ == '__main__':
