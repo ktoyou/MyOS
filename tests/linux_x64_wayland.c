@@ -18,6 +18,7 @@
 
 static const char socket_path[] = "/tmp/wayland-0";
 static struct wl_compositor *compositor;
+static struct wl_subcompositor *subcompositor;
 static struct wl_shm *shm;
 static struct xdg_wm_base *shell;
 static struct wl_output *output;
@@ -30,6 +31,19 @@ static bool output_ready, configured, presented, released, xrgb;
 static bool keymap_ready, focused, repeat_ready, shift_down, shift_active;
 static unsigned key_events;
 static const uint32_t window_colors[2][2] = {{0xf14c88, 0x13c5a2}, {0x8254ec, 0xd49d12}};
+
+enum {
+    SUBSURFACE_X = 61, SUBSURFACE_MOVED_X = 103, SUBSURFACE_Y = 54,
+    SUBSURFACE_WIDTH = 31, SUBSURFACE_HEIGHT = 23,
+    SUBSURFACE_COLOR = 0x58ab0f, SUBSURFACE_DESYNC_COLOR = 0x3e57d1,
+};
+static const uint32_t subsurface_colors[2][2] = {
+    {SUBSURFACE_COLOR, SUBSURFACE_COLOR}, {SUBSURFACE_COLOR, SUBSURFACE_COLOR},
+};
+static const uint32_t subsurface_desync_colors[2][2] = {
+    {SUBSURFACE_DESYNC_COLOR, SUBSURFACE_DESYNC_COLOR},
+    {SUBSURFACE_DESYNC_COLOR, SUBSURFACE_DESYNC_COLOR},
+};
 
 enum { POPUP_X = 98, POPUP_Y = 92, POPUP_WIDTH = 47, POPUP_HEIGHT = 35, POPUP_COLOR = 0x196dea };
 static const uint32_t popup_colors[2][2] = {{POPUP_COLOR, POPUP_COLOR}, {POPUP_COLOR, POPUP_COLOR}};
@@ -302,6 +316,8 @@ static void global(void *data, struct wl_registry *registry, uint32_t id,
     (void)data;
     if (!strcmp(interface, "wl_compositor") && version >= 4) {
         compositor = wl_registry_bind(registry, id, &wl_compositor_interface, 4);
+    } else if (!strcmp(interface, "wl_subcompositor")) {
+        subcompositor = wl_registry_bind(registry, id, &wl_subcompositor_interface, 1);
     } else if (!strcmp(interface, "wl_shm")) {
         shm = wl_registry_bind(registry, id, &wl_shm_interface, 1);
         wl_shm_add_listener(shm, &shm_events, NULL);
@@ -481,7 +497,7 @@ static uint32_t framebuffer_color(int fb, const struct fb_fix_screeninfo *layout
                                   const struct fb_var_screeninfo *mode, int x, int y) {
     uint32_t pixel;
     off_t offset = (off_t)y * layout->line_length + (off_t)x * sizeof(pixel);
-    if (pread(fb, &pixel, sizeof(pixel), offset) != sizeof(pixel)) fail("read popup framebuffer pixel");
+    if (pread(fb, &pixel, sizeof(pixel), offset) != sizeof(pixel)) fail("read framebuffer pixel");
     return ((pixel >> mode->red.offset) & 0xff) << 16 |
            ((pixel >> mode->green.offset) & 0xff) << 8 | ((pixel >> mode->blue.offset) & 0xff);
 }
@@ -562,11 +578,69 @@ static void check_popup(struct wl_display *display, struct xdg_surface *parent, 
     check_popup_pixels(fb, &layout, &mode, &state, false);
 }
 
+static void check_subsurface_pixels(int fb, const struct fb_fix_screeninfo *layout,
+                                    const struct fb_var_screeninfo *mode, int x, uint32_t color,
+                                    const char *message) {
+    const int y = SUBSURFACE_Y;
+    const uint32_t background = window_colors[0][0];
+    if (framebuffer_color(fb, layout, mode, x, y) != color ||
+        framebuffer_color(fb, layout, mode, x + SUBSURFACE_WIDTH - 1, y + SUBSURFACE_HEIGHT - 1) != color ||
+        framebuffer_color(fb, layout, mode, x - 1, y) != background ||
+        framebuffer_color(fb, layout, mode, x + SUBSURFACE_WIDTH, y) != background)
+        fail(message);
+}
+
+static void check_subsurface(struct wl_display *display, struct wl_surface *parent, int fb) {
+    struct fb_fix_screeninfo layout;
+    struct fb_var_screeninfo mode;
+    if (ioctl(fb, FBIOGET_FSCREENINFO, &layout) || ioctl(fb, FBIOGET_VSCREENINFO, &mode) ||
+        mode.xres / 2 <= SUBSURFACE_MOVED_X + SUBSURFACE_WIDTH || mode.yres / 2 <= SUBSURFACE_Y + SUBSURFACE_HEIGHT)
+        fail("subsurface framebuffer layout");
+
+    struct wl_surface *child = wl_compositor_create_surface(compositor);
+    struct wl_subsurface *role = wl_subcompositor_get_subsurface(subcompositor, child, parent);
+    struct wl_buffer *buffer = create_buffer(SUBSURFACE_WIDTH, SUBSURFACE_HEIGHT, subsurface_colors);
+    struct wl_buffer *next = create_buffer(SUBSURFACE_WIDTH, SUBSURFACE_HEIGHT, subsurface_desync_colors);
+    const uint32_t background = window_colors[0][0];
+    wl_subsurface_set_position(role, SUBSURFACE_X, SUBSURFACE_Y);
+    wl_surface_attach(child, buffer, 0, 0);
+    wl_surface_damage_buffer(child, 0, 0, SUBSURFACE_WIDTH, SUBSURFACE_HEIGHT);
+    wl_surface_commit(child);
+    if (wl_display_roundtrip(display) < 0) fail("commit synchronized subsurface");
+    check_subsurface_pixels(fb, &layout, &mode, SUBSURFACE_X, background, "subsurface mapped before parent commit");
+
+    wl_surface_commit(parent);
+    if (wl_display_roundtrip(display) < 0) fail("apply synchronized subsurface");
+    check_subsurface_pixels(fb, &layout, &mode, SUBSURFACE_X, SUBSURFACE_COLOR, "render synchronized subsurface");
+
+    wl_subsurface_set_desync(role);
+    wl_subsurface_set_position(role, SUBSURFACE_MOVED_X, SUBSURFACE_Y);
+    wl_surface_attach(child, next, 0, 0);
+    wl_surface_damage_buffer(child, 0, 0, SUBSURFACE_WIDTH, SUBSURFACE_HEIGHT);
+    wl_surface_commit(child);
+    if (wl_display_roundtrip(display) < 0) fail("commit desynchronized subsurface");
+    check_subsurface_pixels(fb, &layout, &mode, SUBSURFACE_X, SUBSURFACE_DESYNC_COLOR, "render desynchronized subsurface");
+    check_subsurface_pixels(fb, &layout, &mode, SUBSURFACE_MOVED_X, background, "subsurface moved before parent commit");
+
+    wl_surface_commit(parent);
+    if (wl_display_roundtrip(display) < 0) fail("apply subsurface position");
+    check_subsurface_pixels(fb, &layout, &mode, SUBSURFACE_X, background, "restore moved subsurface background");
+    check_subsurface_pixels(fb, &layout, &mode, SUBSURFACE_MOVED_X, SUBSURFACE_DESYNC_COLOR, "render moved subsurface");
+
+    wl_subsurface_destroy(role);
+    if (wl_display_roundtrip(display) < 0) fail("destroy subsurface role");
+    check_subsurface_pixels(fb, &layout, &mode, SUBSURFACE_MOVED_X, background, "restore destroyed subsurface background");
+    wl_surface_destroy(child);
+    wl_buffer_destroy(next);
+    wl_buffer_destroy(buffer);
+    if (wl_display_roundtrip(display) < 0) fail("destroy subsurface resources");
+}
+
 int main(void) {
     struct wl_display *display = start_compositor();
     struct wl_registry *registry = wl_display_get_registry(display);
     wl_registry_add_listener(registry, &registry_events, NULL);
-    if (wl_display_roundtrip(display) < 0 || !compositor || !shm || !shell || !output ||
+    if (wl_display_roundtrip(display) < 0 || !compositor || !subcompositor || !shm || !shell || !output ||
         wl_display_roundtrip(display) < 0 || !output_ready || !xrgb || output_scale != 1)
         fail("bind display globals");
 
@@ -614,6 +688,11 @@ int main(void) {
     if (!focused || !pointer_focused || pointer_frames != 6 ||
         write(1, popup_marker, sizeof(popup_marker) - 1) != sizeof(popup_marker) - 1)
         fail("popup completion and focus");
+    check_subsurface(display, surface, fb);
+    static const char subsurface_marker[] = "Wayland subsurface synchronized, presented and restored\n";
+    if (!focused || !pointer_focused || pointer_frames != 6 ||
+        write(1, subsurface_marker, sizeof(subsurface_marker) - 1) != sizeof(subsurface_marker) - 1)
+        fail("subsurface completion and focus");
     wl_surface_attach(surface, NULL, 0, 0);
     wl_surface_commit(surface);
     if (wl_display_roundtrip(display) < 0 || focused || pointer_focused || pointer_frames != 7 ||

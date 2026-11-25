@@ -62,7 +62,14 @@ struct image {
     bool opaque;
 };
 
-enum surface_role { SURFACE_NONE, SURFACE_XDG, SURFACE_CURSOR };
+enum surface_role { SURFACE_NONE, SURFACE_XDG, SURFACE_CURSOR, SURFACE_SUBSURFACE };
+enum layer_state { LAYER_PENDING, LAYER_CACHED, LAYER_CURRENT, LAYER_STATES };
+
+struct layer {
+    struct wl_list link;
+    struct surface *surface;
+    int32_t x, y;
+};
 enum xdg_role { XDG_NONE, XDG_TOPLEVEL, XDG_POPUP };
 
 struct surface {
@@ -71,19 +78,24 @@ struct surface {
     struct wl_resource *shell;
     struct wl_resource *toplevel;
     struct wl_resource *popup;
+    struct wl_resource *subsurface;
     struct wl_resource *wm_base;
     struct wl_listener wm_base_destroy;
     struct wl_list popup_link, shell_link;
     struct surface *parent;
     struct positioner positioner;
     struct rectangle placement, geometry, pending_geometry;
-    struct image image, cursor_image;
+    struct image image, cursor_image, cached_image;
+    struct wl_list layers[LAYER_STATES];
+    struct layer own_layer[LAYER_STATES], child_layer[LAYER_STATES];
     int64_t x, y;
     bool geometry_pending, dismissed;
     struct wl_resource *buffer;
     struct wl_listener buffer_destroy;
-    struct wl_list frames;
-    struct wl_array input_region, pending_input_region;
+    struct wl_list frames, cached_frames, presented_frames;
+    struct wl_array input_region, pending_input_region, cached_input_region;
+    bool layers_pending, layers_cached, sync, commit_cached, buffer_cached;
+    bool input_cached, cached_input_set;
     int32_t attach_x, attach_y;
     int64_t cursor_x, cursor_y;
     uint32_t serial;
@@ -121,6 +133,8 @@ static void restore_cursor(struct compositor *server) {
 }
 
 static bool redraw(struct compositor *server);
+static bool shown(const struct surface *surface);
+static void orphan_subsurface(struct surface *surface);
 
 static void clear_image(struct image *image) {
     free(image->pixels);
@@ -133,6 +147,13 @@ static bool popup_descends_from(const struct surface *popup, const struct surfac
     return false;
 }
 
+static void detach_pointer_tree(struct surface *surface) {
+    wayland_seat_pointer_detach(surface->server->seat, surface->resource);
+    struct layer *layer;
+    wl_list_for_each(layer, &surface->layers[LAYER_CURRENT], link)
+        if (layer->surface) detach_pointer_tree(layer->surface);
+}
+
 static void hide_surface(struct surface *surface) {
     struct compositor *server = surface->server;
     struct surface *child;
@@ -143,12 +164,12 @@ static void hide_surface(struct surface *surface) {
             child->dismissed = true;
             child->mapped = false;
             clear_image(&child->image);
-            wayland_seat_pointer_detach(server->seat, child->resource);
+            detach_pointer_tree(child);
         }
     }
     surface->mapped = false;
     clear_image(&surface->image);
-    wayland_seat_pointer_detach(server->seat, surface->resource);
+    detach_pointer_tree(surface);
     if (server->visible == surface) {
         server->visible = NULL;
         wayland_seat_keyboard_focus(server->seat, NULL);
@@ -218,20 +239,33 @@ static void shell_surface_destroyed(struct wl_resource *resource) {
     surface->geometry_pending = false;
 }
 
+static void destroy_frames(struct wl_list *frames) {
+    struct frame *frame, *next;
+    wl_list_for_each_safe(frame, next, frames, link) wl_resource_destroy(frame->resource);
+}
+
 static void surface_destroyed(struct wl_resource *resource) {
     struct surface *surface = wl_resource_get_user_data(resource);
-    struct frame *frame, *next;
+    if (surface->subsurface) {
+        wl_resource_set_user_data(surface->subsurface, NULL);
+        orphan_subsurface(surface);
+    }
+    struct layer *layer, *next_layer;
+    wl_list_for_each_safe(layer, next_layer, &surface->layers[LAYER_PENDING], link)
+        if (layer->surface) orphan_subsurface(layer->surface);
     if (surface->server->cursor_surface == resource) surface->server->cursor_surface = NULL;
     if (surface->shell) wl_resource_destroy(surface->shell);
     struct surface *child;
     wl_list_for_each(child, &surface->server->popups, popup_link)
         if (child->parent == surface) child->parent = NULL;
     clear_pending_buffer(surface);
-    wl_list_for_each_safe(frame, next, &surface->frames, link) {
-        wl_resource_destroy(frame->resource);
-    }
+    destroy_frames(&surface->frames);
+    destroy_frames(&surface->cached_frames);
+    destroy_frames(&surface->presented_frames);
     wl_array_release(&surface->input_region);
     wl_array_release(&surface->pending_input_region);
+    wl_array_release(&surface->cached_input_region);
+    clear_image(&surface->cached_image);
     clear_image(&surface->cursor_image);
     clear_image(&surface->image);
     free(surface);
@@ -240,7 +274,7 @@ static void surface_destroyed(struct wl_resource *resource) {
 static void destroy_surface_request(struct wl_client *client, struct wl_resource *resource) {
     (void)client;
     struct surface *surface = wl_resource_get_user_data(resource);
-    hide_surface(surface);
+    if (!surface->subsurface) hide_surface(surface);
     wl_resource_destroy(resource);
 }
 
@@ -292,8 +326,12 @@ static void set_input_region(struct wl_client *client, struct wl_resource *resou
 
 static bool shown(const struct surface *surface) {
     const struct surface *root = surface;
-    while (root->mapped && root->parent) root = root->parent;
-    return root == surface->server->visible && surface->mapped;
+    for (; root->parent; root = root->parent) {
+        if (!root->mapped ||
+            (root->role == SURFACE_SUBSURFACE && wl_list_empty(&root->child_layer[LAYER_CURRENT].link)))
+            return false;
+    }
+    return root->mapped && root == surface->server->visible;
 }
 
 static bool accepts_pointer(const struct surface *surface, int x, int y) {
@@ -311,13 +349,29 @@ static bool accepts_pointer(const struct surface *surface, int x, int y) {
     return inside;
 }
 
+static struct wl_resource *pick_surface_tree(struct surface *surface, int x, int y) {
+    if (!surface->mapped) return NULL;
+    struct layer *layer;
+    wl_list_for_each_reverse(layer, &surface->layers[LAYER_CURRENT], link) {
+        if (layer->surface) {
+            struct wl_resource *child = pick_surface_tree(layer->surface, x, y);
+            if (child) return child;
+        } else if (accepts_pointer(surface, x, y)) {
+            return surface->resource;
+        }
+    }
+    return NULL;
+}
+
 static struct wl_resource *pick_surface(void *data, int x, int y) {
     struct compositor *server = data;
     struct surface *surface;
-    wl_list_for_each_reverse(surface, &server->popups, popup_link)
-        if (shown(surface) && accepts_pointer(surface, x, y)) return surface->resource;
-    surface = server->visible;
-    return surface && accepts_pointer(surface, x, y) ? surface->resource : NULL;
+    wl_list_for_each_reverse(surface, &server->popups, popup_link) {
+        if (!shown(surface)) continue;
+        struct wl_resource *target = pick_surface_tree(surface, x, y);
+        if (target) return target;
+    }
+    return server->visible ? pick_surface_tree(server->visible, x, y) : NULL;
 }
 
 static wl_fixed_t local_coordinate(int64_t value) {
@@ -335,7 +389,7 @@ static void pointer_coordinates(struct wl_resource *resource, int x, int y, wl_f
 static bool assign_cursor(void *data, struct wl_resource *resource) {
     (void)data;
     struct surface *surface = wl_resource_get_user_data(resource);
-    if (surface->role == SURFACE_XDG) return false;
+    if (surface->role != SURFACE_NONE && surface->role != SURFACE_CURSOR) return false;
     surface->role = SURFACE_CURSOR;
     surface->cursor_x = 0;
     surface->cursor_y = 0;
@@ -558,6 +612,10 @@ static void add_extent(const struct surface *surface, int screen_width, int scre
     int64_t bottom = surface->y + surface->image.height;
     if (right > *width) *width = right > screen_width ? screen_width : (int)right;
     if (bottom > *height) *height = bottom > screen_height ? screen_height : (int)bottom;
+    const struct layer *layer;
+    wl_list_for_each(layer, &surface->layers[LAYER_CURRENT], link)
+        if (layer->surface && layer->surface->mapped)
+            add_extent(layer->surface, screen_width, screen_height, width, height);
 }
 
 static void paint_surface_row(struct compositor *server, const struct surface *surface, int y, int width) {
@@ -577,14 +635,40 @@ static void paint_surface_row(struct compositor *server, const struct surface *s
     }
 }
 
+static void paint_tree_row(struct compositor *server, const struct surface *surface, int y, int width) {
+    if (!surface->mapped) return;
+    const struct layer *layer;
+    wl_list_for_each(layer, &surface->layers[LAYER_CURRENT], link) {
+        if (layer->surface) paint_tree_row(server, layer->surface, y, width);
+        else paint_surface_row(server, surface, y, width);
+    }
+}
+
+static void update_child_origins(struct surface *surface) {
+    struct layer *layer;
+    wl_list_for_each(layer, &surface->layers[LAYER_CURRENT], link) {
+        struct surface *child = layer->surface;
+        if (!child) continue;
+        child->x = surface->x + layer->x;
+        child->y = surface->y + layer->y;
+        update_child_origins(child);
+    }
+}
+
+static void update_popup_origins(struct compositor *server);
+
 static bool redraw(struct compositor *server) {
+    update_popup_origins(server);
+    if (server->visible) update_child_origins(server->visible);
     int width = 0, height = 0;
     struct surface *popup;
     if (server->visible)
         add_extent(server->visible, server->mode.xres, server->mode.yres, &width, &height);
     wl_list_for_each(popup, &server->popups, popup_link) {
-        if (shown(popup))
+        if (shown(popup)) {
+            update_child_origins(popup);
             add_extent(popup, server->mode.xres, server->mode.yres, &width, &height);
+        }
     }
     int draw_width = width > server->drawn_width ? width : server->drawn_width;
     int draw_height = height > server->drawn_height ? height : server->drawn_height;
@@ -592,9 +676,9 @@ static bool redraw(struct compositor *server) {
     restore_cursor(server);
     for (int y = 0; y < draw_height; ++y) {
         memset(server->row, 0, (size_t)draw_width * sizeof(*server->row));
-        if (server->visible) paint_surface_row(server, server->visible, y, draw_width);
+        if (server->visible) paint_tree_row(server, server->visible, y, draw_width);
         wl_list_for_each(popup, &server->popups, popup_link)
-            if (shown(popup)) paint_surface_row(server, popup, y, draw_width);
+            if (shown(popup)) paint_tree_row(server, popup, y, draw_width);
         if (!write_pixels(server, 0, y, draw_width, server->row)) return false;
     }
     server->drawn_width = width;
@@ -629,11 +713,160 @@ static bool configure(struct surface *surface) {
     return true;
 }
 
+static void copy_layers(struct surface *surface, enum layer_state from, enum layer_state to) {
+    struct wl_list *tail = &surface->layers[to];
+    const struct layer *layer;
+    wl_list_for_each(layer, &surface->layers[from], link) {
+        struct layer *target = layer->surface ? &layer->surface->child_layer[to] : &surface->own_layer[to];
+        target->x = layer->x;
+        target->y = layer->y;
+        wl_list_remove(&target->link);
+        wl_list_insert(tail, &target->link);
+        tail = &target->link;
+    }
+}
+
+static bool effectively_synchronized(const struct surface *surface) {
+    for (; surface->role == SURFACE_SUBSURFACE && surface->parent; surface = surface->parent)
+        if (surface->sync) return true;
+    return false;
+}
+
+static void move_frames(struct wl_list *from, struct wl_list *to) {
+    if (!wl_list_empty(from)) {
+        wl_list_insert_list(to->prev, from);
+        wl_list_init(from);
+    }
+}
+
+static bool apply_subsurface(struct surface *surface) {
+    if (!surface->commit_cached) return false;
+    surface->commit_cached = false;
+    if (surface->buffer_cached) {
+        if (surface->mapped && !surface->cached_image.pixels) detach_pointer_tree(surface);
+        clear_image(&surface->image);
+        surface->image = surface->cached_image;
+        surface->cached_image = (struct image){0};
+        surface->mapped = surface->image.pixels != NULL;
+        surface->buffer_cached = false;
+    }
+    if (surface->input_cached) {
+        wl_array_release(&surface->input_region);
+        surface->input_region = surface->cached_input_region;
+        wl_array_init(&surface->cached_input_region);
+        surface->input_set = surface->cached_input_set;
+        surface->input_cached = false;
+    }
+    if (surface->layers_cached) {
+        copy_layers(surface, LAYER_CACHED, LAYER_CURRENT);
+        surface->layers_cached = false;
+    }
+    move_frames(&surface->cached_frames, &surface->presented_frames);
+    return true;
+}
+
+static bool apply_child_commits(struct surface *surface, bool synchronized) {
+    bool changed = false;
+    struct layer *layer;
+    wl_list_for_each(layer, &surface->layers[LAYER_CURRENT], link) {
+        struct surface *child = layer->surface;
+        if (!child || (!synchronized && !child->sync)) continue;
+        changed |= apply_subsurface(child);
+        changed |= apply_child_commits(child, true);
+    }
+    return changed;
+}
+
+static void complete_frames(struct wl_list *frames, uint32_t ms) {
+    struct frame *frame, *next;
+    wl_list_for_each_safe(frame, next, frames, link) {
+        wl_callback_send_done(frame->resource, ms);
+        wl_resource_destroy(frame->resource);
+    }
+}
+
+static void complete_child_frames(struct surface *surface, uint32_t ms) {
+    if (!surface->mapped) return;
+    complete_frames(&surface->presented_frames, ms);
+    struct layer *layer;
+    wl_list_for_each(layer, &surface->layers[LAYER_CURRENT], link)
+        if (layer->surface) complete_child_frames(layer->surface, ms);
+}
+
+static uint32_t frame_time(void) {
+    struct timespec time = {0};
+    clock_gettime(CLOCK_MONOTONIC, &time);
+    return (uint32_t)time.tv_sec * 1000 + (uint32_t)(time.tv_nsec / 1000000);
+}
+
+static bool present_changes(struct wl_client *client, struct compositor *server) {
+    if (!redraw(server)) {
+        wl_client_post_implementation_error(client, "Could not redraw shared memory buffers");
+        return false;
+    }
+    wayland_seat_pointer_update(server->seat);
+    uint32_t ms = frame_time();
+    if (server->visible) complete_child_frames(server->visible, ms);
+    struct surface *popup;
+    wl_list_for_each(popup, &server->popups, popup_link)
+        if (shown(popup)) complete_child_frames(popup, ms);
+    return true;
+}
+
+static void commit_subsurface(struct wl_client *client, struct surface *surface,
+                              struct wl_resource *buffer) {
+    struct compositor *server = surface->server;
+    if (buffer) {
+        struct wl_shm_buffer *shm = wl_shm_buffer_get(buffer);
+        struct buffer_view view;
+        if (!shm || !read_buffer_view(&view, surface, shm) ||
+            view.output_width > 2LL * server->mode.xres || view.output_height > 2LL * server->mode.yres) {
+            wl_client_post_implementation_error(client, "Unsupported subsurface buffer");
+            return;
+        }
+        if (!capture_image(&surface->cached_image, shm, &view, view.output_width, view.output_height)) {
+            wl_client_post_no_memory(client);
+            return;
+        }
+        wl_buffer_send_release(buffer);
+    } else if (surface->detach) {
+        clear_image(&surface->cached_image);
+    }
+    surface->buffer_cached |= buffer || surface->detach;
+    surface->detach = false;
+    if (surface->input_pending) {
+        wl_array_release(&surface->cached_input_region);
+        surface->cached_input_region = surface->pending_input_region;
+        wl_array_init(&surface->pending_input_region);
+        surface->cached_input_set = surface->pending_input_set;
+        surface->input_cached = true;
+        surface->input_pending = false;
+    }
+    if (surface->layers_pending) {
+        copy_layers(surface, LAYER_PENDING, LAYER_CACHED);
+        surface->layers_pending = false;
+        surface->layers_cached = true;
+    }
+    move_frames(&surface->frames, &surface->cached_frames);
+    surface->commit_cached = true;
+    if (!effectively_synchronized(surface)) {
+        bool repaint = shown(surface);
+        apply_subsurface(surface);
+        apply_child_commits(surface, false);
+        if (repaint || shown(surface)) present_changes(client, server);
+    }
+}
+
 static void surface_commit(struct wl_client *client, struct wl_resource *resource) {
     struct surface *surface = wl_resource_get_user_data(resource);
     struct compositor *server = surface->server;
     struct wl_resource *buffer = surface->buffer;
     clear_pending_buffer(surface);
+    if (surface->role == SURFACE_SUBSURFACE) {
+        if (surface->parent) commit_subsurface(client, surface, buffer);
+        else if (buffer) wl_buffer_send_release(buffer);
+        return;
+    }
     if (surface->shell && !surface->toplevel && !surface->popup) {
         wl_resource_post_error(surface->shell, XDG_SURFACE_ERROR_NOT_CONSTRUCTED, "Missing surface role");
         return;
@@ -724,25 +957,16 @@ static void surface_commit(struct wl_client *client, struct wl_resource *resourc
         repaint |= server->cursor_surface == resource;
     }
     surface->detach = false;
-    if (recomposite) {
-        update_popup_origins(server);
-        if (!redraw(server)) {
-            wl_client_post_implementation_error(client, "Could not redraw shared memory buffers");
-            return;
-        }
+    if (surface->layers_pending) {
+        copy_layers(surface, LAYER_PENDING, LAYER_CURRENT);
+        surface->layers_pending = false;
+        recomposite |= shown(surface);
     }
-    if (repaint || recomposite) wayland_seat_pointer_update(server->seat);
-
-    if (shown(surface) || surface->role == SURFACE_CURSOR) {
-        struct timespec time = {0};
-        clock_gettime(CLOCK_MONOTONIC, &time);
-        uint32_t ms = (uint32_t)time.tv_sec * 1000 + (uint32_t)(time.tv_nsec / 1000000);
-        struct frame *frame, *next;
-        wl_list_for_each_safe(frame, next, &surface->frames, link) {
-            wl_callback_send_done(frame->resource, ms);
-            wl_resource_destroy(frame->resource);
-        }
-    }
+    if (apply_child_commits(surface, false)) recomposite |= shown(surface);
+    if (recomposite && !present_changes(client, server)) return;
+    if (repaint && !recomposite) wayland_seat_pointer_update(server->seat);
+    if (shown(surface) || surface->role == SURFACE_CURSOR)
+        complete_frames(&surface->frames, frame_time());
 }
 
 static const struct wl_surface_interface surface_requests = {
@@ -775,8 +999,17 @@ static void create_surface(struct wl_client *client, struct wl_resource *resourc
     surface->buffer_destroy.notify = buffer_destroyed;
     surface->scale = 1;
     wl_list_init(&surface->frames);
+    wl_list_init(&surface->cached_frames);
+    wl_list_init(&surface->presented_frames);
     wl_array_init(&surface->input_region);
     wl_array_init(&surface->pending_input_region);
+    wl_array_init(&surface->cached_input_region);
+    for (unsigned i = 0; i < LAYER_STATES; ++i) {
+        wl_list_init(&surface->layers[i]);
+        wl_list_init(&surface->child_layer[i].link);
+        surface->child_layer[i].surface = surface;
+        wl_list_insert(&surface->layers[i], &surface->own_layer[i].link);
+    }
     wl_resource_set_implementation(child, &surface_requests, surface, surface_destroyed);
 }
 
@@ -1185,7 +1418,7 @@ static const struct xdg_surface_interface shell_surface_requests = {
 static void get_shell_surface(struct wl_client *client, struct wl_resource *resource, uint32_t id,
                               struct wl_resource *parent) {
     struct surface *surface = wl_resource_get_user_data(parent);
-    if (surface->role == SURFACE_CURSOR || surface->shell) {
+    if ((surface->role != SURFACE_NONE && surface->role != SURFACE_XDG) || surface->shell) {
         wl_resource_post_error(resource, XDG_WM_BASE_ERROR_ROLE, "Surface already has a role");
         return;
     }
@@ -1271,6 +1504,168 @@ static int open_listener(struct wl_display *display, const char *path) {
     return 0;
 }
 
+static void orphan_subsurface(struct surface *surface) {
+    if (!surface->parent) return;
+    bool repaint = shown(surface);
+    detach_pointer_tree(surface);
+    for (unsigned i = 0; i < LAYER_STATES; ++i) {
+        wl_list_remove(&surface->child_layer[i].link);
+        wl_list_init(&surface->child_layer[i].link);
+        surface->child_layer[i].x = surface->child_layer[i].y = 0;
+    }
+    surface->parent = NULL;
+    surface->mapped = false;
+    surface->commit_cached = surface->buffer_cached = surface->input_cached = false;
+    surface->layers_cached = false;
+    clear_image(&surface->image);
+    clear_image(&surface->cached_image);
+    destroy_frames(&surface->cached_frames);
+    destroy_frames(&surface->presented_frames);
+    if (repaint) present_changes(wl_resource_get_client(surface->resource), surface->server);
+}
+
+static void subsurface_destroyed(struct wl_resource *resource) {
+    struct surface *surface = wl_resource_get_user_data(resource);
+    if (surface) {
+        surface->subsurface = NULL;
+        orphan_subsurface(surface);
+    }
+}
+
+static void set_subsurface_position(struct wl_client *client, struct wl_resource *resource,
+                                    int32_t x, int32_t y) {
+    (void)client;
+    struct surface *surface = wl_resource_get_user_data(resource);
+    if (!surface || !surface->parent) return;
+    surface->child_layer[LAYER_PENDING].x = x;
+    surface->child_layer[LAYER_PENDING].y = y;
+    surface->parent->layers_pending = true;
+}
+
+static void place_subsurface(struct wl_resource *resource, struct wl_resource *reference, bool above) {
+    struct surface *surface = wl_resource_get_user_data(resource);
+    if (!surface || !surface->parent) return;
+    struct surface *parent = surface->parent;
+    struct surface *sibling = wl_resource_get_user_data(reference);
+    struct layer *anchor;
+    if (sibling == parent) anchor = &parent->own_layer[LAYER_PENDING];
+    else if (sibling != surface && sibling->subsurface && sibling->parent == parent)
+        anchor = &sibling->child_layer[LAYER_PENDING];
+    else {
+        wl_resource_post_error(resource, WL_SUBSURFACE_ERROR_BAD_SURFACE, "Reference must be parent or sibling");
+        return;
+    }
+    struct wl_list *link = &surface->child_layer[LAYER_PENDING].link;
+    wl_list_remove(link);
+    wl_list_insert(above ? &anchor->link : anchor->link.prev, link);
+    parent->layers_pending = true;
+}
+
+static void place_above(struct wl_client *client, struct wl_resource *resource, struct wl_resource *reference) {
+    (void)client;
+    place_subsurface(resource, reference, true);
+}
+
+static void place_below(struct wl_client *client, struct wl_resource *resource, struct wl_resource *reference) {
+    (void)client;
+    place_subsurface(resource, reference, false);
+}
+
+static void set_sync(struct wl_client *client, struct wl_resource *resource) {
+    (void)client;
+    struct surface *surface = wl_resource_get_user_data(resource);
+    if (surface && surface->parent) surface->sync = true;
+}
+
+static bool apply_desynchronized_tree(struct surface *surface) {
+    bool changed = apply_subsurface(surface);
+    changed |= apply_child_commits(surface, false);
+    struct layer *layer;
+    wl_list_for_each(layer, &surface->layers[LAYER_CURRENT], link)
+        if (layer->surface && !layer->surface->sync) changed |= apply_desynchronized_tree(layer->surface);
+    return changed;
+}
+
+static void set_desync(struct wl_client *client, struct wl_resource *resource) {
+    struct surface *surface = wl_resource_get_user_data(resource);
+    if (!surface || !surface->parent) return;
+    surface->sync = false;
+    if (!effectively_synchronized(surface)) {
+        bool repaint = shown(surface);
+        if (apply_desynchronized_tree(surface) && (repaint || shown(surface)))
+            present_changes(client, surface->server);
+    }
+}
+
+static const struct wl_subsurface_interface subsurface_requests = {
+    .destroy = destroy_request,
+    .set_position = set_subsurface_position,
+    .place_above = place_above,
+    .place_below = place_below,
+    .set_sync = set_sync,
+    .set_desync = set_desync,
+};
+
+// Обходы отрисовки и синхронного коммита расходуют стек на каждый вложенный слой.
+enum { MAX_SUBSURFACE_DEPTH = 128 };
+
+static bool subsurface_tree_fits(const struct surface *surface, unsigned depth) {
+    if (depth >= MAX_SUBSURFACE_DEPTH) return false;
+    const struct layer *layer;
+    wl_list_for_each(layer, &surface->layers[LAYER_PENDING], link)
+        if (layer->surface && !subsurface_tree_fits(layer->surface, depth + 1)) return false;
+    return true;
+}
+
+static void get_subsurface(struct wl_client *client, struct wl_resource *resource, uint32_t id,
+                           struct wl_resource *child_resource, struct wl_resource *parent_resource) {
+    struct surface *surface = wl_resource_get_user_data(child_resource);
+    struct surface *parent = wl_resource_get_user_data(parent_resource);
+    if (surface->subsurface || (surface->role != SURFACE_NONE && surface->role != SURFACE_SUBSURFACE)) {
+        wl_resource_post_error(resource, WL_SUBCOMPOSITOR_ERROR_BAD_SURFACE, "Surface already has a role");
+        return;
+    }
+    unsigned depth = 0;
+    for (const struct surface *ancestor = parent; ancestor; ancestor = ancestor->parent) {
+        if (ancestor == surface) {
+            wl_resource_post_error(resource, WL_SUBCOMPOSITOR_ERROR_BAD_PARENT, "Invalid subsurface parent");
+            return;
+        }
+        if (ancestor->role == SURFACE_SUBSURFACE) ++depth;
+    }
+    if (!subsurface_tree_fits(surface, depth)) {
+        wl_client_post_implementation_error(client, "Subsurface tree is too deep");
+        return;
+    }
+    surface->subsurface = wl_resource_create(client, &wl_subsurface_interface, 1, id);
+    if (!surface->subsurface) {
+        wl_client_post_no_memory(client);
+        return;
+    }
+    surface->role = SURFACE_SUBSURFACE;
+    surface->parent = parent;
+    surface->sync = true;
+    if (surface->cursor_image.pixels) {
+        surface->cached_image = surface->cursor_image;
+        surface->cursor_image = (struct image){0};
+        surface->buffer_cached = surface->commit_cached = true;
+    }
+    wl_list_insert(parent->layers[LAYER_PENDING].prev, &surface->child_layer[LAYER_PENDING].link);
+    parent->layers_pending = true;
+    wl_resource_set_implementation(surface->subsurface, &subsurface_requests, surface, subsurface_destroyed);
+}
+
+static const struct wl_subcompositor_interface subcompositor_requests = {
+    .destroy = destroy_request,
+    .get_subsurface = get_subsurface,
+};
+
+static void bind_subcompositor(struct wl_client *client, void *data, uint32_t version, uint32_t id) {
+    struct wl_resource *resource = wl_resource_create(client, &wl_subcompositor_interface, version, id);
+    if (resource) wl_resource_set_implementation(resource, &subcompositor_requests, data, NULL);
+    else wl_client_post_no_memory(client);
+}
+
 static bool color_supported(struct fb_bitfield color) {
     return color.length == 8 && color.offset <= 24 && !color.msb_right;
 }
@@ -1302,6 +1697,7 @@ int main(int argc, char **argv) {
     server.display = wl_display_create();
     if (!server.row || !server.display || wl_display_init_shm(server.display) ||
         !wl_global_create(server.display, &wl_compositor_interface, 4, &server, bind_compositor) ||
+        !wl_global_create(server.display, &wl_subcompositor_interface, 1, &server, bind_subcompositor) ||
         !wl_global_create(server.display, &wl_output_interface, 2, &server, bind_output) ||
         !wl_global_create(server.display, &xdg_wm_base_interface, 1, &server, bind_shell)) {
         fputs("Could not initialize Wayland display\n", stderr);
