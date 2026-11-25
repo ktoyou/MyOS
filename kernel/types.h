@@ -55,9 +55,9 @@ static inline u32 irq_save(void) { return 0; }
 static inline void irq_restore(u32 f) { (void)f; }
 #else
 static inline u32 irq_save(void) {
-    u32 f;
-    __asm__ volatile ("pushf; pop %0; cli" : "=r"(f) : : "memory");
-    return f;
+    uptr flags;
+    __asm__ volatile ("pushf; pop %0; cli" : "=r"(flags) : : "memory");
+    return (u32)flags;
 }
 static inline void irq_restore(u32 f) {
     if (f & 0x200) __asm__ volatile ("sti" : : : "memory");

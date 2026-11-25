@@ -5,6 +5,8 @@
 /* Unit 0 is the installed root; units 3/4 are explicit Live targets. */
 bool nvme_init(void);
 int nvme_installer_probe(void);
+struct boot_info;
+bool nvme64_probe_live(const struct boot_info *boot);
 bool nvme_present(int unit);
 u32 nvme_sectors(int unit);
 const char *nvme_model(int unit);
