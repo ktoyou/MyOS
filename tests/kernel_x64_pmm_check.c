@@ -2,6 +2,9 @@
 #include "../kernel/x86_64/framebuffer.h"
 
 extern const u8 _start[], __kernel_end[];
+extern void kernel64_serial_char(char ch);
+
+static const uptr two_gib = 2ul * 1024 * 1024 * 1024;
 
 static bool overlaps(uptr page, u64 start, u64 size) {
     return size && page < start + size && start < page + PMM_PAGE_SIZE;
@@ -26,14 +29,19 @@ static bool reserved(const struct boot_info *boot, uptr page) {
 
 static u32 expected_pages(const struct boot_info *boot) {
     const struct boot_region *map = (const void *)(uptr)boot->map_phys;
+    u64 highest_usable_end = 0;
     u32 count = 0;
     for (u32 i = 0; i < boot->map_count; ++i) {
         if (map[i].type != 1 || !(map[i].attributes & 1u)) continue;
         u64 end = map[i].base + map[i].length;
+        if (end > highest_usable_end) highest_usable_end = end;
         for (u64 page = map[i].base; page < end; page += PMM_PAGE_SIZE)
             if (!reserved(boot, (uptr)page)) ++count;
     }
-    return count;
+    /* Счётчики покрывают физические номера страниц, включая разрывы карты. */
+    u64 bytes = highest_usable_end / PMM_PAGE_SIZE * sizeof(u16);
+    u64 reference_pages = (bytes + PMM_PAGE_SIZE - 1) / PMM_PAGE_SIZE;
+    return count > reference_pages ? count - (u32)reference_pages : 0;
 }
 
 bool pmm64_check(const struct boot_info *boot, const struct gop64_framebuffer *fb) {
@@ -81,12 +89,13 @@ bool pmm64_check(const struct boot_info *boot, const struct gop64_framebuffer *f
     pmm64_page_counts(&total, &free);
     if (free + 1 != before) return false;
     if (!pmm64_free(first) || !pmm64_free(second)) return false;
-    uptr previous = 0;
+    uptr previous = 0, high = 0;
     u32 count = 0;
     for (uptr page; (page = pmm64_alloc()) != 0;) {
         if (page <= previous || (page & (PMM_PAGE_SIZE - 1)) ||
             !usable(boot, page) || reserved(boot, page))
             return false;
+        if (!high && page >= two_gib) high = page;
         previous = page;
         ++count;
     }
@@ -96,5 +105,21 @@ bool pmm64_check(const struct boot_info *boot, const struct gop64_framebuffer *f
         for (u32 i = 0; i < sizeof(expected) - 1; ++i)
             if (root[i] != expected[i]) return false;
     }
-    return count && count == expected_pages(boot);
+    pmm64_page_counts(&total, &free);
+    if (!count || count != expected_pages(boot) || count != total || free) return false;
+    if (high) {
+        volatile u64 *high_words = pmm64_pointer(high);
+        const u32 last = PMM_PAGE_SIZE / sizeof(*high_words) - 1;
+        const u64 pattern = 0x123456789abcdef0ull;
+        high_words[0] = pattern;
+        high_words[last] = ~pattern;
+        if (count < two_gib / PMM_PAGE_SIZE || high_words[0] != pattern ||
+            high_words[last] != ~pattern || !pmm64_free(high) ||
+            pmm64_alloc() != high || high_words[0] || high_words[last])
+            return false;
+        /* Маркер появится только после записи, возврата и повторного выделения верхней страницы. */
+        const char marker[] = "x86-64 PMM high RAM PASS\r\n";
+        for (unsigned i = 0; marker[i]; ++i) kernel64_serial_char(marker[i]);
+    }
+    return true;
 }

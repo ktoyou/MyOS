@@ -162,7 +162,8 @@ static u32 memory_type(u32 t) {
     if(t==EfiConventionalMemory || t==EfiLoaderCode || t==EfiLoaderData || t==EfiBootServicesCode || t==EfiBootServicesData)return 1;
     return t==EfiACPIReclaimMemory?3:t==EfiACPIMemoryNVS?4:2;
 }
-static BOOLEAN convert_map(void *map,UINTN bytes,UINTN stride,struct boot_info *boot,BOOLEAN kernel64) {
+static BOOLEAN convert_map(void *map,UINTN bytes,UINTN stride,struct boot_info *boot,
+                           BOOLEAN kernel64,UINT64 ram_limit) {
     struct region *out=(void *)(UINTN)boot->map_phys;unsigned count=0;
     if(stride<sizeof(EFI_MEMORY_DESCRIPTOR) || bytes%stride)return FALSE;
     UINT64 xhci_base = (UINT64)boot->xhci_bar_hi << 32 | boot->xhci_bar_lo;
@@ -175,8 +176,8 @@ static BOOLEAN convert_map(void *map,UINTN bytes,UINTN stride,struct boot_info *
         if (boot->xhci_bar_bytes && type != 2 && m->NumberOfPages && base < xhci_end &&
             (base >= xhci_base || m->NumberOfPages > (xhci_base - base) / 4096))
             boot->xhci_bdf = boot->xhci_bar_lo = boot->xhci_bar_hi = boot->xhci_bar_bytes = 0;
-        /* Таблицы ACPI доступны в начальном отображении x86-64 выше предела аллокатора. */
-        UINT64 limit=(kernel64 && (type==3 || type==4))?0x100000000ULL:0x40000000ULL;
+        /* Таблицы ACPI x86-64 читаются через начальное отображение ниже 4 ГиБ. */
+        UINT64 limit=type==1?ram_limit:(kernel64 && (type==3 || type==4))?0x100000000ULL:0x40000000ULL;
         if(base>=limit || !m->NumberOfPages)continue;
         UINT64 pages=(limit-base)/4096;
         UINT64 size=(m->NumberOfPages<pages?m->NumberOfPages:pages)*4096;
@@ -269,7 +270,10 @@ EFI_STATUS efi_main(EFI_HANDLE image,EFI_SYSTEM_TABLE *st) {
     for(unsigned attempt=0;attempt<4;attempt++) {
         UINTN size=capacity,key,stride;u32 version;
         EFI_STATUS r=services->GetMemoryMap(&size,map,&key,&stride,&version);
-        if(EFI_ERROR(r) || !convert_map(map,size,stride,boot,kernel64))break;
+        if(EFI_ERROR(r))break;
+        UINT64 ram_limit=kernel64?0x100000000ULL:0x40000000ULL;
+        if(!convert_map(map,size,stride,boot,kernel64,ram_limit) &&
+           (!kernel64 || !convert_map(map,size,stride,boot,kernel64,0x40000000ULL)))break;
         if(!EFI_ERROR(services->ExitBootServices(image,key))) {
             __asm__ volatile("cli; jmp *%0"::"r"(trampoline):"memory");__builtin_unreachable();
         }

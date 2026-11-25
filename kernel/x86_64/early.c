@@ -267,6 +267,20 @@ static void check_paging(unsigned mode, const struct boot_info *boot) {
         }
         serial_puts("x86-64 paging live root PASS\n");
     }
+    if (!mode) {
+        const struct boot_region *map = (const void *)(uptr)boot->map_phys;
+        for (u32 i = 0; i < boot->map_count; ++i) {
+            if (map[i].type != 1 || !(map[i].attributes & 1u) ||
+                map[i].base + map[i].length <= BOOT_MEMORY_LIMIT) continue;
+            uptr high = map[i].base > BOOT_MEMORY_LIMIT ? map[i].base : BOOT_MEMORY_LIMIT;
+            if (paging64_map_mmio(high, PMM_PAGE_SIZE)) {
+                serial_puts("x86-64 paging check FAIL\n");
+                halt();
+            }
+            serial_puts("x86-64 paging high RAM alias rejected\n");
+            break;
+        }
+    }
     serial_puts("x86-64 paging access PASS\n");
     if (!mode) return;
 
@@ -334,7 +348,8 @@ static bool valid_boot_map(const struct boot_info *boot, u32 entry_magic) {
 
     const struct boot_region *map = (const void *)(uptr)boot->map_phys;
     for (u32 i = 0; i < boot->map_count; ++i) {
-        u64 limit = (map[i].type == 3 || map[i].type == 4) ? 1ull << 32 : BOOT_MEMORY_LIMIT;
+        u32 type = map[i].type;
+        u64 limit = (type == 1 || type == 3 || type == 4) ? X64_RAM_LIMIT : BOOT_MEMORY_LIMIT;
         if (map[i].base >= limit || !map[i].length || map[i].length > limit - map[i].base ||
             ((map[i].base | map[i].length) & 4095u))
             return false;

@@ -264,7 +264,7 @@ void paging64_unmap_mmio(volatile void *mapping, uptr bytes) {
 }
 
 volatile void *paging64_map_mmio(uptr physical, uptr bytes) {
-    /* Нижний диапазон может иметь кешируемый псевдоним в прямом отображении. */
+    /* Низкие физические адреса могут иметь тождественное отображение. */
     if (physical < BOOT_MEMORY_LIMIT || physical >= MMIO_SPAN || !bytes ||
         bytes > MMIO_SPAN - physical || ((physical | bytes) & (PMM_PAGE_SIZE - 1)) ||
         (physical < framebuffer_end && framebuffer_first < physical + bytes)) return NULL;
@@ -272,7 +272,11 @@ volatile void *paging64_map_mmio(uptr physical, uptr bytes) {
     if (!uncached_flags(&flags)) return NULL;
     uptr root = paging64_active_root(), start = MMIO_BASE + physical;
     for (uptr mapped = 0; mapped < bytes; mapped += PMM_PAGE_SIZE) {
-        if (!map_page(root, start + mapped, physical + mapped, flags | WRITE | NO_EXECUTE)) {
+        uptr page = physical + mapped;
+        /* Страница RAM уже имеет кешируемое прямое отображение. */
+        const u64 *alias = page < X64_RAM_LIMIT ? find_leaf(root, X64_DIRECT_BASE + page) : NULL;
+        if ((alias && (*alias & PRESENT)) ||
+            !map_page(root, start + mapped, page, flags | WRITE | NO_EXECUTE)) {
             paging64_unmap_mmio((volatile void *)start, mapped);
             return NULL;
         }

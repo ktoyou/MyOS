@@ -1,5 +1,5 @@
 /* Minimal polling xHCI 1.x + USB HID boot protocol.
- * DMA lives in PMM pages below 1 GiB, never in the virtual kernel heap.
+ * Для DMA используются физические страницы PMM с 32-битными адресами.
  * Hotplug and USB 2.x hubs; HID input. Boot media use Bulk-Only/SCSI transport.
  * Reference: Intel xHCI 1.2, sections 4.3, 4.5, 6.2 and 6.4.
  */

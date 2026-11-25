@@ -55,9 +55,9 @@ void *xhci64_dma_alloc(void) {
 }
 
 u32 xhci64_dma_address(const volatile void *pointer) {
-    /* Страницы PMM находятся ниже 1 ГиБ и отображены в прямом окне ядра. */
+    /* DMA использует физический адрес страницы из прямого окна ядра. */
     uptr offset = (uptr)pointer - X64_DIRECT_BASE;
-    return offset < BOOT_MEMORY_LIMIT ? (u32)offset : 0;
+    return offset < X64_RAM_LIMIT ? (u32)offset : 0;
 }
 
 void xhci64_dma_free(void *page) {

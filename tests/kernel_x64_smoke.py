@@ -26,6 +26,12 @@ def check_pmm():
                      live_root_header=b'MYOSPMM!' if mode == 'live' else None)
         print(f'OVMF x86-64 PMM {mode}: PASS', flush=True)
 
+    with tempfile.TemporaryDirectory(prefix='myos-pmm-x64-high-') as temp:
+        # Q35 размещает 2560 МиБ ниже 4 ГиБ, не дробя RAM вокруг окна PCI.
+        boot_x64(pathlib.Path(temp), 'x64-pmm-high', payload, kernel_end,
+                 ['x86-64 PMM high RAM PASS', 'x86-64 PMM disk PASS'], extra=['-m', '2560M'])
+    print('OVMF x86-64 PMM usable RAM >= 2 GiB and high-page reuse: PASS', flush=True)
+
 
 def check_paging():
     for mode, error in enumerate((None, 3, 0x11, 0)):
@@ -35,8 +41,12 @@ def check_paging():
         if error is not None:
             fault = f'x86-64 exception vector=0x000000000000000e error={error:#018x} rip='
             markers.extend((fault, 'x86-64 exception halted'))
+        extra = ()
+        if mode == 0:
+            markers.append('x86-64 paging high RAM alias rejected')
+            extra = ('-m', '1280M')
         with tempfile.TemporaryDirectory(prefix='myos-paging-x64-') as temp:
-            serial = boot_x64(pathlib.Path(temp), f'x64-{name}', payload, kernel_end, markers)
+            serial = boot_x64(pathlib.Path(temp), f'x64-{name}', payload, kernel_end, markers, extra=extra)
         assert 'x86-64 paging check FAIL' not in serial, serial
         if error is not None:
             expected = re.search(r'x86-64 expected fault address=(0x[0-9a-f]{16})', serial)

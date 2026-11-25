@@ -3,7 +3,10 @@
 
 #include "../bootinfo.h"
 
+/* Загрузочная арена и Live-корень остаются в низкой памяти. */
 #define BOOT_MEMORY_LIMIT  0x40000000u
+/* Выделяемые физические адреса должны помещаться в 32 бита для DMA. */
+#define X64_RAM_LIMIT      (1ull << 32)
 #define PMM_PAGE_SIZE      4096u
 #define X64_DIRECT_BASE    0xffff800000000000ul
 
