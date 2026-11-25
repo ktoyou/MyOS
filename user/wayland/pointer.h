@@ -9,6 +9,7 @@ struct wayland_pointer;
 
 struct wayland_pointer_ops {
     struct wl_resource *(*pick)(void *data, int x, int y);
+    void (*coordinates)(struct wl_resource *surface, int x, int y, wl_fixed_t *sx, wl_fixed_t *sy);
     bool (*assign_cursor)(void *data, struct wl_resource *surface);
     void (*paint)(void *data, int x, int y, struct wl_resource *cursor,
                   int32_t hotspot_x, int32_t hotspot_y, bool visible);

@@ -25,6 +25,7 @@ struct compositor {
     struct fb_var_screeninfo mode;
     struct fb_fix_screeninfo layout;
     struct surface *visible;
+    struct wl_list popups, shell_surfaces;
     struct wl_resource *cursor_surface;
     struct wayland_seat *seat;
     uint32_t *row;
@@ -45,23 +46,49 @@ struct region_rect {
     bool add;
 };
 
+struct rectangle {
+    int32_t x, y, width, height;
+};
+
+struct positioner {
+    struct rectangle anchor_rect;
+    int32_t width, height, offset_x, offset_y;
+    uint32_t anchor, gravity, adjustment;
+};
+
+struct image {
+    uint32_t *pixels;
+    int width, height;
+    bool opaque;
+};
+
 enum surface_role { SURFACE_NONE, SURFACE_XDG, SURFACE_CURSOR };
+enum xdg_role { XDG_NONE, XDG_TOPLEVEL, XDG_POPUP };
 
 struct surface {
     struct compositor *server;
     struct wl_resource *resource;
     struct wl_resource *shell;
     struct wl_resource *toplevel;
+    struct wl_resource *popup;
+    struct wl_resource *wm_base;
+    struct wl_listener wm_base_destroy;
+    struct wl_list popup_link, shell_link;
+    struct surface *parent;
+    struct positioner positioner;
+    struct rectangle placement, geometry, pending_geometry;
+    struct image image, cursor_image;
+    int64_t x, y;
+    bool geometry_pending, dismissed;
     struct wl_resource *buffer;
     struct wl_listener buffer_destroy;
     struct wl_list frames;
     struct wl_array input_region, pending_input_region;
-    uint32_t *cursor_pixels;
-    int cursor_width, cursor_height;
     int32_t attach_x, attach_y;
     int64_t cursor_x, cursor_y;
     uint32_t serial;
     enum surface_role role;
+    enum xdg_role xdg_role;
     bool configured, acknowledged, detach, mapped, input_pending, input_set, pending_input_set;
     int scale, transform;
 };
@@ -93,26 +120,43 @@ static void restore_cursor(struct compositor *server) {
     server->cursor_rows = 0;
 }
 
+static bool redraw(struct compositor *server);
+
+static void clear_image(struct image *image) {
+    free(image->pixels);
+    *image = (struct image){0};
+}
+
+static bool popup_descends_from(const struct surface *popup, const struct surface *ancestor) {
+    for (const struct surface *parent = popup->parent; parent; parent = parent->parent)
+        if (parent == ancestor) return true;
+    return false;
+}
+
 static void hide_surface(struct surface *surface) {
     struct compositor *server = surface->server;
-    surface->mapped = false;
-    bool visible = server->visible == surface;
-    if (visible) server->visible = NULL;
-    wayland_seat_pointer_detach(server->seat, surface->resource);
-    if (visible) {
-        wayland_seat_keyboard_focus(server->seat, NULL);
-        restore_cursor(server);
-        memset(server->row, 0, (size_t)server->drawn_width * sizeof(*server->row));
-        for (int y = 0; y < server->drawn_height; ++y) {
-            if (!write_pixels(server, 0, y, server->drawn_width, server->row)) {
-                perror("Clear framebuffer");
-                break;
-            }
+    struct surface *child;
+    bool repaint = surface->mapped && (surface->popup || server->visible == surface);
+    wl_list_for_each_reverse(child, &server->popups, popup_link) {
+        if (!child->dismissed && popup_descends_from(child, surface)) {
+            xdg_popup_send_popup_done(child->popup);
+            child->dismissed = true;
+            child->mapped = false;
+            clear_image(&child->image);
+            wayland_seat_pointer_detach(server->seat, child->resource);
         }
-        server->drawn_width = 0;
-        server->drawn_height = 0;
     }
-    wayland_seat_pointer_update(server->seat);
+    surface->mapped = false;
+    clear_image(&surface->image);
+    wayland_seat_pointer_detach(server->seat, surface->resource);
+    if (server->visible == surface) {
+        server->visible = NULL;
+        wayland_seat_keyboard_focus(server->seat, NULL);
+    }
+    if (repaint) {
+        if (!redraw(server)) perror("Redraw framebuffer");
+        wayland_seat_pointer_update(server->seat);
+    }
 }
 
 static void destroy_request(struct wl_client *client, struct wl_resource *resource) {
@@ -145,10 +189,33 @@ static void toplevel_destroyed(struct wl_resource *resource) {
     surface->acknowledged = false;
 }
 
+static void popup_destroyed(struct wl_resource *resource) {
+    struct surface *surface = wl_resource_get_user_data(resource);
+    hide_surface(surface);
+    wl_list_remove(&surface->popup_link);
+    surface->parent = NULL;
+    surface->popup = NULL;
+    surface->configured = false;
+    surface->acknowledged = false;
+}
+
+static void wm_base_destroyed(struct wl_listener *listener, void *data) {
+    (void)data;
+    struct surface *surface = wl_container_of(listener, surface, wm_base_destroy);
+    wl_list_remove(&listener->link);
+    surface->wm_base = NULL;
+}
+
 static void shell_surface_destroyed(struct wl_resource *resource) {
     struct surface *surface = wl_resource_get_user_data(resource);
     if (surface->toplevel) wl_resource_destroy(surface->toplevel);
+    if (surface->popup) wl_resource_destroy(surface->popup);
+    if (surface->wm_base) wl_list_remove(&surface->wm_base_destroy.link);
+    wl_list_remove(&surface->shell_link);
+    surface->wm_base = NULL;
     surface->shell = NULL;
+    surface->geometry = (struct rectangle){0};
+    surface->geometry_pending = false;
 }
 
 static void surface_destroyed(struct wl_resource *resource) {
@@ -156,13 +223,17 @@ static void surface_destroyed(struct wl_resource *resource) {
     struct frame *frame, *next;
     if (surface->server->cursor_surface == resource) surface->server->cursor_surface = NULL;
     if (surface->shell) wl_resource_destroy(surface->shell);
+    struct surface *child;
+    wl_list_for_each(child, &surface->server->popups, popup_link)
+        if (child->parent == surface) child->parent = NULL;
     clear_pending_buffer(surface);
     wl_list_for_each_safe(frame, next, &surface->frames, link) {
         wl_resource_destroy(frame->resource);
     }
     wl_array_release(&surface->input_region);
     wl_array_release(&surface->pending_input_region);
-    free(surface->cursor_pixels);
+    clear_image(&surface->cursor_image);
+    clear_image(&surface->image);
     free(surface);
 }
 
@@ -219,19 +290,46 @@ static void set_input_region(struct wl_client *client, struct wl_resource *resou
     surface->input_pending = true;
 }
 
-static struct wl_resource *pick_surface(void *data, int x, int y) {
-    struct compositor *server = data;
-    struct surface *surface = server->visible;
-    if (!surface || x < 0 || y < 0 || x >= server->drawn_width || y >= server->drawn_height) return NULL;
-    if (!surface->input_set) return surface->resource;
+static bool shown(const struct surface *surface) {
+    const struct surface *root = surface;
+    while (root->mapped && root->parent) root = root->parent;
+    return root == surface->server->visible && surface->mapped;
+}
+
+static bool accepts_pointer(const struct surface *surface, int x, int y) {
+    int64_t local_x = x - surface->x, local_y = y - surface->y;
+    if (local_x < 0 || local_y < 0 || local_x >= surface->image.width || local_y >= surface->image.height)
+        return false;
+    if (!surface->input_set) return true;
 
     bool inside = false;
     const struct region_rect *rect;
     wl_array_for_each(rect, &surface->input_region) {
-        if (x >= rect->x && y >= rect->y && (int64_t)x - rect->x < rect->width &&
-            (int64_t)y - rect->y < rect->height) inside = rect->add;
+        if (local_x >= rect->x && local_y >= rect->y && local_x - rect->x < rect->width &&
+            local_y - rect->y < rect->height) inside = rect->add;
     }
-    return inside ? surface->resource : NULL;
+    return inside;
+}
+
+static struct wl_resource *pick_surface(void *data, int x, int y) {
+    struct compositor *server = data;
+    struct surface *surface;
+    wl_list_for_each_reverse(surface, &server->popups, popup_link)
+        if (shown(surface) && accepts_pointer(surface, x, y)) return surface->resource;
+    surface = server->visible;
+    return surface && accepts_pointer(surface, x, y) ? surface->resource : NULL;
+}
+
+static wl_fixed_t local_coordinate(int64_t value) {
+    if (value < INT32_MIN / 256) return INT32_MIN;
+    if (value > INT32_MAX / 256) return INT32_MAX;
+    return wl_fixed_from_int((int)value);
+}
+
+static void pointer_coordinates(struct wl_resource *resource, int x, int y, wl_fixed_t *sx, wl_fixed_t *sy) {
+    struct surface *surface = wl_resource_get_user_data(resource);
+    *sx = local_coordinate(x - surface->x);
+    *sy = local_coordinate(y - surface->y);
 }
 
 static bool assign_cursor(void *data, struct wl_resource *resource) {
@@ -302,8 +400,8 @@ static void paint_cursor(void *data, int x, int y, struct wl_resource *resource,
     if (!visible) return;
 
     struct surface *surface = resource ? wl_resource_get_user_data(resource) : NULL;
-    int width = surface ? surface->cursor_width : (int)sizeof(arrow[0]) - 1;
-    int height = surface ? surface->cursor_height : (int)(sizeof(arrow) / sizeof(arrow[0]));
+    int width = surface ? surface->cursor_image.width : (int)sizeof(arrow[0]) - 1;
+    int height = surface ? surface->cursor_image.height : (int)(sizeof(arrow) / sizeof(arrow[0]));
     if (!width || !height) return;
 
     int64_t left = (int64_t)x - hotspot_x;
@@ -340,7 +438,7 @@ static void paint_cursor(void *data, int x, int y, struct wl_resource *resource,
         }
         int image_y = (int)(row - top);
         for (int col = 0; col < columns; ++col) {
-            uint32_t source = surface ? surface->cursor_pixels[(size_t)image_y * width + image_x + col]
+            uint32_t source = surface ? surface->cursor_image.pixels[(size_t)image_y * width + image_x + col]
                                       : arrow_pixel(image_x + col, image_y);
             server->row[col] = blend_pixel(server, source, background[col]);
         }
@@ -354,6 +452,7 @@ static void paint_cursor(void *data, int x, int y, struct wl_resource *resource,
 
 static const struct wayland_pointer_ops pointer_ops = {
     .pick = pick_surface,
+    .coordinates = pointer_coordinates,
     .assign_cursor = assign_cursor,
     .paint = paint_cursor,
 };
@@ -435,69 +534,99 @@ static uint32_t sample_buffer(const struct buffer_view *view, const unsigned cha
     return view->opaque ? pixel | 0xff000000u : pixel;
 }
 
-static void clear_cursor_image(struct surface *surface) {
-    free(surface->cursor_pixels);
-    surface->cursor_pixels = NULL;
-    surface->cursor_width = 0;
-    surface->cursor_height = 0;
-}
-
-static bool capture_cursor(struct surface *surface, struct wl_shm_buffer *buffer, const struct buffer_view *view) {
-    int width = view->output_width, height = view->output_height;
-    uint32_t *image = malloc((size_t)width * height * sizeof(*image));
-    if (!image) return false;
-
+static bool capture_image(struct image *image, struct wl_shm_buffer *buffer, const struct buffer_view *view,
+                          int width, int height) {
+    if ((size_t)width > SIZE_MAX / sizeof(uint32_t) / (size_t)height) return false;
+    uint32_t *pixels = image->pixels;
+    if (image->width != width || image->height != height) {
+        pixels = realloc(pixels, (size_t)width * height * sizeof(*pixels));
+        if (!pixels) return false;
+    }
     wl_shm_buffer_begin_access(buffer);
-    const unsigned char *pixels = wl_shm_buffer_get_data(buffer);
+    const unsigned char *data = wl_shm_buffer_get_data(buffer);
     for (int y = 0; y < height; ++y)
         for (int x = 0; x < width; ++x)
-            image[(size_t)y * width + x] = sample_buffer(view, pixels, x, y);
+            pixels[(size_t)y * width + x] = sample_buffer(view, data, x, y);
     wl_shm_buffer_end_access(buffer);
-    clear_cursor_image(surface);
-    surface->cursor_pixels = image;
-    surface->cursor_width = width;
-    surface->cursor_height = height;
+    *image = (struct image){ pixels, width, height, view->opaque };
     return true;
 }
 
-static bool present(struct surface *surface, struct wl_shm_buffer *buffer, const struct buffer_view *view) {
-    struct compositor *server = surface->server;
-    int output_width = view->output_width, output_height = view->output_height;
-    if (output_width > (int)server->mode.xres) output_width = (int)server->mode.xres;
-    if (output_height > (int)server->mode.yres) output_height = (int)server->mode.yres;
-    int draw_width = output_width > server->drawn_width ? output_width : server->drawn_width;
-    int draw_height = output_height > server->drawn_height ? output_height : server->drawn_height;
-
-    restore_cursor(server);
-    wl_shm_buffer_begin_access(buffer);
-    const unsigned char *pixels = wl_shm_buffer_get_data(buffer);
-    bool success = true;
-    for (int y = 0; y < draw_height; ++y) {
-        int content_width = y < output_height ? output_width : 0;
-        for (int x = 0; x < content_width; ++x)
-            server->row[x] = rgb_pixel(server, sample_buffer(view, pixels, x, y));
-        memset(server->row + content_width, 0, (size_t)(draw_width - content_width) * sizeof(*server->row));
-        if (!write_pixels(server, 0, y, draw_width, server->row)) {
-            success = false;
-            break;
-        }
-    }
-    wl_shm_buffer_end_access(buffer);
-    if (success) {
-        server->drawn_width = output_width;
-        server->drawn_height = output_height;
-    }
-    return success;
+static void add_extent(const struct surface *surface, int screen_width, int screen_height,
+                       int *width, int *height) {
+    int64_t right = surface->x + surface->image.width;
+    int64_t bottom = surface->y + surface->image.height;
+    if (right > *width) *width = right > screen_width ? screen_width : (int)right;
+    if (bottom > *height) *height = bottom > screen_height ? screen_height : (int)bottom;
 }
 
-static void configure(struct surface *surface) {
+static void paint_surface_row(struct compositor *server, const struct surface *surface, int y, int width) {
+    int64_t row = y - surface->y;
+    if (row < 0 || row >= surface->image.height) return;
+    int64_t left = surface->x > 0 ? surface->x : 0;
+    int64_t right = surface->x + surface->image.width;
+    if (right > width) right = width;
+    if (left >= right) return;
+    const uint32_t *pixels = surface->image.pixels + (size_t)row * surface->image.width;
+    if (surface->image.opaque) {
+        for (int x = (int)left; x < right; ++x)
+            server->row[x] = rgb_pixel(server, pixels[x - surface->x]);
+    } else {
+        for (int x = (int)left; x < right; ++x)
+            server->row[x] = blend_pixel(server, pixels[x - surface->x], server->row[x]);
+    }
+}
+
+static bool redraw(struct compositor *server) {
+    int width = 0, height = 0;
+    struct surface *popup;
+    if (server->visible)
+        add_extent(server->visible, server->mode.xres, server->mode.yres, &width, &height);
+    wl_list_for_each(popup, &server->popups, popup_link) {
+        if (shown(popup))
+            add_extent(popup, server->mode.xres, server->mode.yres, &width, &height);
+    }
+    int draw_width = width > server->drawn_width ? width : server->drawn_width;
+    int draw_height = height > server->drawn_height ? height : server->drawn_height;
+
+    restore_cursor(server);
+    for (int y = 0; y < draw_height; ++y) {
+        memset(server->row, 0, (size_t)draw_width * sizeof(*server->row));
+        if (server->visible) paint_surface_row(server, server->visible, y, draw_width);
+        wl_list_for_each(popup, &server->popups, popup_link)
+            if (shown(popup)) paint_surface_row(server, popup, y, draw_width);
+        if (!write_pixels(server, 0, y, draw_width, server->row)) return false;
+    }
+    server->drawn_width = width;
+    server->drawn_height = height;
+    return true;
+}
+
+static void update_popup_origins(struct compositor *server) {
+    struct surface *popup;
+    wl_list_for_each(popup, &server->popups, popup_link) {
+        if (!popup->parent) continue;
+        popup->x = popup->parent->x + popup->parent->geometry.x + popup->placement.x - popup->geometry.x;
+        popup->y = popup->parent->y + popup->parent->geometry.y + popup->placement.y - popup->geometry.y;
+    }
+}
+
+static bool configure_popup(struct surface *surface);
+static bool topmost_popup(const struct surface *surface);
+
+static bool configure(struct surface *surface) {
     struct compositor *server = surface->server;
     uint32_t activated = XDG_TOPLEVEL_STATE_ACTIVATED;
     struct wl_array states = { .size = sizeof(activated), .data = &activated };
     surface->serial = wl_display_next_serial(server->display);
     surface->configured = true;
-    xdg_toplevel_send_configure(surface->toplevel, server->mode.xres, server->mode.yres, &states);
+    if (surface->popup) {
+        if (!configure_popup(surface)) return false;
+    } else {
+        xdg_toplevel_send_configure(surface->toplevel, server->mode.xres, server->mode.yres, &states);
+    }
     xdg_surface_send_configure(surface->shell, surface->serial);
+    return true;
 }
 
 static void surface_commit(struct wl_client *client, struct wl_resource *resource) {
@@ -505,23 +634,41 @@ static void surface_commit(struct wl_client *client, struct wl_resource *resourc
     struct compositor *server = surface->server;
     struct wl_resource *buffer = surface->buffer;
     clear_pending_buffer(surface);
-    if (surface->shell && !surface->toplevel) {
+    if (surface->shell && !surface->toplevel && !surface->popup) {
         wl_resource_post_error(surface->shell, XDG_SURFACE_ERROR_NOT_CONSTRUCTED, "Missing surface role");
         return;
     }
-    if (surface->toplevel && !surface->configured && !buffer) configure(surface);
+    if (surface->dismissed) {
+        if (buffer) wl_buffer_send_release(buffer);
+        surface->detach = false;
+        return;
+    }
+    if ((surface->toplevel || surface->popup) && !surface->configured && !buffer && !configure(surface)) return;
     if (buffer && surface->shell && !surface->acknowledged) {
         wl_resource_post_error(surface->shell, XDG_SURFACE_ERROR_UNCONFIGURED_BUFFER, "Buffer before configure acknowledgement");
         return;
     }
-    bool repaint = false;
+    if (buffer && surface->popup && (!surface->parent || !surface->parent->mapped)) {
+        wl_resource_post_error(surface->wm_base, XDG_WM_BASE_ERROR_INVALID_POPUP_PARENT, "Map popup parent first");
+        return;
+    }
+    if (buffer && surface->popup && !surface->mapped && !topmost_popup(surface)) {
+        wl_resource_post_error(surface->wm_base, XDG_WM_BASE_ERROR_NOT_THE_TOPMOST_POPUP, "Map topmost popup first");
+        return;
+    }
+    bool repaint = false, recomposite = false;
+    if (surface->geometry_pending) {
+        surface->geometry = surface->pending_geometry;
+        surface->geometry_pending = false;
+        recomposite = shown(surface);
+    }
     if (surface->input_pending) {
         wl_array_release(&surface->input_region);
         surface->input_region = surface->pending_input_region;
         wl_array_init(&surface->pending_input_region);
         surface->input_set = surface->pending_input_set;
         surface->input_pending = false;
-        repaint = server->visible == surface;
+        repaint = shown(surface);
     }
     if (buffer) {
         struct wl_shm_buffer *shm = wl_shm_buffer_get(buffer);
@@ -530,18 +677,29 @@ static void surface_commit(struct wl_client *client, struct wl_resource *resourc
             wl_client_post_implementation_error(client, "Unsupported shared memory buffer");
             return;
         }
-        if (surface->toplevel) {
-            if (!present(surface, shm, &view)) {
-                wl_client_post_implementation_error(client, "Could not display shared memory buffer");
+        if (surface->toplevel || surface->popup) {
+            int width = view.output_width, height = view.output_height;
+            if (surface->toplevel) {
+                if (width > (int)server->mode.xres) width = (int)server->mode.xres;
+                if (height > (int)server->mode.yres) height = (int)server->mode.yres;
+            } else if (width > 2LL * server->mode.xres || height > 2LL * server->mode.yres) {
+                /* Снимок хранится после release. Предел оставляет место для теней и обрезки у края. */
+                wl_client_post_implementation_error(client, "Popup buffer exceeds output bounds");
                 return;
             }
-            server->visible = surface;
+            if (!capture_image(&surface->image, shm, &view, width, height)) {
+                wl_client_post_no_memory(client);
+                return;
+            }
+            if (surface->toplevel) {
+                server->visible = surface;
+                wayland_seat_keyboard_focus(server->seat, resource);
+            }
             surface->mapped = true;
-            wayland_seat_keyboard_focus(server->seat, resource);
-            repaint = true;
+            recomposite = shown(surface);
         } else if (surface->role != SURFACE_XDG) {
             /* Изображение может быть готово к моменту назначения роли курсора. */
-            if (!capture_cursor(surface, shm, &view)) {
+            if (!capture_image(&surface->cursor_image, shm, &view, view.output_width, view.output_height)) {
                 wl_client_post_no_memory(client);
                 return;
             }
@@ -553,8 +711,9 @@ static void surface_commit(struct wl_client *client, struct wl_resource *resourc
             surface->configured = false;
             surface->acknowledged = false;
             repaint = false;
+            recomposite = false;
         }
-        clear_cursor_image(surface);
+        clear_image(&surface->cursor_image);
     }
     if (surface->role == SURFACE_CURSOR && (buffer || surface->detach)) {
         /* В wl_surface версии 4 смещение задаётся аргументами attach. */
@@ -565,9 +724,16 @@ static void surface_commit(struct wl_client *client, struct wl_resource *resourc
         repaint |= server->cursor_surface == resource;
     }
     surface->detach = false;
-    if (repaint) wayland_seat_pointer_update(server->seat);
+    if (recomposite) {
+        update_popup_origins(server);
+        if (!redraw(server)) {
+            wl_client_post_implementation_error(client, "Could not redraw shared memory buffers");
+            return;
+        }
+    }
+    if (repaint || recomposite) wayland_seat_pointer_update(server->seat);
 
-    if (server->visible == surface || surface->role == SURFACE_CURSOR) {
+    if (shown(surface) || surface->role == SURFACE_CURSOR) {
         struct timespec time = {0};
         clock_gettime(CLOCK_MONOTONIC, &time);
         uint32_t ms = (uint32_t)time.tv_sec * 1000 + (uint32_t)(time.tv_nsec / 1000000);
@@ -748,8 +914,8 @@ static const struct xdg_toplevel_interface toplevel_requests = {
 
 static void destroy_shell_surface(struct wl_client *client, struct wl_resource *resource) {
     struct surface *surface = wl_resource_get_user_data(resource);
-    if (surface->toplevel) {
-        wl_resource_post_error(resource, XDG_SURFACE_ERROR_DEFUNCT_ROLE_OBJECT, "Destroy toplevel first");
+    if (surface->toplevel || surface->popup) {
+        wl_resource_post_error(resource, XDG_SURFACE_ERROR_DEFUNCT_ROLE_OBJECT, "Destroy role object first");
         return;
     }
     destroy_request(client, resource);
@@ -757,8 +923,12 @@ static void destroy_shell_surface(struct wl_client *client, struct wl_resource *
 
 static void get_toplevel(struct wl_client *client, struct wl_resource *resource, uint32_t id) {
     struct surface *surface = wl_resource_get_user_data(resource);
-    if (surface->toplevel) {
+    if (surface->toplevel || surface->popup) {
         wl_resource_post_error(resource, XDG_SURFACE_ERROR_ALREADY_CONSTRUCTED, "Surface already has a role");
+        return;
+    }
+    if (surface->xdg_role == XDG_POPUP) {
+        wl_resource_post_error(surface->wm_base, XDG_WM_BASE_ERROR_ROLE, "Popup cannot become a toplevel");
         return;
     }
     surface->toplevel = wl_resource_create(client, &xdg_toplevel_interface, wl_resource_get_version(resource), id);
@@ -766,25 +936,232 @@ static void get_toplevel(struct wl_client *client, struct wl_resource *resource,
         wl_client_post_no_memory(client);
         return;
     }
+    surface->xdg_role = XDG_TOPLEVEL;
     wl_resource_set_implementation(surface->toplevel, &toplevel_requests, surface, toplevel_destroyed);
 }
 
+static void positioner_size(struct wl_client *client, struct wl_resource *resource, int32_t width, int32_t height) {
+    (void)client;
+    if (width <= 0 || height <= 0) {
+        wl_resource_post_error(resource, XDG_POSITIONER_ERROR_INVALID_INPUT, "Empty popup size");
+        return;
+    }
+    struct positioner *positioner = wl_resource_get_user_data(resource);
+    positioner->width = width;
+    positioner->height = height;
+}
+
+static void positioner_anchor_rect(struct wl_client *client, struct wl_resource *resource,
+                                   int32_t x, int32_t y, int32_t width, int32_t height) {
+    (void)client;
+    if (width < 0 || height < 0) {
+        wl_resource_post_error(resource, XDG_POSITIONER_ERROR_INVALID_INPUT, "Negative anchor rectangle size");
+        return;
+    }
+    struct positioner *positioner = wl_resource_get_user_data(resource);
+    positioner->anchor_rect = (struct rectangle){ x, y, width, height };
+}
+
+static void positioner_anchor(struct wl_client *client, struct wl_resource *resource, uint32_t anchor) {
+    (void)client;
+    if (anchor > XDG_POSITIONER_ANCHOR_BOTTOM_RIGHT) {
+        wl_resource_post_error(resource, XDG_POSITIONER_ERROR_INVALID_INPUT, "Unknown popup anchor");
+        return;
+    }
+    struct positioner *positioner = wl_resource_get_user_data(resource);
+    positioner->anchor = anchor;
+}
+
+static void positioner_gravity(struct wl_client *client, struct wl_resource *resource, uint32_t gravity) {
+    (void)client;
+    if (gravity > XDG_POSITIONER_GRAVITY_BOTTOM_RIGHT) {
+        wl_resource_post_error(resource, XDG_POSITIONER_ERROR_INVALID_INPUT, "Unknown popup gravity");
+        return;
+    }
+    struct positioner *positioner = wl_resource_get_user_data(resource);
+    positioner->gravity = gravity;
+}
+
+static void positioner_adjustment(struct wl_client *client, struct wl_resource *resource, uint32_t adjustment) {
+    (void)client;
+    const uint32_t known = XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_X |
+                           XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_Y |
+                           XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_X |
+                           XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_Y |
+                           XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_RESIZE_X |
+                           XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_RESIZE_Y;
+    if (adjustment & ~known) {
+        wl_resource_post_error(resource, XDG_POSITIONER_ERROR_INVALID_INPUT, "Unknown popup adjustment");
+        return;
+    }
+    struct positioner *positioner = wl_resource_get_user_data(resource);
+    positioner->adjustment = adjustment;
+}
+
+static void positioner_offset(struct wl_client *client, struct wl_resource *resource, int32_t x, int32_t y) {
+    (void)client;
+    struct positioner *positioner = wl_resource_get_user_data(resource);
+    positioner->offset_x = x;
+    positioner->offset_y = y;
+}
+
+static const struct xdg_positioner_interface positioner_requests = {
+    .destroy = destroy_request,
+    .set_size = positioner_size,
+    .set_anchor_rect = positioner_anchor_rect,
+    .set_anchor = positioner_anchor,
+    .set_gravity = positioner_gravity,
+    .set_constraint_adjustment = positioner_adjustment,
+    .set_offset = positioner_offset,
+};
+
+static void destroy_positioner(struct wl_resource *resource) {
+    free(wl_resource_get_user_data(resource));
+}
+
+static int64_t place_axis(int64_t start, int anchor_size, int popup_size, int anchor, int gravity) {
+    return start + (int64_t)anchor_size * (anchor + 1) / 2 - (int64_t)popup_size * (1 - gravity) / 2;
+}
+
+static int64_t constrain_axis(int64_t start, int anchor_size, int32_t *size, int anchor, int gravity,
+                              int limit, uint32_t rules, bool vertical) {
+    uint32_t flip = XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_X << vertical;
+    uint32_t slide = XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_X << vertical;
+    uint32_t resize = XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_RESIZE_X << vertical;
+    int64_t pos = place_axis(start, anchor_size, *size, anchor, gravity);
+    if (pos >= 0 && pos + *size <= limit) return pos;
+    if (rules & flip) {
+        int64_t flipped = place_axis(start, anchor_size, *size, -anchor, -gravity);
+        if (flipped >= 0 && flipped + *size <= limit) return flipped;
+    }
+    if (rules & slide) {
+        int64_t last_start = (int64_t)limit - *size;
+        if (pos > last_start) pos = last_start;
+        if (pos < 0) pos = 0;
+    }
+    if (rules & resize) {
+        int64_t first = pos < 0 ? 0 : pos;
+        int64_t last = pos + *size > limit ? limit : pos + *size;
+        if (last > first) {
+            *size = (int32_t)(last - first);
+            pos = first;
+        }
+    }
+    return pos;
+}
+
+static bool configure_popup(struct surface *surface) {
+    static const struct { int x, y; } directions[] = {
+        {0, 0}, {0, -1}, {0, 1}, {-1, 0}, {1, 0}, {-1, -1}, {-1, 1}, {1, -1}, {1, 1},
+    };
+    const struct positioner *p = &surface->positioner;
+    const struct surface *parent = surface->parent;
+    int64_t parent_x = parent->x + parent->geometry.x;
+    int64_t parent_y = parent->y + parent->geometry.y;
+    int32_t width = p->width, height = p->height;
+    int64_t x = constrain_axis(parent_x + p->anchor_rect.x + p->offset_x, p->anchor_rect.width, &width,
+                               directions[p->anchor].x, directions[p->gravity].x,
+                               surface->server->mode.xres, p->adjustment, false) - parent_x;
+    int64_t y = constrain_axis(parent_y + p->anchor_rect.y + p->offset_y, p->anchor_rect.height, &height,
+                               directions[p->anchor].y, directions[p->gravity].y,
+                               surface->server->mode.yres, p->adjustment, true) - parent_y;
+    if (x < INT32_MIN || x > INT32_MAX || y < INT32_MIN || y > INT32_MAX) {
+        wl_resource_post_error(surface->wm_base, XDG_WM_BASE_ERROR_INVALID_POSITIONER, "Popup position out of range");
+        return false;
+    }
+    surface->placement = (struct rectangle){ (int32_t)x, (int32_t)y, width, height };
+    xdg_popup_send_configure(surface->popup, (int32_t)x, (int32_t)y, width, height);
+    return true;
+}
+
+static void popup_grab(struct wl_client *client, struct wl_resource *resource,
+                       struct wl_resource *seat, uint32_t serial) {
+    (void)client;
+    (void)seat;
+    (void)serial;
+    struct surface *surface = wl_resource_get_user_data(resource);
+    if (surface->mapped) {
+        wl_resource_post_error(resource, XDG_POPUP_ERROR_INVALID_GRAB, "Popup already mapped");
+        return;
+    }
+    /* Р—Р°С…РІР°С‚ С‚СЂРµР±СѓРµС‚ РїСЂРѕРІРµСЂРєРё serial СЃРѕР±С‹С‚РёСЏ РІРІРѕРґР° РЅР° СЃС‚РѕСЂРѕРЅРµ seat. */
+    if (!surface->dismissed) xdg_popup_send_popup_done(resource);
+    surface->dismissed = true;
+}
+
+static const struct surface *popup_root(const struct surface *surface) {
+    while (surface->parent) surface = surface->parent;
+    return surface;
+}
+
+static bool topmost_popup(const struct surface *surface) {
+    const struct surface *root = popup_root(surface);
+    const struct surface *above;
+    wl_list_for_each_reverse(above, &surface->server->popups, popup_link) {
+        if (above == surface) break;
+        if (!above->dismissed && popup_root(above) == root) return false;
+    }
+    return true;
+}
+
+static void destroy_popup(struct wl_client *client, struct wl_resource *resource) {
+    struct surface *surface = wl_resource_get_user_data(resource);
+    if (!surface->dismissed && !topmost_popup(surface)) {
+        wl_resource_post_error(surface->wm_base, XDG_WM_BASE_ERROR_NOT_THE_TOPMOST_POPUP, "Destroy topmost popup first");
+        return;
+    }
+    destroy_request(client, resource);
+}
+
+static const struct xdg_popup_interface popup_requests = {
+    .destroy = destroy_popup,
+    .grab = popup_grab,
+};
+
 static void get_popup(struct wl_client *client, struct wl_resource *resource, uint32_t id,
-                      struct wl_resource *parent, struct wl_resource *positioner) {
-    (void)resource;
-    (void)id;
-    (void)parent;
-    (void)positioner;
-    wl_client_post_implementation_error(client, "Popups are unavailable");
+                      struct wl_resource *parent_resource, struct wl_resource *positioner_resource) {
+    struct surface *surface = wl_resource_get_user_data(resource);
+    struct surface *parent = parent_resource ? wl_resource_get_user_data(parent_resource) : NULL;
+    const struct positioner *positioner = wl_resource_get_user_data(positioner_resource);
+    if (surface->toplevel || surface->popup) {
+        wl_resource_post_error(resource, XDG_SURFACE_ERROR_ALREADY_CONSTRUCTED, "Surface already has a role");
+        return;
+    }
+    if (!parent || parent == surface || (!parent->toplevel && !parent->popup) || parent->dismissed) {
+        wl_resource_post_error(surface->wm_base, XDG_WM_BASE_ERROR_INVALID_POPUP_PARENT, "Invalid popup parent");
+        return;
+    }
+    if (!positioner->width || !positioner->anchor_rect.width || !positioner->anchor_rect.height) {
+        wl_resource_post_error(surface->wm_base, XDG_WM_BASE_ERROR_INVALID_POSITIONER, "Incomplete positioner");
+        return;
+    }
+    if (surface->xdg_role == XDG_TOPLEVEL) {
+        wl_resource_post_error(surface->wm_base, XDG_WM_BASE_ERROR_ROLE, "Toplevel cannot become a popup");
+        return;
+    }
+    surface->popup = wl_resource_create(client, &xdg_popup_interface, 1, id);
+    if (!surface->popup) {
+        wl_client_post_no_memory(client);
+        return;
+    }
+    surface->xdg_role = XDG_POPUP;
+    surface->dismissed = false;
+    surface->parent = parent;
+    surface->positioner = *positioner;
+    wl_list_insert(surface->server->popups.prev, &surface->popup_link);
+    wl_resource_set_implementation(surface->popup, &popup_requests, surface, popup_destroyed);
 }
 
 static void window_geometry(struct wl_client *client, struct wl_resource *resource,
                             int32_t x, int32_t y, int32_t width, int32_t height) {
     (void)client;
-    (void)x;
-    (void)y;
-    if (width <= 0 || height <= 0)
+    if (width <= 0 || height <= 0) {
         wl_resource_post_error(resource, XDG_SURFACE_ERROR_INVALID_SIZE, "Empty window geometry");
+        return;
+    }
+    struct surface *surface = wl_resource_get_user_data(resource);
+    surface->pending_geometry = (struct rectangle){ x, y, width, height };
+    surface->geometry_pending = true;
 }
 
 static void ack_configure(struct wl_client *client, struct wl_resource *resource, uint32_t serial) {
@@ -818,14 +1195,27 @@ static void get_shell_surface(struct wl_client *client, struct wl_resource *reso
         return;
     }
     surface->role = SURFACE_XDG;
-    clear_cursor_image(surface);
+    surface->wm_base = resource;
+    surface->wm_base_destroy.notify = wm_base_destroyed;
+    wl_resource_add_destroy_listener(resource, &surface->wm_base_destroy);
+    wl_list_insert(&surface->server->shell_surfaces, &surface->shell_link);
+    clear_image(&surface->cursor_image);
     wl_resource_set_implementation(surface->shell, &shell_surface_requests, surface, shell_surface_destroyed);
 }
 
 static void create_positioner(struct wl_client *client, struct wl_resource *resource, uint32_t id) {
-    (void)resource;
-    (void)id;
-    wl_client_post_implementation_error(client, "Popup positioners are unavailable");
+    struct positioner *positioner = calloc(1, sizeof(*positioner));
+    if (!positioner) {
+        wl_client_post_no_memory(client);
+        return;
+    }
+    struct wl_resource *child = wl_resource_create(client, &xdg_positioner_interface, wl_resource_get_version(resource), id);
+    if (!child) {
+        free(positioner);
+        wl_client_post_no_memory(client);
+        return;
+    }
+    wl_resource_set_implementation(child, &positioner_requests, positioner, destroy_positioner);
 }
 
 static void pong(struct wl_client *client, struct wl_resource *resource, uint32_t serial) {
@@ -834,8 +1224,20 @@ static void pong(struct wl_client *client, struct wl_resource *resource, uint32_
     (void)serial;
 }
 
+static void destroy_shell(struct wl_client *client, struct wl_resource *resource) {
+    struct compositor *server = wl_resource_get_user_data(resource);
+    struct surface *surface;
+    wl_list_for_each(surface, &server->shell_surfaces, shell_link) {
+        if (surface->wm_base == resource) {
+            wl_resource_post_error(resource, XDG_WM_BASE_ERROR_DEFUNCT_SURFACES, "Destroy xdg surfaces first");
+            return;
+        }
+    }
+    destroy_request(client, resource);
+}
+
 static const struct xdg_wm_base_interface shell_requests = {
-    .destroy = destroy_request,
+    .destroy = destroy_shell,
     .create_positioner = create_positioner,
     .get_xdg_surface = get_shell_surface,
     .pong = pong,
@@ -879,6 +1281,8 @@ int main(int argc, char **argv) {
         return 2;
     }
     struct compositor server = { .fb = open("/dev/fb0", O_RDWR | O_CLOEXEC) };
+    wl_list_init(&server.popups);
+    wl_list_init(&server.shell_surfaces);
     if (server.fb < 0 || ioctl(server.fb, FBIOGET_VSCREENINFO, &server.mode) ||
         ioctl(server.fb, FBIOGET_FSCREENINFO, &server.layout)) {
         perror("/dev/fb0");

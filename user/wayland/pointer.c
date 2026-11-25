@@ -48,8 +48,9 @@ static void send_frame(struct wl_resource *resource) {
 
 static void send_enter(struct wayland_pointer *pointer, struct pointer_client *client, uint32_t serial) {
     client->enter_serial = serial;
-    wl_pointer_send_enter(client->resource, serial, pointer->focus,
-                          wl_fixed_from_int(pointer->x), wl_fixed_from_int(pointer->y));
+    wl_fixed_t x, y;
+    pointer->ops->coordinates(pointer->focus, pointer->x, pointer->y, &x, &y);
+    wl_pointer_send_enter(client->resource, serial, pointer->focus, x, y);
     send_frame(client->resource);
 }
 
@@ -206,11 +207,13 @@ static void report(struct wayland_pointer *pointer, uint32_t time) {
         uint32_t serials[BUTTON_COUNT];
         for (unsigned i = 0; i < BUTTON_COUNT; ++i)
             if (transitions & (1u << i)) serials[i] = wl_display_next_serial(pointer->display);
+        wl_fixed_t sx, sy;
+        pointer->ops->coordinates(pointer->focus, x, y, &sx, &sy);
         struct pointer_client *client;
         wl_list_for_each(client, &pointer->clients, link) {
             if (!client_owns(client, pointer->focus)) continue;
             struct wl_resource *resource = client->resource;
-            if (motion) wl_pointer_send_motion(resource, time, wl_fixed_from_int(x), wl_fixed_from_int(y));
+            if (motion) wl_pointer_send_motion(resource, time, sx, sy);
             for (unsigned i = 0; i < BUTTON_COUNT; ++i) {
                 unsigned bit = 1u << i;
                 if (transitions & bit)
