@@ -18,8 +18,13 @@ static struct wl_compositor *compositor;
 static struct wl_shm *shm;
 static struct xdg_wm_base *shell;
 static struct wl_output *output;
+static struct wl_seat *seat;
+static struct wl_keyboard *keyboard;
+static struct wl_surface *keyboard_surface;
 static int output_width, output_height, output_scale, width, height;
 static bool output_ready, configured, presented, released, xrgb;
+static bool keymap_ready, focused, repeat_ready, shift_down, shift_active;
+static unsigned key_events;
 
 static void fail(const char *stage) {
     fprintf(stderr, "Wayland smoke: %s\n", stage);
@@ -82,6 +87,86 @@ static const struct wl_output_listener output_events = {
     .geometry = geometry, .mode = mode, .done = output_done, .scale = scale,
 };
 
+static void keyboard_keymap(void *data, struct wl_keyboard *obj, uint32_t format, int32_t fd, uint32_t size) {
+    (void)data;
+    (void)obj;
+    if (format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1 || size < sizeof("xkb_keymap")) fail("keyboard keymap format");
+    const char *map = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (map == MAP_FAILED || map[size - 1] || strncmp(map, "xkb_keymap", 10)) fail("keyboard keymap file");
+    munmap((void *)map, size);
+    close(fd);
+    keymap_ready = true;
+}
+
+static void keyboard_enter(void *data, struct wl_keyboard *obj, uint32_t serial,
+                           struct wl_surface *surface, struct wl_array *keys) {
+    (void)data;
+    (void)obj;
+    (void)serial;
+    if (!keymap_ready || focused || surface != keyboard_surface || keys->size) fail("keyboard enter");
+    focused = true;
+}
+
+static void keyboard_leave(void *data, struct wl_keyboard *obj, uint32_t serial,
+                           struct wl_surface *surface) {
+    (void)data;
+    (void)obj;
+    (void)serial;
+    if (!focused || surface != keyboard_surface) fail("keyboard leave");
+    focused = false;
+}
+
+static void keyboard_key(void *data, struct wl_keyboard *obj, uint32_t serial,
+                         uint32_t time, uint32_t key, uint32_t state) {
+    (void)data;
+    (void)obj;
+    (void)serial;
+    (void)time;
+    static const uint32_t expected_keys[] = {42, 30, 30, 42};
+    static const uint32_t expected_states[] = {1, 1, 0, 0};
+    if (!focused || !repeat_ready || key_events >= 4 || key != expected_keys[key_events] ||
+        state != expected_states[key_events] || (key == 30 && !shift_active)) fail("keyboard key sequence");
+    if (key == 42) shift_down = state != 0;
+    ++key_events;
+}
+
+static void keyboard_modifiers(void *data, struct wl_keyboard *obj, uint32_t serial,
+                               uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t group) {
+    (void)data;
+    (void)obj;
+    (void)serial;
+    if (!focused || (depressed != 0) != shift_down || latched || locked || group) fail("keyboard modifiers");
+    shift_active = depressed != 0;
+}
+
+static void keyboard_repeat(void *data, struct wl_keyboard *obj, int32_t rate, int32_t delay) {
+    (void)data;
+    (void)obj;
+    if (rate < 0 || delay < 0) fail("keyboard repeat");
+    repeat_ready = true;
+}
+
+static const struct wl_keyboard_listener keyboard_events = {
+    .keymap = keyboard_keymap, .enter = keyboard_enter, .leave = keyboard_leave,
+    .key = keyboard_key, .modifiers = keyboard_modifiers, .repeat_info = keyboard_repeat,
+};
+
+static void seat_capabilities(void *data, struct wl_seat *obj, uint32_t capabilities) {
+    (void)data;
+    if ((capabilities & WL_SEAT_CAPABILITY_KEYBOARD) && !keyboard) {
+        keyboard = wl_seat_get_keyboard(obj);
+        wl_keyboard_add_listener(keyboard, &keyboard_events, NULL);
+    }
+}
+
+static void seat_name(void *data, struct wl_seat *obj, const char *name) {
+    (void)data;
+    (void)obj;
+    (void)name;
+}
+
+static const struct wl_seat_listener seat_events = { .capabilities = seat_capabilities, .name = seat_name };
+
 static void global(void *data, struct wl_registry *registry, uint32_t id,
                    const char *interface, uint32_t version) {
     (void)data;
@@ -96,6 +181,9 @@ static void global(void *data, struct wl_registry *registry, uint32_t id,
     } else if (!strcmp(interface, "wl_output") && version >= 2) {
         output = wl_registry_bind(registry, id, &wl_output_interface, 2);
         wl_output_add_listener(output, &output_events, NULL);
+    } else if (!strcmp(interface, "wl_seat") && version >= 7) {
+        seat = wl_registry_bind(registry, id, &wl_seat_interface, 7);
+        wl_seat_add_listener(seat, &seat_events, NULL);
     }
 }
 
@@ -214,6 +302,7 @@ int main(void) {
         fail("bind display globals");
 
     struct wl_surface *surface = wl_compositor_create_surface(compositor);
+    keyboard_surface = surface;
     struct xdg_surface *role = xdg_wm_base_get_xdg_surface(shell, surface);
     xdg_surface_add_listener(role, &surface_events, NULL);
     struct xdg_toplevel *toplevel = xdg_surface_get_toplevel(role);
@@ -226,6 +315,11 @@ int main(void) {
 
     struct wl_buffer *buffer = create_buffer();
     commit_frame(display, surface, buffer);
+    if (!keyboard || !focused) fail("missing keyboard focus");
+    static const char ready[] = "Wayland keyboard focused\n";
+    if (write(1, ready, sizeof(ready) - 1) != sizeof(ready) - 1) fail("keyboard marker");
+    while (key_events != 4 || shift_active)
+        if (wl_display_dispatch(display) < 0) fail("dispatch keyboard events");
 
     int fb = open("/dev/fb0", O_RDONLY | O_CLOEXEC);
     uint32_t pixel;
@@ -233,7 +327,7 @@ int main(void) {
         fail("mapped framebuffer");
     wl_surface_attach(surface, NULL, 0, 0);
     wl_surface_commit(surface);
-    if (wl_display_roundtrip(display) < 0 || pread(fb, &pixel, sizeof(pixel), 0) != sizeof(pixel) || pixel)
+    if (wl_display_roundtrip(display) < 0 || focused || pread(fb, &pixel, sizeof(pixel), 0) != sizeof(pixel) || pixel)
         fail("unmap toplevel");
     close(fb);
 
@@ -241,6 +335,7 @@ int main(void) {
     wl_surface_commit(surface);
     if (wl_display_roundtrip(display) < 0 || !configured) fail("configure remapped toplevel");
     commit_frame(display, surface, buffer);
+    if (!focused) fail("focus remapped toplevel");
 
     /* Выход исходного процесса останавливает гостя с последним кадром для QMP. */
     static const char marker[] = "Wayland shared memory frame presented\n";
