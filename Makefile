@@ -1736,6 +1736,28 @@ kernel-x64-linux-smoke: $(X64BUILD)/linux-fb.elf
 kernel-x64-linux-smoke: $(X64BUILD)/kernel-linux.bin $(X64BUILD)/linux-probe.elf $(X64BUILD)/linux-bad-stack.elf $(X64BUILD)/linux-pie.elf $(X64BUILD)/linux-files.elf $(X64BUILD)/linux-mmap.elf $(X64BUILD)/linux-socket.elf $(X64BUILD)/linux-pipe.elf $(X64BUILD)/linux-poll.elf $(X64BUILD)/linux-fork.elf $(X64BUILD)/linux-pthread.elf $(X64BUILD)/linux-userns.elf $(X64BUILD)/linux-pidns.elf $(X64BUILD)/linux-shared-fs.elf $(X64BUILD)/linux-vfork.elf $(X64BUILD)/linux-exec.elf $(X64BUILD)/linux-exec-target.elf
 	python3 tests/kernel_x64_linux_smoke.py
 
+WAYLAND_SCANNER ?= wayland-scanner
+WAYLAND_PROTOCOLS ?= $(shell pkg-config --variable=pkgdatadir wayland-protocols 2>/dev/null)
+WAYLAND_CFLAGS ?= $(shell pkg-config --cflags wayland-server wayland-client)
+WAYLAND_SERVER_LIBS ?= $(shell pkg-config --libs wayland-server)
+WAYLAND_CLIENT_LIBS ?= $(shell pkg-config --libs wayland-client)
+WAYLAND_BUILD := $(X64BUILD)/wayland
+XDG_SHELL_XML := $(WAYLAND_PROTOCOLS)/stable/xdg-shell/xdg-shell.xml
+
+$(WAYLAND_BUILD):
+	mkdir -p $@
+$(WAYLAND_BUILD)/xdg-shell-%-protocol.h: $(XDG_SHELL_XML) | $(WAYLAND_BUILD)
+	$(WAYLAND_SCANNER) $*-header $< $@
+$(WAYLAND_BUILD)/xdg-shell-protocol.c: $(XDG_SHELL_XML) | $(WAYLAND_BUILD)
+	$(WAYLAND_SCANNER) private-code $< $@
+$(WAYLAND_BUILD)/wayland-compositor: user/wayland/compositor.c $(WAYLAND_BUILD)/xdg-shell-protocol.c $(WAYLAND_BUILD)/xdg-shell-server-protocol.h
+	$(CC) -m64 -O2 -Wall -Wextra $(WAYLAND_CFLAGS) -I$(WAYLAND_BUILD) $(filter %.c,$^) $(WAYLAND_SERVER_LIBS) -o $@
+$(WAYLAND_BUILD)/wayland-client: tests/linux_x64_wayland.c $(WAYLAND_BUILD)/xdg-shell-protocol.c $(WAYLAND_BUILD)/xdg-shell-client-protocol.h
+	$(CC) -m64 -O2 -Wall -Wextra $(WAYLAND_CFLAGS) -I$(WAYLAND_BUILD) $(filter %.c,$^) $(WAYLAND_CLIENT_LIBS) -o $@
+.PHONY: kernel-x64-wayland-smoke
+kernel-x64-wayland-smoke: $(X64BUILD)/kernel-linux.bin $(WAYLAND_BUILD)/wayland-compositor $(WAYLAND_BUILD)/wayland-client
+	python3 tests/kernel_x64_wayland_smoke.py $(WAYLAND_BUILD)
+
 uefi-smoke: $(HWBUILD)/kernel.bin $(BUILD)/myfs $(BUILD)/ld.so $(BUILD)/user/libc.so $(addprefix $(BUILD)/user/,sh cat stat poweroff sync)
 	python3 tests/uefi_smoke.py
 uefi-installer-smoke: $(HWBUILD)/kernel.bin $(BUILD)/myfs $(BUILD)/ld.so $(BUILD)/user/libc.so $(BUILD)/user/installercheck $(addprefix $(BUILD)/user/,sh setup cat mkdir sync stat poweroff)
