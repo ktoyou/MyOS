@@ -53,7 +53,11 @@ struct idt_pointer {
     u64 base;
 } __attribute__((packed));
 
-_Static_assert(sizeof(struct boot_info) == 100, "UEFI boot-info v5");
+_Static_assert(__builtin_offsetof(struct boot_info, xhci_bdf) == 100, "UEFI boot-info v5 prefix");
+_Static_assert(__builtin_offsetof(struct boot_info, xhci_bar_lo) == 104 &&
+               __builtin_offsetof(struct boot_info, xhci_bar_hi) == 108, "UEFI boot-info v6 BAR address");
+_Static_assert(__builtin_offsetof(struct boot_info, xhci_bar_bytes) == 112, "UEFI boot-info v6 aperture");
+_Static_assert(sizeof(struct boot_info) == 116, "UEFI boot-info v6");
 _Static_assert(sizeof(struct boot_region) == 24, "UEFI memory map entry");
 _Static_assert(sizeof(struct idt_gate) == 16, "x86-64 IDT gate");
 _Static_assert(sizeof(struct idt_pointer) == 10, "x86-64 IDTR");
@@ -317,11 +321,16 @@ static bool valid_boot_map(const struct boot_info *boot, u32 entry_magic) {
     if (entry_magic != UEFI_ENTRY_MAGIC || address < 0x100000 ||
         (address & 4095u) || address > BOOT_MEMORY_LIMIT - BOOT_ARENA_SIZE)
         return false;
-    if (boot->magic != BOOT_INFO_MAGIC || boot->version != 5 || boot->firmware != 1 ||
+    if (boot->magic != BOOT_INFO_MAGIC ||
+        (boot->version != BOOT_INFO_VERSION_GOP && boot->version != BOOT_INFO_VERSION_XHCI) || boot->firmware != 1 ||
         boot->arena_phys != address || boot->arena_bytes != BOOT_ARENA_SIZE ||
         boot->map_phys != address + BOOT_MAP_OFFSET ||
         !boot->map_count || boot->map_count > BOOT_MAP_MAX || !boot_root_valid(boot))
         return false;
+    bool xhci = boot->version == BOOT_INFO_VERSION_XHCI && boot->xhci_bar_bytes;
+    if (xhci && !boot_xhci_bar_valid(boot))
+        return false;
+    u64 xhci_base = xhci ? boot_xhci_bar_address(boot) : 0;
 
     const struct boot_region *map = (const void *)(uptr)boot->map_phys;
     for (u32 i = 0; i < boot->map_count; ++i) {
@@ -330,6 +339,8 @@ static bool valid_boot_map(const struct boot_info *boot, u32 entry_magic) {
             ((map[i].base | map[i].length) & 4095u))
             return false;
         u64 end = map[i].base + map[i].length;
+        if (xhci && map[i].type != 2 && xhci_base < end && map[i].base < xhci_base + boot->xhci_bar_bytes)
+            return false;
         for (u32 j = 0; j < i; ++j) {
             if (map[i].base < map[j].base + map[j].length && map[j].base < end)
                 return false;

@@ -37,6 +37,10 @@ bool pci64_find(u16 vendor, u16 device, u16 class_code, struct pci64_device *res
     return false;
 }
 
+u32 pci64_class(struct pci64_device device) {
+    return read_config(device, 8) >> 8;
+}
+
 uptr pci64_mmio_bar0(struct pci64_device device) {
     u32 low = read_config(device, 0x10);
     if (low & 1) return 0;

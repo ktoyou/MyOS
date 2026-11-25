@@ -1619,7 +1619,7 @@ X64_NETWORK := $(X64_ETHERNET) $(X64BUILD)/ethernet.o $(X64BUILD)/net.o
 X64_LINUX_NET := $(X64_NETWORK) $(X64BUILD)/dhcp.o $(X64BUILD)/tcp.o $(X64BUILD)/linux_net.o
 X64_NVME := $(X64BUILD)/nvme.o $(X64BUILD)/storage-pci.o $(X64BUILD)/storage-string.o
 X64_MYFS := $(X64BUILD)/storage-block.o $(X64BUILD)/storage-myfs.o $(X64BUILD)/storage-alloc.o
-X64_LINUX_RUNTIME := $(X64BUILD)/linux_elf.o \
+X64_LINUX_RUNTIME := $(X64BUILD)/linux_elf.o $(X64BUILD)/xhci.o $(X64BUILD)/xhci64_platform.o $(X64BUILD)/hid_mouse.o \
     $(X64BUILD)/linux_syscall.o $(X64BUILD)/linux_file.o $(X64BUILD)/linux_fb.o \
     $(X64BUILD)/linux_input.o $(X64BUILD)/linux_mmap.o $(X64BUILD)/linux_random.o \
     $(X64BUILD)/linux_time.o $(X64BUILD)/linux_timer.o $(X64BUILD)/acpi-smp.o $(X64BUILD)/linux_signal.o $(X64BUILD)/linux_socket.o \
@@ -1734,6 +1734,7 @@ $(X64BUILD)/linux_myfs.o: kernel/x86_64/linux_myfs.c kernel/x86_64/linux_myfs.h 
 $(X64BUILD)/linux-myfs-mmap.o: kernel/x86_64/linux_myfs_mmap.c kernel/x86_64/linux_myfs.h kernel/x86_64/linux.h $(X64_HEADERS) | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
 $(X64BUILD)/linux_file.o $(X64BUILD)/linux_vfs.o $(X64BUILD)/linux_elf.o $(X64BUILD)/linux_mmap.o: kernel/x86_64/linux_myfs.h
+$(X64BUILD)/linux_elf.o: kernel/x86_64/linux_input.h
 $(X64BUILD)/linux_syscall.o: X64CFLAGS += -I$(BUILD)
 $(X64BUILD)/linux_syscall.o: $(BUILD)/build_info.h
 $(X64BUILD)/linux_timer.o: kernel/acpi_smp.h kernel/smp.h
@@ -1746,7 +1747,13 @@ $(X64BUILD)/linux_file.o: kernel/x86_64/linux_input.h
 $(X64BUILD)/linux_task.o $(X64BUILD)/linux_seccomp.o: kernel/x86_64/linux_seccomp.h
 $(X64BUILD)/linux_seccomp.o $(X64BUILD)/linux_seccomp_bpf.o: kernel/x86_64/linux_seccomp_bpf.h
 $(X64BUILD)/linux_socket.o: kernel/x86_64/net.h kernel/x86_64/net_bytes.h kernel/x86_64/tcp.h
-$(X64BUILD)/linux_input.o: kernel/x86_64/linux_input.c kernel/x86_64/linux_input.h kernel/x86_64/linux.h kernel/x86_64/linux_task.h $(X64_HEADERS) | $(X64BUILD)
+$(X64BUILD)/xhci.o: kernel/xhci.c kernel/xhci.h kernel/hid_mouse.h kernel/hwinfo.h kernel/string.h kernel/x86_64/xhci64.h kernel/x86_64/pci.h kernel/x86_64/linux_input.h kernel/x86_64/linux.h $(X64_HEADERS) | $(X64BUILD)
+	$(CC) $(X64CFLAGS) -DMYOS_XHCI_X64 -c $< -o $@
+$(X64BUILD)/xhci64_platform.o: kernel/x86_64/xhci64_platform.c kernel/x86_64/xhci64.h kernel/x86_64/pci.h kernel/x86_64/linux.h $(X64_HEADERS) | $(X64BUILD)
+	$(CC) $(X64CFLAGS) -c $< -o $@
+$(X64BUILD)/hid_mouse.o: kernel/hid_mouse.c kernel/hid_mouse.h kernel/string.h kernel/types.h | $(X64BUILD)
+	$(CC) $(X64CFLAGS) -c $< -o $@
+$(X64BUILD)/linux_input.o: kernel/x86_64/linux_input.c kernel/x86_64/linux_input.h kernel/x86_64/xhci64.h kernel/x86_64/linux.h kernel/x86_64/linux_task.h $(X64_HEADERS) | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
 $(X64BUILD)/kernel-linux.elf: $(X64_CORE) $(X64_LINUX_NET) $(X64BUILD)/early-linux.o $(X64_LINUX_RUNTIME) $(X64_NVME) $(X64_MYFS) kernel/x86_64/linker.ld
 	$(LD) -m elf_x86_64 -T kernel/x86_64/linker.ld -nostdlib $(filter %.o,$^) -o $@
@@ -1807,6 +1814,10 @@ $(X64BUILD)/linux-fb.elf: $(X64BUILD)/linux-fb.o
 $(X64BUILD)/linux-input.o: tests/linux_x64_input.c | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
 $(X64BUILD)/linux-input.elf: $(X64BUILD)/linux-input.o
+	$(LD) -m elf_x86_64 -static -no-pie $< -o $@
+$(X64BUILD)/linux-usb-input.o: tests/linux_x64_usb_input.c | $(X64BUILD)
+	$(CC) $(X64CFLAGS) -c $< -o $@
+$(X64BUILD)/linux-usb-input.elf: $(X64BUILD)/linux-usb-input.o
 	$(LD) -m elf_x86_64 -static -no-pie $< -o $@
 $(X64BUILD)/linux-mmap.o: tests/linux_x64_mmap.c | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -DFILE_PATH='"$(abspath $(X64BUILD)/linux-mmap-data.bin)"' -c $< -o $@
@@ -1911,6 +1922,10 @@ kernel-x64-ring3-smoke: $(X64_RING3_TESTS)
 kernel-x64-linux-smoke: $(X64BUILD)/linux-fb.elf $(X64BUILD)/linux-input.elf
 kernel-x64-linux-smoke: $(X64BUILD)/kernel-linux.bin $(X64BUILD)/linux-probe.elf $(X64BUILD)/linux-bad-stack.elf $(X64BUILD)/linux-pie.elf $(X64BUILD)/linux-files.elf $(X64BUILD)/linux-mmap.elf $(X64BUILD)/linux-socket.elf $(X64BUILD)/linux-pipe.elf $(X64BUILD)/linux-poll.elf $(X64BUILD)/linux-fork.elf $(X64BUILD)/linux-pthread.elf $(X64BUILD)/linux-userns.elf $(X64BUILD)/linux-pidns.elf $(X64BUILD)/linux-netns.elf $(X64BUILD)/linux-shared-fs.elf $(X64BUILD)/linux-vfork.elf $(X64BUILD)/linux-exec.elf $(X64BUILD)/linux-exec-target.elf
 	python3 tests/kernel_x64_linux_smoke.py
+
+.PHONY: kernel-x64-usb-input-smoke
+kernel-x64-usb-input-smoke: $(X64BUILD)/kernel-linux.bin $(X64BUILD)/linux-usb-input.elf
+	python3 tests/kernel_x64_usb_input_smoke.py
 
 WAYLAND_SCANNER ?= wayland-scanner
 WAYLAND_PROTOCOLS ?= $(shell pkg-config --variable=pkgdatadir wayland-protocols 2>/dev/null)

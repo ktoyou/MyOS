@@ -2,6 +2,7 @@
 #include "paging.h"
 #include "segments.h"
 #include "linux_myfs.h"
+#include "linux_input.h"
 
 #define USER_MIN        0x400000ul
 #define BOOT_STACK_SIZE (4 * PMM_PAGE_SIZE)
@@ -338,6 +339,7 @@ bool linux64_run(const struct linux64_file *file, const char *path, uptr path_le
     linux64_use_files(source, path, path_length);
     linux64_reset_signals();
     linux64_clock_init();
+    linux64_input_init(boot);
     linux64_myfs_mount(boot, source);
     bool preemptive = linux64_timer_init();
     if (preemptive) linux64_user_rflags |= 1u << 9;
