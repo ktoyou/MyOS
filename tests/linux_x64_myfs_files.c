@@ -538,6 +538,57 @@ static int check_filesystem_space(long parent) {
     return 0;
 }
 
+static int check_resize(long parent) {
+    enum { SECTOR = 512 };
+    static const char name[] = "resize-probe";
+    static const unsigned offsets[] = {
+        0, 12 * SECTOR, 145 * SECTOR, (12 + 128 + 128 * 128 + 1) * SECTOR,
+    };
+    static const char payload[] = "MyFS resize";
+    static const unsigned short_length = 5;
+    struct file_stat info;
+    struct filesystem_info before, sparse, after;
+    if (call(SYS_FSTATFS, parent, (word)&before, 0, 0)) return 74;
+    long fd = open_at(parent, name, O_CREAT | O_EXCL | O_RDWR, 0600);
+    if (fd < 0) return 74;
+    for (unsigned i = 0; i < sizeof(offsets) / sizeof(*offsets); ++i)
+        if (call(SYS_PWRITE, fd, (word)payload, sizeof(payload), offsets[i]) != sizeof(payload)) return 74;
+
+    const word maximum_offset = offsets[sizeof(offsets) / sizeof(*offsets) - 1];
+    const word large_size = maximum_offset + sizeof(payload) + SECTOR;
+    if (call(SYS_FSTATFS, fd, (word)&sparse, 0, 0) ||
+        call(SYS_FTRUNCATE, fd, large_size, 0, 0) || stat_fd(fd, &info) || info.size != (long)large_size ||
+        call(SYS_FSTATFS, fd, (word)&after, 0, 0) || sparse.free_blocks != after.free_blocks ||
+        call(SYS_PREAD, fd, (word)buffer, 1, maximum_offset + sizeof(payload)) != 1 || buffer[0] ||
+        call(SYS_FTRUNCATE, fd, (word)-1, 0, 0) != -EINVAL ||
+        call(SYS_FTRUNCATE, fd, 1ul << 32, 0, 0) != -27 ||
+        call(SYS_FTRUNCATE, fd, 1ul << 31, 0, 0) != -27) return 75;
+
+    long mapping = map_shared(fd, PAGE_BYTES, PROT_READ, 0);
+    if (mapping < 0 || call(SYS_FTRUNCATE, fd, large_size, 0, 0) ||
+        call(SYS_FTRUNCATE, fd, short_length, 0, 0) != -EBUSY ||
+        call(SYS_MUNMAP, mapping, PAGE_BYTES, 0, 0)) return 75;
+
+    if (call(SYS_FTRUNCATE, fd, short_length, 0, 0) || stat_fd(fd, &info) || info.size != short_length ||
+        call(SYS_PREAD, fd, (word)buffer, sizeof(payload), 0) != short_length ||
+        !same_bytes(buffer, payload, short_length) ||
+        call(SYS_FSTATFS, fd, (word)&after, 0, 0) || after.free_blocks <= sparse.free_blocks ||
+        call(SYS_FTRUNCATE, fd, large_size, 0, 0) ||
+        call(SYS_PREAD, fd, (word)buffer, sizeof(payload), 0) != sizeof(payload) ||
+        !same_bytes(buffer, payload, short_length)) return 76;
+    for (unsigned i = short_length; i < sizeof(payload); ++i)
+        if (buffer[i]) return 76;
+    for (unsigned i = 1; i < sizeof(offsets) / sizeof(*offsets); ++i) {
+        if (call(SYS_PREAD, fd, (word)buffer, sizeof(payload), offsets[i]) != sizeof(payload)) return 76;
+        for (unsigned j = 0; j < sizeof(payload); ++j)
+            if (buffer[j]) return 76;
+    }
+    if (call(SYS_FSYNC, fd, 0, 0, 0) || close_fd(fd) || call(SYS_UNLINKAT, parent, (word)name, 0, 0) ||
+        call(SYS_FSTATFS, parent, (word)&after, 0, 0) || after.free_blocks != before.free_blocks ||
+        after.free_inodes != before.free_inodes) return 77;
+    return 0;
+}
+
 void _start(void) {
     int status = 1;
     char phase;
@@ -548,6 +599,7 @@ void _start(void) {
         prepare_long_target();
         status = parent < 0 ? 2 : check_permissions(parent);
         if (!status) status = check_filesystem_space(parent);
+        if (!status && phase == '1') status = check_resize(parent);
         if (!status && phase == '1') status = write_profile(parent);
         if (!status) status = verify_profile(parent);
         if (!status) status = check_deep_path(parent, phase == '1');

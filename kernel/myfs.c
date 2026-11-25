@@ -644,17 +644,102 @@ static int myfs_write_impl(u32 ino, u32 off, const void *buf, u32 n) {
     return w ? w : (int)done;
 }
 
-static int myfs_truncate_impl(u32 ino) {
+/*
+ * Для целой удаляемой ветви мы меняем только битмап. На диск
+ * переписывается не более одного сохранённого блока на каждом уровне.
+ */
+static int trim_indirect(u32 *block, u32 level, u32 capacity, u32 keep,
+                         u32 *last) {
+    if (!*block || (keep == capacity && !last)) return 0;
+
+    u32 entries[NINDIRECT];
+    if (read_ind(*block, entries)) return FS_EIO;
+    u32 child_capacity = capacity / NINDIRECT;
+    bool empty = true, changed = false;
+    for (u32 i = 0; i < NINDIRECT; ++i) {
+        u32 previous = entries[i];
+        u32 count = keep < child_capacity ? keep : child_capacity;
+        u32 *child_last = keep && keep <= child_capacity ? last : NULL;
+        if (level > 1) {
+            int result = trim_indirect(&entries[i], level - 1, child_capacity,
+                                       count, child_last);
+            if (result) return result;
+        } else if (!count) {
+            bfree(entries[i]);
+            entries[i] = 0;
+        } else if (child_last) {
+            *child_last = entries[i];
+        }
+        keep -= count;
+        empty &= !entries[i];
+        changed |= entries[i] != previous;
+    }
+
+    if (empty) {
+        bfree(*block);
+        *block = 0;
+    } else if (changed) {
+        int result = bwrite(*block, entries);
+        if (result) return result;
+        ind_invalidate_block(*block);
+    }
+    return 0;
+}
+
+static int trim_file(struct inode *in, u32 boundary) {
+    u32 keep = (boundary + BS - 1) / BS;
+    u32 partial = boundary % BS, last = 0;
+    u32 direct = n_direct();
+    for (u32 i = 0; i < direct; ++i) {
+        if (!keep) {
+            bfree(in->direct[i]);
+            in->direct[i] = 0;
+        } else if (!--keep && partial) {
+            last = in->direct[i];
+        }
+    }
+
+    u32 roots[] = {in->indirect, in->dindirect, in->direct[NDIRECT_V2]};
+    u32 capacity = NINDIRECT;
+    u32 levels = legacy() ? 2 : 3;
+    for (u32 level = 1; level <= levels; ++level) {
+        u32 count = keep < capacity ? keep : capacity;
+        u32 *tail = partial && keep && keep <= capacity ? &last : NULL;
+        int result = trim_indirect(&roots[level - 1], level, capacity, count, tail);
+        if (result) return result;
+        keep -= count;
+        capacity *= NINDIRECT;
+    }
+
+    in->indirect = roots[0];
+    in->dindirect = roots[1];
+    if (levels == 3) in->direct[NDIRECT_V2] = roots[2];
+
+    if (last) {
+        u8 data[BS];
+        if (bread(last, data)) return FS_EIO;
+        memset(data + partial, 0, BS - partial);
+        return bwrite_data(last, data);
+    }
+    return 0;
+}
+
+static int myfs_resize_impl(u32 ino, u32 size, bool grow) {
     struct inode in;
-    int r = iread(ino, &in);
-    if (r) return r;
+    int result = iread(ino, &in);
+    if (result) return result;
     if (in.type != FS_TYPE_FILE) return FS_EISDIR;
-    free_all_blocks(&in);
-    if((r=myfs_touch(ino)))return r;
-    int w = iwrite(ino, &in);
-    int meta = sync_meta();
-    if (w) return w;
-    return meta;
+    if (!grow && size > in.size) return FS_EINVAL;
+    if (size > max_file_blks() * BS) return FS_EFBIG;
+    if (size && size == in.size) return 0;
+
+    /* Старый fs_set_size мог оставить указатели за концом файла. */
+    u32 boundary = size < in.size ? size : in.size;
+    result = trim_file(&in, boundary);
+    if (result) return result;
+    in.size = size;
+    result = myfs_touch(ino);
+    return result ? result : iwrite(ino, &in);
 }
 
 static int myfs_stat_impl(u32 ino, struct fs_stat *st) {
@@ -1493,19 +1578,26 @@ int myfs_write(u32 ino, u32 off, const void *buf, u32 n) {
     }
     return done;
 }
-int myfs_truncate(u32 ino) { int e=transaction_begin();if(e)return e; int r = myfs_truncate_impl(ino); return transaction_end(r); }
-static int myfs_set_size_impl(u32 ino, u32 size) {
-    struct inode in;
-    int r = iread(ino, &in);
-    if (r) return r;
-    if (in.type != FS_TYPE_FILE) return FS_EISDIR;
-    if (size > in.size) return FS_EINVAL;
-    in.size = size;
-    if((r=myfs_touch(ino)))return r;
-    r = iwrite(ino, &in);
-    if (r) return r;
-    return sync_meta();
+static int myfs_resize_transaction(u32 ino, u32 size, bool grow) {
+    int result = transaction_begin();
+    if (result) return result;
+    u32 before = available_blocks;
+    result = myfs_resize_impl(ino, size, grow);
+    if (!result && !transaction_depth) result = sync_meta();
+    result = transaction_end(result);
+    /* Сбрасываем усечение до того, как другой файл сможет занять блоки. */
+    if (!result && !transaction_depth && available_blocks > before) return commit_pending();
+    return result;
 }
+
+int myfs_resize(u32 ino, u32 size) {
+    return myfs_resize_transaction(ino, size, true);
+}
+
+int myfs_truncate(u32 ino) {
+    return myfs_resize(ino, 0);
+}
+
 int myfs_stat(u32 ino, struct fs_stat *st) { int r = myfs_stat_impl(ino, st); return r; }
 int myfs_readdir(u32 dir, u32 *pos, struct fs_dirent *out) { int r = myfs_readdir_impl(dir, pos, out); return r; }
 int myfs_getpath(u32 ino, char *buf, u32 len) { int r = myfs_getpath_impl(ino, buf, len); return r; }
@@ -1533,7 +1625,9 @@ int myfs_transaction_end(int result){return transaction_end(result);}
 
 int myfs_touch(u32 ino) {int r=transaction_begin();return r?r:transaction_end(myfs_touch_impl(ino));}
 int myfs_set_time(u32 ino,u32 when) {int r=transaction_begin();return r?r:transaction_end(myfs_set_time_impl(ino,when));}
-int myfs_set_size(u32 ino,u32 size) {int r=transaction_begin();return r?r:transaction_end(myfs_set_size_impl(ino,size));}
+int myfs_set_size(u32 ino, u32 size) {
+    return myfs_resize_transaction(ino, size, false);
+}
 
 int myfs_rename_keep(u32 cwd,const char *src,const char *dst,bool keep) {int r=transaction_begin();return r?r:transaction_end(myfs_rename_impl(cwd,src,dst,keep));}
 int myfs_rename_at(u32 src_parent, const char *src, u32 dst_parent, const char *dst, bool keep_victim) {

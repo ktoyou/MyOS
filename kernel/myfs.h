@@ -26,6 +26,7 @@ int  myfs_rename_at(u32 src_parent, const char *src, u32 dst_parent, const char 
 int  myfs_read(u32 ino, u32 off, void *buf, u32 n);         /* -> прочитано байт */
 int  myfs_write(u32 ino, u32 off, const void *buf, u32 n);  /* -> записано байт */
 int  myfs_truncate(u32 ino);
+int  myfs_resize(u32 ino, u32 size);
 int  myfs_set_size(u32 ino, u32 size);
 int  myfs_stat(u32 ino, struct fs_stat *st);
 int myfs_setattr(u32 ino,u32 mode,u32 uid,u32 gid);
