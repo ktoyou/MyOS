@@ -5,6 +5,7 @@
 
 #define LINUX64_PATH_LIMIT 4096u
 #define LINUX64_FD_COUNT 256u
+#define LINUX64_MSG_ERRQUEUE 0x2000u
 /* Глобальные пулы не растут вместе с таблицей отдельного процесса. */
 #define LINUX64_OPEN_FILE_COUNT 512u
 #define LINUX64_PID 1
@@ -64,6 +65,7 @@ struct linux64_socket;
 struct linux64_socket_wait;
 struct linux64_udp_address { u32 ip; u16 port; };
 bool linux64_socket_is_udp(const struct linux64_socket *socket);
+bool linux64_udp_recverr_enabled(const struct linux64_socket *socket);
 bool linux64_socket_is_inet(const struct linux64_socket *socket);
 bool linux64_socket_is_tcp(const struct linux64_socket *socket);
 long linux64_tcp_path(struct linux64_socket *socket, bool bind, uptr address, u32 length);
@@ -73,6 +75,8 @@ long linux64_tcp_recvfrom(struct linux64_socket *socket, struct linux64_socket_w
 long linux64_udp_address(uptr address, u32 length, struct linux64_udp_address *result, bool disconnect);
 long linux64_udp_path(struct linux64_socket *socket, bool bind, uptr address, u32 length);
 void linux64_udp_receive(void *context, u32 source, u32 destination, u8 protocol, const u8 *data, u32 length);
+void linux64_udp_icmp_error(u32 offender, u32 local_ip, u32 peer_ip, u16 local_port, u16 peer_port,
+                            u8 type, u8 code, u32 info, const u8 *payload, u32 length);
 bool linux64_udp_flush(u64 now);
 #define LINUX64_UNIX_PATH_LIMIT 108u
 struct linux64_sockaddr { u16 family; char path[LINUX64_UNIX_PATH_LIMIT + 1]; };

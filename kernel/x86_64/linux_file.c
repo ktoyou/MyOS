@@ -181,7 +181,8 @@ static bool epoll_ready(const struct file_handle *file) {
 
 static bool socket_needs_poll(const struct linux64_socket *socket, u16 events) {
     return linux64_socket_is_inet(socket) &&
-           (linux64_socket_is_tcp(socket) || (events & (LINUX64_POLL_READ | LINUX64_POLL_WRITE)));
+           (linux64_socket_is_tcp(socket) || linux64_udp_recverr_enabled(socket) ||
+            (events & (LINUX64_POLL_READ | LINUX64_POLL_WRITE)));
 }
 
 static u16 poll_fd(const struct linux64_process *process, i32 fd, u16 events, bool *input) {
@@ -1179,7 +1180,8 @@ static long socket_attempt(struct linux64_socket_wait *wait) {
 static long socket_run(struct linux64_socket_wait wait) {
     bool per_call = wait.operation == SOCKET_WRITE || wait.operation == SOCKET_SENDMSG ||
                     wait.operation == SOCKET_RECVMSG || wait.operation == SOCKET_RECVFROM;
-    wait.blocking = !(wait.file->flags & O_NONBLOCK) && !(per_call && (wait.flags & MSG_DONTWAIT));
+    bool error_queue = wait.operation == SOCKET_RECVMSG && (wait.flags & LINUX64_MSG_ERRQUEUE);
+    wait.blocking = !(wait.file->flags & O_NONBLOCK) && !(per_call && (wait.flags & MSG_DONTWAIT)) && !error_queue;
     if (wait.operation == SOCKET_SENDMSG && !linux64_socket_is_inet(wait.file->socket)) {
         long result = linux64_socket_prepare_rights(wait.address, wait.flags, &wait.rights);
         if (result) return result;
