@@ -186,12 +186,14 @@ struct linux64_pollfd {
 struct linux64_poll_timeout {
     uptr address;
     u64 seconds, nanoseconds;
+    bool timeval;
 };
 
 struct linux64_poll_wait {
     struct linux64_pollfd entries[LINUX64_FD_COUNT];
     struct linux64_poll_timeout timeout;
-    uptr address;
+    uptr address, select_sets[3];
+    unsigned select_bytes;
     u64 deadline, saved_mask;
     unsigned count, ready;
     bool input, interrupted;
@@ -297,6 +299,7 @@ long linux64_pipe_resume(void);
 u16 linux64_pipe_poll(const struct linux64_pipe *pipe, bool writer);
 long linux64_poll(uptr address, u32 count, i32 timeout);
 long linux64_ppoll(uptr address, u32 count, uptr timeout, uptr sigmask, uptr sigset_size);
+long linux64_select(i32 count, const uptr sets[3], uptr timeout, uptr sigarg, bool pselect);
 bool linux64_poll_ready(struct linux64_task *task);
 long linux64_poll_resume(struct linux64_task *task);
 long linux64_read_signal_mask(uptr set, uptr sigset_size, u64 *mask);

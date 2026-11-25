@@ -13,13 +13,18 @@ struct pollfd {
 
 static unsigned char pages[8192] __attribute__((aligned(4096)));
 
-static long call5(word number, word a0, word a1, word a2, word a3, word a4) {
+static long call6(word number, word a0, word a1, word a2, word a3, word a4, word a5) {
     register word fourth __asm__("r10") = a3;
     register word fifth __asm__("r8") = a4;
+    register word sixth __asm__("r9") = a5;
     __asm__ volatile("syscall" : "+a"(number)
-                     : "D"(a0), "S"(a1), "d"(a2), "r"(fourth), "r"(fifth)
+                     : "D"(a0), "S"(a1), "d"(a2), "r"(fourth), "r"(fifth), "r"(sixth)
                      : "rcx", "r11", "memory");
     return (long)number;
+}
+
+static long call5(word number, word a0, word a1, word a2, word a3, word a4) {
+    return call6(number, a0, a1, a2, a3, a4, 0);
 }
 
 static long call(word number, word a0, word a1, word a2, word a3) {
@@ -399,6 +404,69 @@ static int check_high_fd(void) {
     return 0;
 }
 
+static long select_call(int count, word *read, word *write, word *except, long *timeout) {
+    return call5(23, count, (word)read, (word)write, (word)except, (word)timeout);
+}
+
+static long pselect_call(int count, word *read, long *timeout, const word *signal) {
+    return call6(270, count, (word)read, 0, 0, (word)timeout, (word)signal);
+}
+
+static int check_select(void) {
+    long immediate[2] = {0, 0};
+    int ends[2];
+    if (call(53, 1, 1, 0, (word)ends)) return 66;
+    int count = ends[0] + 1;
+    word bit = 1ul << ends[0], read = bit, write = bit, except = bit;
+    if (select_call(count, &read, &write, &except, immediate) != 1 || read || write != bit || except)
+        return 67;
+    if (call(1, ends[1], (word)"x", 1, 0) != 1) return 67;
+    read = write = except = bit;
+    if (select_call(count, &read, &write, &except, immediate) != 2 || read != bit || write != bit || except)
+        return 68;
+    char byte;
+    if (call(0, ends[0], (word)&byte, 1, 0) != 1 || byte != 'x') return 68;
+
+    const word mask = 1ul << 11;
+    const word bad_signal[] = {(word)&mask, 4};
+    const word signal[] = {(word)&mask, sizeof(mask)};
+    long bad_time[2] = {0, 1000000000}, overflow[2] = {0x7fffffffffffffffL, 1000000};
+    if (pselect_call(count, &read, immediate, bad_signal) != -22 ||
+        pselect_call(count, &read, bad_time, (const word *)1) != -14 ||
+        select_call(count, &read, 0, 0, overflow) != -22 ||
+        select_call(-1, 0, 0, 0, immediate) != -22 ||
+        select_call(count, (word *)1, 0, 0, immediate) != -14) return 69;
+
+    long timeout[2] = {0, 20000};
+    if (select_call(count, &read, 0, 0, timeout) || read || timeout[0] || timeout[1]) return 70;
+    long child = call(57, 0, 0, 0, 0);
+    if (child < 0) return 71;
+    if (!child) {
+        if (close_fd(ends[0]) || poll(0, 0, 20) ||
+            call(1, ends[1], (word)"ACK", 3, 0) != 3 || call(48, ends[1], 1, 0, 0))
+            finish(72);
+        finish(0);
+    }
+    if (close_fd(ends[1])) return 71;
+    word before, after;
+    timeout[0] = 5;
+    read = bit;
+    char response[3];
+    int status;
+    if (call(14, 0, 0, (word)&before, 8) ||
+        pselect_call(count, &read, timeout, signal) != 1 || read != bit ||
+        timeout[0] < 0 || timeout[0] >= 5 || timeout[1] < 0 || timeout[1] >= 1000000000 ||
+        call(14, 0, 0, (word)&after, 8) || before != after ||
+        call(0, ends[0], (word)response, sizeof(response), 0) != sizeof(response) ||
+        response[0] != 'A' || response[1] != 'C' || response[2] != 'K' ||
+        call(61, child, (word)&status, 0, 0) != child || status) return 73;
+    except = bit;
+    if (select_call(count, &read, 0, &except, immediate) != 1 || read != bit || except ||
+        close_fd(ends[0]) || select_call(count, &read, 0, 0, immediate) != -9 || read != bit)
+        return 74;
+    return 0;
+}
+
 void _start(void) {
     int error = check_pipe();
     if (!error) error = check_socket();
@@ -412,6 +480,7 @@ void _start(void) {
     if (!error) error = check_epoll_blocking();
     if (!error) error = check_epoll_delivery();
     if (!error) error = check_high_fd();
+    if (!error) error = check_select();
     if (error) finish(error);
     static const char marker[] = "Linux ELF64 poll probe\n";
     if (call(1, 1, (word)marker, sizeof(marker) - 1, 0) != sizeof(marker) - 1) finish(26);
