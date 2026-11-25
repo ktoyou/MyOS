@@ -232,9 +232,12 @@ static struct linux64_address_space *unused_memory(void) {
 
 static struct linux64_address_space *fork_memory(const struct linux64_address_space *parent) {
     struct linux64_address_space *child = unused_memory();
-    if (!child) return NULL;
+    if (!child || !linux64_copy_file_mappings(child, parent)) return NULL;
     uptr root = paging64_fork_root();
-    if (!root) return NULL;
+    if (!root) {
+        linux64_drop_file_mappings(child);
+        return NULL;
+    }
     child->root = root;
     child->references = 1;
     child->data_bytes = parent->data_bytes;
@@ -248,6 +251,7 @@ static void release_memory(struct linux64_task *task) {
     task->memory = NULL;
     if (!--memory->references) {
         paging64_drop_root(memory->root);
+        linux64_drop_file_mappings(memory);
         memory->root = 0;
     }
 }
@@ -553,8 +557,10 @@ bool linux64_commit_exec(struct linux64_frame *frame, uptr root, uptr entry, upt
     struct linux64_address_space *old = task->memory;
     struct linux64_address_space *memory = old->references == 1 ? old : unused_memory();
     if (!memory) return false;
-    if (memory == old) paging64_drop_root(old->root);
-    else release_memory(task);
+    if (memory == old) {
+        paging64_drop_root(old->root);
+        linux64_drop_file_mappings(old);
+    } else release_memory(task);
     memory->root = root;
     memory->data_bytes = data_bytes;
     memory->references = 1;

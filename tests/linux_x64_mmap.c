@@ -249,6 +249,92 @@ static __attribute__((noreturn)) void finish(long status) {
     __builtin_trap();
 }
 
+static long flock_exclusive(long fd) {
+    return call(73, fd, 2 | 4, 0, 0, 0, 0);
+}
+
+enum flock_cleanup { FLOCK_UNMAP, FLOCK_EXIT, FLOCK_EXEC };
+static const char flock_exec_path[] = "/proc/self/exe";
+
+static long check_mmap_flock(word mode, enum flock_cleanup cleanup) {
+    const word page = 4096;
+    long owner = call(319, (word)"mmap-flock", 0, 0, 0, 0, 0);
+    if (owner < 0 || owner > 99 || resize_fd(owner, 3 * page)) return 88;
+    char path[] = "/proc/self/fd/00";
+    char *digit = path + sizeof("/proc/self/fd/") - 1;
+    if (owner < 10) {
+        digit[0] = '0' + owner;
+        digit[1] = '\0';
+    } else {
+        digit[0] = '0' + owner / 10;
+        digit[1] = '0' + owner % 10;
+    }
+    long observer = open_proc_fd(path, 0);
+    if (observer < 0 || flock_exclusive(owner) || flock_exclusive(observer) != -11) return 88;
+    long base = mmap(0, 3 * page, 3, mode, owner, 0);
+    if (base < 0 || close_fd(owner) || flock_exclusive(observer) != -11) return 89;
+    volatile unsigned char *bytes = (void *)base;
+    bytes[0] = 0x51;
+    bytes[2 * page] = 0x72;
+    if (munmap(base + page, page) || flock_exclusive(observer) != -11) return 90;
+
+    int gate[2];
+    if (call(22, (word)gate, 0, 0, 0, 0, 0)) return 91;
+    long child = call(57, 0, 0, 0, 0, 0, 0);
+    if (!child) {
+        char ready;
+        if (close_fd(gate[1]) || call(0, gate[0], (word)&ready, 1, 0, 0, 0) != 1 || ready != 'g' ||
+            close_fd(gate[0]) || bytes[0] != 0x51 || bytes[2 * page] != 0x72 ||
+            flock_exclusive(observer) != -11) finish(94);
+        if (cleanup == FLOCK_EXIT) finish(0);
+        if (cleanup == FLOCK_EXEC) {
+            if (observer > 99) finish(98);
+            char descriptor[] = {'0' + observer / 10, '0' + observer % 10, '\0'};
+            const char *argv[] = {flock_exec_path, descriptor, 0};
+            call(59, (word)flock_exec_path, (word)argv, 0, 0, 0, 0);
+            finish(98);
+        }
+        if (munmap(base, page) || flock_exclusive(observer) != -11) finish(95);
+        /* Проверяем снятие блокировки сразу после munmap, до выхода потомка. */
+        if (munmap(base + 2 * page, page) || flock_exclusive(observer) ||
+            call(73, observer, 8, 0, 0, 0, 0)) finish(96);
+        finish(0);
+    }
+    if (child < 0 || close_fd(gate[0]) || mmap(base, page, 3, 0x32, -1, 0) != base ||
+        bytes[0] || munmap(base + 2 * page, page) || flock_exclusive(observer) != -11) return 92;
+    if (call(1, gate[1], (word)"g", 1, 0, 0, 0) != 1 || close_fd(gate[1])) return 93;
+    int status;
+    if (call(61, child, (word)&status, 0, 0, 0, 0) != child || (status & 0xff)) return 93;
+    if (status) return status >> 8;
+    return flock_exclusive(observer) || close_fd(observer) || munmap(base, page) ? 97 : 0;
+}
+
+static long check_many_file_mappings(void) {
+    const word page = 4096, count = 530;
+    long base = mmap(0, count * page, 0, 0x22, -1, 0);
+    if (base < 0) return 100;
+    /* После закрытия fd каждое отображение всё ещё удерживает своё описание. */
+    for (word i = 0; i < count; ++i) {
+        long fd = open_data();
+        long address = base + i * page;
+        if (fd < 0 || mmap(address, page, 1, 0x12, fd, 0) != address || close_fd(fd)) return 101;
+    }
+    struct epoll_event {
+        unsigned events;
+        word data;
+    } __attribute__((packed)) event = {1, 0x174}, observed;
+    long epoll = call(291, 0, 0, 0, 0, 0, 0);
+    long wake = call(290, 1, 0, 0, 0, 0, 0);
+    if (epoll < 0 || wake < 0 || call(233, epoll, 1, wake, (word)&event, 0, 0) ||
+        call(232, epoll, (word)&observed, 1, 0, 0, 0) != 1 ||
+        observed.events != event.events || observed.data != event.data ||
+        close_fd(wake) || call(232, epoll, (word)&observed, 1, 0, 0, 0) ||
+        close_fd(epoll) || munmap(base, count * page)) return 102;
+    long observer = open_data();
+    if (observer < 0 || close_fd(observer)) return 103;
+    return 0;
+}
+
 static long check_discard(void) {
     const word page = 4096;
     long base = mmap(0, 5 * page, 3, 0x22, -1, 0);
@@ -286,11 +372,24 @@ static long check_discard(void) {
     return munmap(file, page) ? 76 : 0;
 }
 
-__attribute__((noreturn)) void _start(void) {
+static __attribute__((noreturn, used)) void mmap_start(const word *stack) {
+    if (stack[0] == 2) {
+        const char *descriptor = (const char *)stack[2];
+        if (descriptor[0] < '0' || descriptor[0] > '9' || descriptor[1] < '0' ||
+            descriptor[1] > '9' || descriptor[2]) finish(98);
+        long observer = (descriptor[0] - '0') * 10 + descriptor[1] - '0';
+        if (flock_exclusive(observer) || call(73, observer, 8, 0, 0, 0, 0)) finish(99);
+        finish(0);
+    }
     long status = check_mmap();
     if (!status) status = check_shared();
     if (!status) status = check_memfd();
     if (!status) status = check_memfd_resize();
+    if (!status) status = check_mmap_flock(1, FLOCK_UNMAP);
+    if (!status) status = check_mmap_flock(2, FLOCK_UNMAP);
+    if (!status) status = check_mmap_flock(1, FLOCK_EXIT);
+    if (!status) status = check_mmap_flock(2, FLOCK_EXEC);
+    if (!status) status = check_many_file_mappings();
     if (!status) status = check_stack();
     if (!status) status = check_sparse();
     if (!status) status = check_discard();
@@ -300,6 +399,10 @@ __attribute__((noreturn)) void _start(void) {
             status = 10;
     }
     finish(status);
+}
+
+__attribute__((naked, noreturn)) void _start(void) {
+    __asm__("mov %rsp, %rdi\n\tand $-16, %rsp\n\tcall mmap_start");
 }
 
 enum { DATA_LIMIT = 2, PAGE = 4096, PRIVATE_ANON = 0x22, DATA_CAP = 16 * PAGE };
