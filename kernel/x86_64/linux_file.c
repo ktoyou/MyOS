@@ -2031,6 +2031,13 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
         return linux_fcntl(fd, (i32)arg1, (u32)arg2);
     case 73: /* flock */
         return linux_flock(fd, (u32)arg1);
+    case 74: /* fsync */
+    case 75: /* fdatasync */ {
+        if (!open_file(fd)) return -EBADF;
+        const struct file_handle *file = file_at(fd);
+        /* Страницы и метаданные временных файлов уже обновлены в памяти. */
+        return file->memfd || (file->directory_path && file->file.writable_directory) ? 0 : -EINVAL;
+    }
     case 77: /* ftruncate */
         return linux_ftruncate(fd, arg1);
     case 80: /* chdir */
