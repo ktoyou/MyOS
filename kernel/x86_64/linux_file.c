@@ -2391,13 +2391,12 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
         return file_stat(&file, memfd, kind_of(file_at(fd)), arg1);
     case 8: /* lseek */
         if (!open_file(fd)) return -EBADF;
-        if (file_at(fd)->file.backing || file_at(fd)->file.dns_server ||
-            (file_at(fd)->file.myfs_ino && !file_at(fd)->directory_path)) {
+        if (kind_of(file_at(fd)) == FILE_REGULAR) {
             struct file_handle *handle = file_at(fd);
             long offset = (long)arg1;
             u32 whence = (u32)arg2;
             if (whence > 2) return -EINVAL;
-            uptr size = handle->file.backing ? handle->file.backing->size : handle->file.size;
+            uptr size = handle->memfd ? handle->memfd->size : handle->file.size;
             if (whence == 2 && handle->file.myfs_ino) {
                 result = linux64_myfs_stat(handle->file.myfs_ino, &file);
                 if (result) return result;
@@ -2427,7 +2426,7 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
             file_at(fd)->offset = (uptr)offset;
             return offset;
         }
-        return kind_of(file_at(fd)) != FILE_REGULAR ? -ESPIPE : -ENOSYS;
+        return -ESPIPE;
     case 16: /* ioctl */
         if (!open_file(fd)) return -EBADF;
         if (is_input(file_at(fd)->device))

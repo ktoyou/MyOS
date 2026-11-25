@@ -34,6 +34,15 @@ static long check_files(void) {
         (stat[3] & 0170000) != 0100000 || stat[6] < 64 ||
         call(17, fd, (word)cross, 1, stat[6]) != 0) return 7;
     word size = stat[6], inode = stat[1];
+    long alias = call(32, fd, 0, 0, 0);
+    if (alias < 0 || call(8, alias, 0, 1, 0) != 5 || call(8, fd, (word)-2, 1, 0) != 3 ||
+        call(0, alias, (word)cross, 1, 0) != 1 || cross[0] != 'F' ||
+        call(8, fd, (word)-1, 2, 0) != (long)size - 1 || call(0, alias, (word)cross, 1, 0) != 1 ||
+        call(8, fd, 2, 1, 0) != (long)size + 2 || call(0, alias, (word)cross, 1, 0) != 0)
+        return 112;
+    if (call(8, fd, 0, 5, 0) != -22 || call(8, fd, (word)-1, 0, 0) != -22 ||
+        call(8, fd, __LONG_MAX__, 1, 0) != -22 || call(8, alias, 0, 1, 0) != (long)size + 2 ||
+        call(8, alias, 0, 0, 0) || call(3, alias, 0, 0, 0)) return 113;
     if (call(5, fd, (word)path, 0, 0) != -14 ||
         call(262, (unsigned)-100, (word)path, (word)stat, 0) ||
         stat[6] != size || stat[1] != inode) return 8;
