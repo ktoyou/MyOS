@@ -32,12 +32,15 @@ def test_disk(image, payload, kernel_end, live_root_header):
 
 
 def boot_x64(directory, name, payload, kernel_end, markers, *, live_root_header=None, cpu='max', rtc=None,
-             screenshot=None, interact=None, extra=(), before_boot=None):
+             screenshot=None, interact=None, extra=(), before_boot=None, root_pci_address=None):
     image = directory / 'disk.img'
     test_disk(image, payload, kernel_end, live_root_header)
+    root_device = 'nvme,drive=root,serial=UEFIX64,bootindex=1'
+    if root_pci_address is not None:
+        root_device += f',addr={root_pci_address:#x}'
     args = uefi_firmware(directory, name) + [
         '-drive', f'if=none,id=root,format=raw,file={image}',
-        '-device', 'nvme,drive=root,serial=UEFIX64,bootindex=1',
+        '-device', root_device,
     ]
     if rtc is not None:
         args += ['-rtc', rtc]
