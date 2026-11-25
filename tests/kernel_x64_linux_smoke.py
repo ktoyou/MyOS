@@ -64,6 +64,26 @@ def check_framebuffer(build):
     print('OVMF: ring-3 /dev/fb0 scanout, framebuffer ABI and I/O bounds: PASS', flush=True)
 
 
+def check_keyboard(build):
+    def send_keys(vm):
+        for marker, key, down in (('PS2 keyboard ready', 'a', True),
+                                  ('PS2 KEY_A down', 'a', False),
+                                  ('PS2 KEY_A up', 'right', True),
+                                  ('PS2 KEY_RIGHT down', 'right', False)):
+            vm.wait(marker)
+            event = {'type': 'key', 'data': {'down': down, 'key': {'type': 'qcode', 'data': key}}}
+            vm.qmp('input-send-event', {'events': [event]})
+
+    payload, kernel_end = image('kernel-linux')
+    root = linux_root((build / 'linux-keyboard.elf').read_bytes(), {})
+    with tempfile.TemporaryDirectory(prefix='myos-linux-keyboard-') as temp:
+        serial = boot_x64(pathlib.Path(temp), 'x64-linux-keyboard', payload, kernel_end,
+                          ['PS2 KEY_RIGHT up', 'Linux x86-64 exit status=0x00'],
+                          live_root_header=root, interact=send_keys)
+    assert 'x86-64 exception' not in serial, serial
+    print('OVMF: PS/2 press and release delivered to ring 3 through evdev read, poll and epoll: PASS', flush=True)
+
+
 def check_shared_elf(build):
     probe = build / 'linux-exec.elf'
     elf = bytearray(probe.read_bytes())
@@ -430,6 +450,7 @@ def main():
     check_interpreter(build)
     check_files(build)
     check_framebuffer(build)
+    check_keyboard(build)
     check_mmap(build)
     check_socket(build)
     check_pipe(build)

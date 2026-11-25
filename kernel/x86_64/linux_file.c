@@ -1,5 +1,6 @@
 #include "linux_task.h"
 #include "linux_fb.h"
+#include "linux_keyboard.h"
 #include "paging.h"
 
 #define NS_PER_SECOND 1000000000ul
@@ -35,7 +36,7 @@ enum {
 enum file_kind {
     FILE_REGULAR, FILE_SOCKET, FILE_PIPE, FILE_PROC_DIR, FILE_PROC_MAP, FILE_NULL, FILE_SERIAL,
     FILE_NAMESPACE, FILE_PROC_LINK, FILE_DIRECTORY, FILE_SYMLINK, FILE_NAMED_SOCKET, FILE_URANDOM,
-    FILE_EVENTFD, FILE_EPOLL, FILE_FRAMEBUFFER,
+    FILE_EVENTFD, FILE_EPOLL, FILE_FRAMEBUFFER, FILE_KEYBOARD,
 };
 #define EVENTFD_MAX ((u64)-2)
 static const struct linux64_file null_file = {.inode = 1};
@@ -146,6 +147,8 @@ static u16 file_ready(const struct file_handle *file) {
     if (file->serial) return LINUX64_POLL_WRITE;
     if (file->pipe) return linux64_pipe_poll(file->pipe, (file->flags & O_ACCMODE) == O_WRONLY);
     if (file->socket) return linux64_socket_poll(file->socket);
+    if (file->device == FILE_KEYBOARD)
+        return linux64_keyboard_ready(file->offset) ? LINUX64_POLL_READ : 0;
     if (file->device == FILE_EVENTFD)
         return (file->event_count ? LINUX64_POLLIN : 0) |
                (file->event_count < EVENTFD_MAX ? LINUX64_POLLOUT : 0);
@@ -165,21 +168,23 @@ static bool epoll_ready(const struct file_handle *file) {
     return false;
 }
 
-static u16 poll_fd(const struct linux64_process *process, i32 fd, u16 events) {
+static u16 poll_fd(const struct linux64_process *process, i32 fd, u16 events, bool *keyboard) {
     if (fd < 0) return 0;
     if (fd >= FD_COUNT) return LINUX64_POLLNVAL;
     const struct file_handle *file = process->fds[fd].file;
     if (!file) return LINUX64_POLLNVAL;
+    if (file->device == FILE_KEYBOARD && (events & LINUX64_POLL_READ)) *keyboard = true;
     return file_ready(file) & (events | LINUX64_POLLERR | LINUX64_POLLHUP);
 }
 
 bool linux64_poll_ready(struct linux64_task *task) {
     struct linux64_poll_wait *poll = &task->poll;
     poll->ready = 0;
+    poll->keyboard = false;
     /* Сохраняем номера, чтобы заново искать файлы после close в соседнем потоке. */
     for (unsigned i = 0; i < poll->count; ++i) {
         struct linux64_pollfd *entry = &poll->entries[i];
-        entry->revents = poll_fd(task->process, entry->fd, entry->events);
+        entry->revents = poll_fd(task->process, entry->fd, entry->events, &poll->keyboard);
         if (entry->revents) ++poll->ready;
     }
     if (poll->ready) return true;
@@ -492,6 +497,11 @@ void linux64_flock_wait_finish(struct linux64_task *task) {
     task->flock_wait.file = NULL;
 }
 
+void linux64_keyboard_wait_finish(struct linux64_task *task) {
+    release_file(task->keyboard_wait.file);
+    task->keyboard_wait.file = NULL;
+}
+
 static bool epoll_expired(const struct linux64_epoll_wait *wait) {
     u64 now;
     return wait->deadline && linux64_monotonic_ns(&now) && now >= wait->deadline;
@@ -499,6 +509,34 @@ static bool epoll_expired(const struct linux64_epoll_wait *wait) {
 
 bool linux64_epoll_wait_ready(const struct linux64_epoll_wait *wait) {
     return epoll_ready(wait->file) || epoll_expired(wait);
+}
+
+bool linux64_epoll_waits_for_keyboard(const struct linux64_epoll_wait *wait) {
+    for (const struct epoll_watch *watch = wait->file->watches; watch; watch = watch->next)
+        if (watch->armed && watch->target->device == FILE_KEYBOARD && (watch->event.events & LINUX64_POLL_READ))
+            return true;
+    return false;
+}
+
+bool linux64_keyboard_wait_ready(const struct linux64_keyboard_wait *wait) {
+    return linux64_keyboard_ready(wait->file->offset);
+}
+
+long linux64_keyboard_wait_resume(void) {
+    const struct linux64_keyboard_wait *wait = &linux64_current->keyboard_wait;
+    long result = linux64_keyboard_read(&wait->file->offset, wait->address, wait->count);
+    if (result == -EAGAIN) linux64_current->state = TASK_KEYBOARD_WAIT;
+    return result;
+}
+
+static long keyboard_read(struct file_handle *file, uptr address, uptr count) {
+    long result = linux64_keyboard_read(&file->offset, address, count);
+    if (result == -EAGAIN && !(file->flags & O_NONBLOCK)) {
+        ++file->references;
+        linux64_current->keyboard_wait = (struct linux64_keyboard_wait){file, address, count};
+        linux64_current->state = TASK_KEYBOARD_WAIT;
+    }
+    return result;
 }
 
 static long epoll_deliver(const struct linux64_epoll_wait *wait) {
@@ -778,6 +816,10 @@ static enum file_kind device_node(const char *path, struct linux64_file *file) {
         *file = (struct linux64_file){.inode = 3, .mode = 0020600, .uid = LINUX64_UID, .gid = LINUX64_GID};
         return FILE_FRAMEBUFFER;
     }
+    if (path_equal(path, "/dev/input/event0", false) && linux64_keyboard_available()) {
+        *file = (struct linux64_file){.inode = 4, .mode = 0020400, .uid = LINUX64_UID, .gid = LINUX64_GID};
+        return FILE_KEYBOARD;
+    }
     return FILE_REGULAR;
 }
 
@@ -834,7 +876,7 @@ bool linux64_special_node(const char *path, struct linux64_file *file) {
         };
         return true;
     }
-    static const char *const dirs[] = {"/dev", "/proc/self", "/proc/self/ns"};
+    static const char *const dirs[] = {"/dev", "/proc/self", "/proc/self/ns", "/dev/input"};
     for (unsigned i = 0; i < sizeof(dirs) / sizeof(*dirs); ++i) {
         if (!path_equal(path, dirs[i], false)) continue;
         *file = (struct linux64_file){.mode = LINUX64_S_IFDIR | 0555, .inode = (1ull << 31) + i};
@@ -937,7 +979,7 @@ static long linux_epoll_ctl(i32 fd, i32 operation, i32 target_fd, uptr address) 
     if (!open_file(fd) || !open_file(target_fd)) return -EBADF;
     struct file_handle *epoll = file_at(fd), *target = file_at(target_fd);
     if (!target->pipe && !target->socket && !target->serial &&
-        target->device != FILE_EVENTFD && target->device != FILE_EPOLL)
+        target->device != FILE_EVENTFD && target->device != FILE_EPOLL && target->device != FILE_KEYBOARD)
         return -EPERM;
     if (epoll->device != FILE_EPOLL || epoll == target) return -EINVAL;
     if (target->device == FILE_EPOLL) return -EOPNOTSUPP;
@@ -1370,6 +1412,7 @@ static long linux_fcntl(i32 fd, i32 command, uptr argument) {
     }
     if (command == F_GETFL) return file_at(fd)->flags;
     if (command == F_SETFL && (file_at(fd)->socket || file_at(fd)->device == FILE_EVENTFD ||
+                              file_at(fd)->device == FILE_KEYBOARD ||
                               file_at(fd)->file.backing)) {
         if (value & O_DIRECT) return -EINVAL;
         const u32 mask = O_APPEND | O_NONBLOCK;
@@ -1590,14 +1633,18 @@ static long linux_open(i32 dirfd, uptr address, u32 flags, u32 mode) {
         if (exclusive) return -EEXIST;
         if (flags & ~(O_ACCMODE | O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC | O_APPEND |
                       O_NONBLOCK | O_LARGEFILE | O_NOFOLLOW | O_CLOEXEC)) return -EINVAL;
-        if (device == FILE_FRAMEBUFFER) {
+        if (device == FILE_FRAMEBUFFER || device == FILE_KEYBOARD) {
             u32 access = flags & O_ACCMODE;
             u32 needed = access == O_RDWR ? 6u : access == O_WRONLY ? 2u : 4u;
             if (needed & ~linux64_file_permissions(&file)) return -EACCES;
         }
         u32 status = flags & ~(O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC);
         result = new_handle(&file, NULL, status | O_LARGEFILE);
-        if (result >= 0) file_at((i32)result)->device = device;
+        if (result >= 0) {
+            struct file_handle *handle = file_at((i32)result);
+            handle->device = device;
+            if (device == FILE_KEYBOARD) handle->offset = linux64_keyboard_cursor();
+        }
         return result;
     }
     enum linux64_proc_node proc = proc_path(absolute);
@@ -1803,6 +1850,7 @@ static long linux_read(i32 fd, uptr buffer, uptr count, uptr offset, bool positi
     if (handle->directory_path) return -EISDIR;
     if (handle->device == FILE_FRAMEBUFFER)
         return framebuffer_io(handle, false, buffer, count, offset, positioned);
+    if (handle->device == FILE_KEYBOARD) return positioned ? -ESPIPE : keyboard_read(handle, buffer, count);
     if (positioned && (handle->device == FILE_EVENTFD || handle->device == FILE_EPOLL)) return -ESPIPE;
     if (handle->device) return device_io(handle, false, buffer, count);
     if (handle->serial) return positioned ? -ESPIPE : -EBADF;
@@ -1922,10 +1970,10 @@ static long file_stat(const struct linux64_file *file, const struct memfd *memfd
         mode = 0020666;
         device = 5;
         rdev = kind == FILE_NULL ? 0x103 : 0x109;
-    } else if (kind == FILE_FRAMEBUFFER) {
+    } else if (kind == FILE_FRAMEBUFFER || kind == FILE_KEYBOARD) {
         mode = file->mode;
         device = 5;
-        rdev = 29u << 8;
+        rdev = kind == FILE_FRAMEBUFFER ? 29u << 8 : (13u << 8) | 64u;
     } else if (kind == FILE_SERIAL) {
         mode = 0020600;
         device = 6;
@@ -1954,7 +2002,7 @@ static long file_stat(const struct linux64_file *file, const struct memfd *memfd
     bool owned = kind == FILE_SOCKET || kind == FILE_PIPE || kind == FILE_PROC_MAP ||
                  kind == FILE_PROC_LINK || memfd;
     bool named = kind == FILE_DIRECTORY || kind == FILE_SYMLINK || kind == FILE_NAMED_SOCKET ||
-                 kind == FILE_FRAMEBUFFER || file->backing;
+                 kind == FILE_FRAMEBUFFER || kind == FILE_KEYBOARD || file->backing;
     uptr size = file->backing ? file->backing->size : file->size;
     const struct linux_stat stat = {
         .dev = device, .ino = file->inode, .nlink = links, .mode = mode,
@@ -2121,7 +2169,7 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
             file_at(fd)->offset = (uptr)offset;
             return offset;
         }
-        if (file_at(fd)->device == FILE_EPOLL) return -ESPIPE;
+        if (file_at(fd)->device == FILE_EPOLL || file_at(fd)->device == FILE_KEYBOARD) return -ESPIPE;
         if (file_at(fd)->device) return (u32)arg2 <= 4 ? 0 : -EINVAL;
         if (file_at(fd)->proc_node == PROC_FDS || file_at(fd)->directory_path) {
             long offset = (long)arg1;
@@ -2135,6 +2183,8 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
         return kind_of(file_at(fd)) != FILE_REGULAR ? -ESPIPE : -ENOSYS;
     case 16: /* ioctl */
         if (!open_file(fd)) return -EBADF;
+        if (file_at(fd)->device == FILE_KEYBOARD)
+            return linux64_keyboard_ioctl(&file_at(fd)->offset, (u32)arg1, arg2);
         return file_at(fd)->device == FILE_FRAMEBUFFER ? linux64_fb_ioctl((u32)arg1, arg2) : -ENOTTY;
     case 17: /* pread64 */
         if ((long)arg3 < 0) return -EINVAL;
@@ -2146,7 +2196,8 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
         if (file_at(fd)->device == FILE_FRAMEBUFFER)
             return framebuffer_io(file_at(fd), true, arg1, arg2, arg3, true);
         if (file_at(fd)->serial || file_at(fd)->socket ||
-            file_at(fd)->device == FILE_EVENTFD || file_at(fd)->device == FILE_EPOLL) return -ESPIPE;
+            file_at(fd)->device == FILE_EVENTFD || file_at(fd)->device == FILE_EPOLL ||
+            file_at(fd)->device == FILE_KEYBOARD) return -ESPIPE;
         return file_at(fd)->device ? device_io(file_at(fd), true, arg1, arg2) : -ENOSYS;
     case 21: /* access */
         if ((u32)arg1 & ~7u) return -EINVAL;
@@ -2154,7 +2205,8 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
         if (result) return result;
         if (kind == FILE_NULL || kind == FILE_URANDOM) return (arg1 & 1u) ? -EACCES : 0;
         if (file.backing) return (arg1 & ~linux64_file_permissions(&file)) ? -EACCES : 0;
-        if (kind == FILE_FRAMEBUFFER) return (arg1 & ~linux64_file_permissions(&file)) ? -EACCES : 0;
+        if (kind == FILE_FRAMEBUFFER || kind == FILE_KEYBOARD)
+            return (arg1 & ~linux64_file_permissions(&file)) ? -EACCES : 0;
         if (kind == FILE_NAMESPACE) {
             if (arg1 & 1u) return -EACCES;
             return (arg1 & 2u) ? -EPERM : 0;
