@@ -298,6 +298,24 @@ def check_pthread(build):
     print('OVMF: Linux pthread TLS, futex, exit and task/process capacity: PASS', flush=True)
 
 
+def check_pthread_preemption(build):
+    probe = (build / 'linux-pthread.elf').resolve()
+    marker = 'Linux ELF64 pthread preemption probe'
+    symbols = subprocess.check_output(['nm', str(probe)], text=True)
+    entry = next(int(line.split()[0], 16) for line in symbols.splitlines()
+                 if line.endswith(' pthread_preemption'))
+    elf = bytearray(probe.read_bytes())
+    struct.pack_into('<Q', elf, 24, entry)
+    host_probe = build / 'linux-pthread-preemption.elf'
+    host_probe.write_bytes(elf)
+    host_probe.chmod(0o755)
+    host = subprocess.run([str(host_probe.resolve())], env={}, capture_output=True, timeout=5)
+    assert (host.returncode, host.stdout, host.stderr) == (0, (marker + '\n').encode(), b''), host
+    serial = check_guest('pthread-preemption', elf, 'Linux x86-64 exit status=0x00')
+    assert marker in serial, serial
+    print('OVMF: Linux pthread preemption and register context preservation: PASS', flush=True)
+
+
 def drop_root():
     if os.geteuid() == 0:
         os.setgroups([])
@@ -481,6 +499,7 @@ def main():
     check_poll(build)
     check_fork(build)
     check_pthread(build)
+    check_pthread_preemption(build)
     check_userns(build)
     check_pidns(build)
     check_netns(build)

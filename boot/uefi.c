@@ -100,16 +100,18 @@ static u32 memory_type(u32 t) {
     if(t==EfiConventionalMemory || t==EfiLoaderCode || t==EfiLoaderData || t==EfiBootServicesCode || t==EfiBootServicesData)return 1;
     return t==EfiACPIReclaimMemory?3:t==EfiACPIMemoryNVS?4:2;
 }
-static BOOLEAN convert_map(void *map,UINTN bytes,UINTN stride,struct boot_info *boot) {
+static BOOLEAN convert_map(void *map,UINTN bytes,UINTN stride,struct boot_info *boot,BOOLEAN kernel64) {
     struct region *out=(void *)(UINTN)boot->map_phys;unsigned count=0;
     if(stride<sizeof(EFI_MEMORY_DESCRIPTOR) || bytes%stride)return FALSE;
     for(UINTN off=0;off<bytes;off+=stride) {
         EFI_MEMORY_DESCRIPTOR *m=(void *)((u8 *)map+off);
         UINT64 base=m->PhysicalStart;
-        if(base>=0x40000000ULL || !m->NumberOfPages)continue;
-        UINT64 size=m->NumberOfPages>0x100000?0x40000000ULL:m->NumberOfPages*4096;
-        if(size>0x40000000ULL-base)size=0x40000000ULL-base;
         u32 type=memory_type(m->Type);
+        /* Таблицы ACPI доступны в начальном отображении x86-64 выше предела аллокатора. */
+        UINT64 limit=(kernel64 && (type==3 || type==4))?0x100000000ULL:0x40000000ULL;
+        if(base>=limit || !m->NumberOfPages)continue;
+        UINT64 pages=(limit-base)/4096;
+        UINT64 size=(m->NumberOfPages<pages?m->NumberOfPages:pages)*4096;
         if(count && out[count-1].base+out[count-1].length==base && out[count-1].type==type)out[count-1].length+=size;
         else {if(count==128)return FALSE;out[count++]=(struct region){base,size,type,1};}
     }
@@ -198,7 +200,7 @@ EFI_STATUS efi_main(EFI_HANDLE image,EFI_SYSTEM_TABLE *st) {
     for(unsigned attempt=0;attempt<4;attempt++) {
         UINTN size=capacity,key,stride;u32 version;
         EFI_STATUS r=services->GetMemoryMap(&size,map,&key,&stride,&version);
-        if(EFI_ERROR(r) || !convert_map(map,size,stride,boot))break;
+        if(EFI_ERROR(r) || !convert_map(map,size,stride,boot,kernel64))break;
         if(!EFI_ERROR(services->ExitBootServices(image,key))) {
             __asm__ volatile("cli; jmp *%0"::"r"(trampoline):"memory");__builtin_unreachable();
         }

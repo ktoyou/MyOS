@@ -15,6 +15,7 @@ static struct worker_slot {
     volatile int parent_tid;
 } workers[MAX_WORKERS + 1];
 static unsigned arrived, gate;
+static unsigned preempt_started, preempt_stop;
 
 extern long clone_thread(word stack_top, volatile int *ptid, volatile unsigned *ctid, const word *fs);
 
@@ -83,6 +84,20 @@ static __attribute__((noreturn)) void finish(word number, long status) {
 static int mode;
 
 __attribute__((noreturn)) void worker(void) {
+    if (mode == 6) {
+        word pattern = 0xc9b087e6543210ful;
+        __asm__ volatile("movq %0,%%xmm0" :: "r"(pattern) : "memory");
+        word rcx, r11, observed;
+        __asm__ volatile("mov %[pattern],%%rcx; mov %[inverse],%%r11\n"
+                         "movl $1,%[started]\n"
+                         "1: pause; cmpl $0,%[stop]; je 1b\n"
+                         "mov %%r11,%[r11]; movq %%xmm0,%[xmm]"
+                         : "=&c"(rcx), [r11] "=&r"(r11), [xmm] "=r"(observed), [started] "=m"(preempt_started)
+                         : [pattern] "r"(pattern), [inverse] "r"(~pattern), [stop] "m"(preempt_stop)
+                         : "r11", "cc", "memory");
+        if (rcx != pattern || observed != pattern || r11 != ~pattern) finish(231, 39);
+        finish(60, 0);
+    }
     if (mode == 5) {
         long start = clock_ns(3), wall = clock_ns(1), now;
         if (start < 0 || wall < 0) finish(231, 35);
@@ -349,6 +364,52 @@ static int check_process_exit(int test_mode) {
     if (call(61, child, (word)&status, 0, 0, 0, 0) != child ||
         status != (test_mode == 1 ? 0 : 23 << 8)) return 13;
     return 0;
+}
+
+__attribute__((naked, noreturn)) static void invalid_stack_loop(void) {
+    __asm__("movabs $0x4000000000000000,%rsp\n1: pause\njmp 1b");
+}
+
+static int check_invalid_irq_return(void) {
+    char system[390];
+    if (simple(63, (word)system)) return 43;
+    if (system[0] != 'M') return 0;
+
+    long child = simple(57, 0);
+    if (!child) {
+        /* Даже установленный обработчик нельзя вызвать с неканоническим RSP. */
+        const word action[4] = {(word)invalid_stack_loop};
+        if (call(13, 11, (word)action, 0, 8, 0, 0)) finish(60, 44);
+        invalid_stack_loop();
+    }
+    int status;
+    if (child < 0 || call(61, child, (word)&status, 0, 0, 0, 0) != child || status != 11) return 45;
+    return 0;
+}
+
+__attribute__((noreturn)) void pthread_preemption(void) {
+    mode = 6;
+    clear_tid = 1;
+    if (clone_thread((word)(stack + sizeof(stack)), &parent_tid, &clear_tid, &tls) <= 0)
+        finish(231, 40);
+    while (!__atomic_load_n(&preempt_started, __ATOMIC_ACQUIRE))
+        __asm__ volatile("pause");
+    /* Потоки должны видеть разные значения XMM0 после переключения по IRQ. */
+    word pattern = 0x543210fedcba9876ul, observed;
+    __asm__ volatile("movq %0,%%xmm0" :: "r"(pattern) : "memory");
+    __atomic_store_n(&preempt_stop, 1, __ATOMIC_RELEASE);
+    while (clear_tid) {
+        long error = futex(&clear_tid, 0x109, 1, -1);
+        if (error && error != -11) finish(231, 41);
+    }
+    __asm__ volatile("movq %%xmm0,%0" : "=r"(observed) :: "memory");
+    if (observed != pattern) finish(231, 42);
+    int status = check_invalid_irq_return();
+    if (status) finish(231, status);
+    static const char marker[] = "Linux ELF64 pthread preemption probe\n";
+    if (call(1, 1, (word)marker, sizeof(marker) - 1, 0, 0, 0) != sizeof(marker) - 1)
+        finish(231, 42);
+    finish(231, 0);
 }
 
 void _start(void) {

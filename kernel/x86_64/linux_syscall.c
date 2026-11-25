@@ -134,13 +134,6 @@ static long linux_sysinfo(uptr address) {
     return paging64_copy_to_user(address, &info, sizeof(info)) == sizeof(info) ? 0 : -14;
 }
 
-__attribute__((noreturn)) void linux64_invalid_return(void) {
-    linux64_task_exception(13);
-    static const char message[] = "Linux x86-64 invalid syscall return\r\n";
-    for (unsigned i = 0; message[i]; ++i) kernel64_serial_char(message[i]);
-    for (;;) __asm__ volatile("cli; hlt");
-}
-
 long linux64_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2,
                     uptr arg3, uptr arg4, uptr arg5) {
     if (number == 7) return linux64_poll(arg0, (u32)arg1, (i32)arg2);

@@ -339,6 +339,11 @@ bool linux64_run(const struct linux64_file *file, const char *path, uptr path_le
     linux64_reset_signals();
     linux64_clock_init();
     linux64_myfs_mount(boot, source);
+    bool preemptive = linux64_timer_init();
+    if (preemptive) linux64_user_rflags |= 1u << 9;
+    const char *timer = preemptive ? "Linux x86-64 LAPIC preemption ready\n" :
+                                    "Linux x86-64 LAPIC preemption unavailable\n";
+    while (*timer) kernel64_serial_char(*timer++);
     linux64_task_clock_resume();
-    segments64_enter_user(entry, stack);
+    segments64_enter_user_flags(entry, stack, linux64_user_rflags);
 }

@@ -906,6 +906,8 @@ static void resume_wait(struct linux64_task *task) {
     }
 }
 
+u64 linux64_user_rflags = 2;
+
 static void schedule(struct linux64_frame *frame) {
     linux64_scm_collect_pending();
     struct linux64_task *old = linux64_current;
@@ -950,6 +952,24 @@ static void schedule(struct linux64_frame *frame) {
     }
     *frame = next->frame;
     linux64_task_clock_resume();
+}
+
+void linux64_task_timer(struct linux64_frame *frame) {
+    linux64_timer_ack();
+    schedule(frame);
+}
+
+void linux64_invalid_return(void) {
+    if (linux64_current->process->pid != LINUX64_PID) {
+        /* Повреждённый кадр IRETQ нельзя передать пользовательскому обработчику. */
+        finish_task(11, true);
+        struct linux64_frame frame;
+        schedule(&frame);
+        linux64_task_resume(&frame);
+    }
+    static const char message[] = "Linux x86-64 invalid syscall return\r\n";
+    for (unsigned i = 0; message[i]; ++i) kernel64_serial_char(message[i]);
+    for (;;) __asm__ volatile("cli; hlt");
 }
 
 void linux64_task_exception(u64 vector) {
