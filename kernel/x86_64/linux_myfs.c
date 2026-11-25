@@ -12,6 +12,7 @@ enum {
 static bool mounted;
 static struct myfs_pin {
     u32 ino, references;
+    struct linux64_inode_locks locks;
     bool orphan;
 } pins[MYFS_PIN_COUNT];
 
@@ -145,6 +146,11 @@ static struct myfs_pin *find_pin(u32 ino) {
     for (unsigned i = 0; i < MYFS_PIN_COUNT; ++i)
         if (pins[i].ino == ino) return &pins[i];
     return NULL;
+}
+
+struct linux64_inode_locks *linux64_myfs_lock_state(u32 ino) {
+    struct myfs_pin *pin = ino ? find_pin(ino) : NULL;
+    return pin ? &pin->locks : NULL;
 }
 
 long linux64_myfs_retain(u32 ino) {

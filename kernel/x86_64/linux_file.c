@@ -70,16 +70,14 @@ static struct memfd {
     u64 inode;
     u32 seals;
     unsigned references;
-    unsigned shared_locks;
-    unsigned record_lock_count;
-    bool exclusive_lock;
+    struct linux64_inode_locks locks;
     bool linked;
 } memfds[OPEN_FILE_COUNT];
 
 struct record_lock_range { long first, last; };
 
 static struct record_lock {
-    struct memfd *backing;
+    struct linux64_inode_locks *locks;
     const struct linux64_process *owner;
     struct record_lock_range range;
     i16 type;
@@ -361,9 +359,16 @@ static void release_backing(struct memfd *backing) {
     backing->size = 0;
 }
 
-static void flock_release(struct file_handle *file) {
-    if (file->flock_mode == LOCK_SH) --file->memfd->shared_locks;
-    if (file->flock_mode == LOCK_EX) file->memfd->exclusive_lock = false;
+static struct linux64_inode_locks *file_locks(const struct file_handle *file) {
+    if (file->memfd) return &file->memfd->locks;
+    if ((file->file.mode & LINUX64_S_IFMT) == LINUX64_S_IFREG)
+        return linux64_myfs_lock_state(file->file.myfs_ino);
+    return NULL;
+}
+
+static void flock_release(struct file_handle *file, struct linux64_inode_locks *locks) {
+    if (file->flock_mode == LOCK_SH) --locks->shared_flocks;
+    if (file->flock_mode == LOCK_EX) locks->exclusive_flock = false;
     file->flock_mode = 0;
 }
 
@@ -413,13 +418,10 @@ static void destroy_file(struct file_handle *file) {
     if (file->pipe) linux64_pipe_close(file->pipe, (file->flags & O_ACCMODE) == O_WRONLY);
     linux64_userns_release(file->proc_ns);
     linux64_pidns_release(file->proc_pid_ns);
+    if (file->flock_mode) flock_release(file, file_locks(file));
     if (file->file.myfs_ino) linux64_myfs_release(file->file.myfs_ino);
     if (file->directory_path) pmm64_free(file->directory_path);
-    struct memfd *memfd = file->memfd;
-    if (memfd) {
-        flock_release(file);
-        release_backing(memfd);
-    }
+    if (file->memfd) release_backing(file->memfd);
     *file = (struct file_handle){0};
 }
 
@@ -476,17 +478,17 @@ static void close_slot(struct linux64_fd_slot *slot) {
 }
 
 static void remove_record_lock(struct record_lock *lock) {
-    --lock->backing->record_lock_count;
-    lock->backing = NULL;
+    --lock->locks->record_count;
+    lock->locks = NULL;
 }
 
 static void close_descriptor(struct linux64_process *owner, unsigned fd) {
     struct linux64_fd_slot *slot = &owner->fds[fd];
-    struct memfd *backing = slot->file ? slot->file->memfd : NULL;
-    if (backing && backing->record_lock_count) {
+    struct linux64_inode_locks *locks = slot->file ? file_locks(slot->file) : NULL;
+    if (locks && locks->record_count) {
         for (unsigned i = 0; i < RECORD_LOCK_COUNT; ++i) {
             struct record_lock *lock = &record_locks[i];
-            if (lock->backing == backing && lock->owner == owner) remove_record_lock(lock);
+            if (lock->locks == locks && lock->owner == owner) remove_record_lock(lock);
         }
     }
     close_slot(slot);
@@ -688,22 +690,27 @@ static bool open_file(i32 fd) {
     return fd >= 0 && fd < FD_COUNT && file_at(fd);
 }
 
-bool linux64_flock_ready(const struct linux64_flock_wait *wait) {
+static bool flock_ready(const struct linux64_flock_wait *wait, const struct linux64_inode_locks *locks) {
     const struct file_handle *file = wait->file;
-    const struct memfd *backing = file->memfd;
-    if (backing->exclusive_lock && file->flock_mode != LOCK_EX) return false;
-    return wait->mode == LOCK_SH || backing->shared_locks == (unsigned)(file->flock_mode == LOCK_SH);
+    if (locks->exclusive_flock && file->flock_mode != LOCK_EX) return false;
+    return wait->mode == LOCK_SH || locks->shared_flocks == (unsigned)(file->flock_mode == LOCK_SH);
+}
+
+bool linux64_flock_ready(const struct linux64_flock_wait *wait) {
+    return flock_ready(wait, file_locks(wait->file));
 }
 
 static long flock_attempt(const struct linux64_flock_wait *wait) {
     struct file_handle *file = wait->file;
+    struct linux64_inode_locks *locks = file_locks(file);
+    if (!locks) return -ENOSYS;
     if (file->flock_mode == wait->mode) return 0;
     /* При смене режима прежняя блокировка снимается даже при конфликте LOCK_NB. */
-    flock_release(file);
+    flock_release(file, locks);
     if (wait->mode == LOCK_UN) return 0;
-    if (!linux64_flock_ready(wait)) return -EAGAIN;
-    if (wait->mode == LOCK_SH) ++file->memfd->shared_locks;
-    else file->memfd->exclusive_lock = true;
+    if (!flock_ready(wait, locks)) return -EAGAIN;
+    if (wait->mode == LOCK_SH) ++locks->shared_flocks;
+    else locks->exclusive_flock = true;
     file->flock_mode = wait->mode;
     return 0;
 }
@@ -719,7 +726,6 @@ static long linux_flock(i32 fd, u32 operation) {
     if (mode != LOCK_SH && mode != LOCK_EX && mode != LOCK_UN) return -EINVAL;
     if (!open_file(fd)) return -EBADF;
     struct file_handle *file = file_at(fd);
-    if (!file->memfd) return -ENOSYS;
     const struct linux64_flock_wait wait = {.file = file, .mode = mode};
     long result = flock_attempt(&wait);
     if (result == -EAGAIN && !(operation & LOCK_NB)) {
@@ -1374,7 +1380,16 @@ static long record_range(const struct file_handle *file, const struct linux_floc
     switch (request->whence) {
     case 0: break;
     case 1: base = (long)file->offset; break;
-    case 2: base = (long)file->memfd->size; break;
+    case 2:
+        if (file->memfd) {
+            base = (long)file->memfd->size;
+        } else {
+            struct linux64_file disk;
+            long result = linux64_myfs_stat(file->file.myfs_ino, &disk);
+            if (result) return result;
+            base = (long)disk.size;
+        }
+        break;
     default: return -EINVAL;
     }
     if (__builtin_add_overflow(base, request->start, &range->first)) return -EOVERFLOW;
@@ -1398,10 +1413,10 @@ static bool ranges_touch(struct record_lock_range a, struct record_lock_range b)
 }
 
 static const struct record_lock *record_conflict(const struct record_lock *request) {
-    if (request->type == F_UNLCK || !request->backing->record_lock_count) return NULL;
+    if (request->type == F_UNLCK || !request->locks->record_count) return NULL;
     for (unsigned i = 0; i < RECORD_LOCK_COUNT; ++i) {
         const struct record_lock *lock = &record_locks[i];
-        if (lock->backing == request->backing && lock->owner != request->owner &&
+        if (lock->locks == request->locks && lock->owner != request->owner &&
             (lock->type == F_WRLCK || request->type == F_WRLCK) &&
             ranges_overlap(lock->range, request->range)) return lock;
     }
@@ -1413,7 +1428,7 @@ static long replace_record_lock(struct record_lock request) {
         /* Соседние диапазоны одного владельца и типа уже объединены. */
         for (unsigned i = 0; i < RECORD_LOCK_COUNT; ++i) {
             const struct record_lock *lock = &record_locks[i];
-            if (lock->backing != request.backing || lock->owner != request.owner ||
+            if (lock->locks != request.locks || lock->owner != request.owner ||
                 lock->type != request.type || !ranges_touch(lock->range, request.range)) continue;
             if (lock->range.first < request.range.first) request.range.first = lock->range.first;
             if (lock->range.last > request.range.last) request.range.last = lock->range.last;
@@ -1425,9 +1440,9 @@ static long replace_record_lock(struct record_lock request) {
     if (request.type != F_UNLCK) pieces[count++] = request;
     for (unsigned i = 0; i < RECORD_LOCK_COUNT; ++i) {
         const struct record_lock *lock = &record_locks[i];
-        if (!lock->backing) {
+        if (!lock->locks) {
             ++available;
-        } else if (lock->backing == request.backing && lock->owner == request.owner &&
+        } else if (lock->locks == request.locks && lock->owner == request.owner &&
                    ranges_overlap(lock->range, request.range)) {
             ++available;
             /* У непересекающихся диапазонов остаётся не более двух краёв. */
@@ -1444,25 +1459,26 @@ static long replace_record_lock(struct record_lock request) {
     if (available < count) return -ENOLCK;
     for (unsigned i = 0; i < RECORD_LOCK_COUNT; ++i) {
         struct record_lock *lock = &record_locks[i];
-        if (lock->backing == request.backing && lock->owner == request.owner &&
+        if (lock->locks == request.locks && lock->owner == request.owner &&
             ranges_overlap(lock->range, request.range)) remove_record_lock(lock);
     }
     for (unsigned i = 0, added = 0; i < RECORD_LOCK_COUNT && added < count; ++i) {
-        if (record_locks[i].backing) continue;
+        if (record_locks[i].locks) continue;
         record_locks[i] = pieces[added++];
-        ++request.backing->record_lock_count;
+        ++request.locks->record_count;
     }
     return 0;
 }
 
 static long linux_record_lock(const struct file_handle *file, i32 command, uptr address) {
-    if (!file->memfd) return -EINVAL;
+    struct linux64_inode_locks *locks = file_locks(file);
+    if (!locks) return -EINVAL;
     struct linux_flock_record input;
     if (paging64_copy_from_user(&input, address, sizeof(input)) != sizeof(input)) return -EFAULT;
     if (input.type != F_RDLCK && input.type != F_WRLCK &&
         (input.type != F_UNLCK || command == F_GETLK)) return -EINVAL;
     const struct linux64_process *owner = linux64_current->process;
-    struct record_lock request = {.backing = file->memfd, .owner = owner, .type = input.type};
+    struct record_lock request = {.locks = locks, .owner = owner, .type = input.type};
     long result = record_range(file, &input, &request.range);
     if (result) return result;
     if (command == F_SETLK) {
