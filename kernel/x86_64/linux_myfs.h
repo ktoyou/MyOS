@@ -4,6 +4,12 @@
 #include "linux.h"
 
 struct boot_info;
+
+/* Состояние inode общее для независимых открытий, а режим flock хранится в каждом OFD. */
+struct linux64_inode_locks {
+    unsigned shared_flocks, record_count;
+    bool exclusive_flock;
+};
 #define LINUX64_MYFS_MOUNT "/profile"
 #define LINUX64_MYFS_ROOT 1u
 
@@ -24,5 +30,6 @@ long linux64_myfs_truncate(u32 ino, uptr size);
 long linux64_myfs_sync(void);
 long linux64_myfs_retain(u32 ino);
 void linux64_myfs_release(u32 ino);
+struct linux64_inode_locks *linux64_myfs_lock_state(u32 ino);
 
 #endif

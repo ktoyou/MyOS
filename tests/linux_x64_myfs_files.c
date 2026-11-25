@@ -2,13 +2,15 @@ typedef unsigned long word;
 
 enum {
     SYS_READ = 0, SYS_WRITE = 1, SYS_CLOSE = 3, SYS_FSTAT = 5, SYS_PREAD = 17,
-    SYS_EXIT = 60, SYS_FSYNC = 74, SYS_FDATASYNC = 75, SYS_GETCWD = 79, SYS_CHDIR = 80, SYS_UMASK = 95,
+    SYS_PIPE = 22, SYS_DUP = 32, SYS_GETPID = 39, SYS_FORK = 57, SYS_EXIT = 60, SYS_WAIT4 = 61,
+    SYS_FCNTL = 72, SYS_FLOCK = 73, SYS_FSYNC = 74, SYS_FDATASYNC = 75, SYS_GETCWD = 79, SYS_CHDIR = 80, SYS_UMASK = 95,
     SYS_GETDENTS64 = 217, SYS_OPENAT = 257, SYS_MKDIRAT = 258, SYS_STATAT = 262, SYS_UNLINKAT = 263, SYS_RENAMEAT = 264,
     SYS_SYMLINKAT = 266, SYS_READLINKAT = 267,
     AT_FDCWD = -100, AT_SYMLINK_NOFOLLOW = 0x100, O_RDONLY = 0, O_RDWR = 2,
     O_CREAT = 0100, O_EXCL = 0200, O_DIRECTORY = 0200000, O_NOFOLLOW = 0400000,
-    EACCES = 13, ENOENT = 2, EEXIST = 17, EXDEV = 18, ENOTDIR = 20, EISDIR = 21, ELOOP = 40,
+    ENOENT = 2, EAGAIN = 11, EACCES = 13, EEXIST = 17, EXDEV = 18, ENOTDIR = 20, EISDIR = 21, ELOOP = 40,
     DT_DIR = 4, DT_REG = 8, DT_LNK = 10, PAYLOAD_BYTES = 9728, PATH_LIMIT = 4096, DEEP_LEVELS = 36,
+    F_GETLK = 5, F_SETLK = 6, F_RDLCK = 0, F_WRLCK = 1, F_UNLCK = 2, LOCK_EX = 2, LOCK_NB = 4, SEEK_END = 2,
 };
 
 struct file_stat {
@@ -26,9 +28,17 @@ struct directory_entry {
     char name[];
 };
 
+struct file_lock {
+    short type, whence;
+    long start, length;
+    int pid;
+};
+
 _Static_assert(sizeof(struct file_stat) == 144 && __builtin_offsetof(struct file_stat, size) == 48,
                "Linux x86-64 stat ABI");
 _Static_assert(__builtin_offsetof(struct directory_entry, name) == 19, "Linux x86-64 linux_dirent64 ABI");
+_Static_assert(sizeof(struct file_lock) == 32 && __builtin_offsetof(struct file_lock, pid) == 24,
+               "Linux x86-64 flock ABI");
 
 static const char draft[] = "draft", final_dir[] = "Default";
 static const char current[] = "Preferences", temporary[] = "Preferences.tmp";
@@ -60,6 +70,40 @@ static long stat_fd(long fd, struct file_stat *info) {
 
 static long close_fd(long fd) {
     return call(SYS_CLOSE, fd, 0, 0, 0);
+}
+
+static __attribute__((noreturn)) void finish(int status) {
+    call(SYS_EXIT, status, 0, 0, 0);
+    __builtin_trap();
+}
+
+static int child_passed(long child) {
+    int status;
+    return child > 0 && call(SYS_WAIT4, child, (word)&status, 0, 0) == child && !status;
+}
+
+static long set_record_at(long fd, short type, short whence, long start, long length) {
+    struct file_lock lock = {.type = type, .whence = whence, .start = start, .length = length};
+    return call(SYS_FCNTL, fd, F_SETLK, (word)&lock, 0);
+}
+
+static long set_record(long fd, short type, long start, long length) {
+    return set_record_at(fd, type, 0, start, length);
+}
+
+static long get_record(long fd, long start, long length, struct file_lock *lock) {
+    *lock = (struct file_lock){.type = F_WRLCK, .start = start, .length = length};
+    return call(SYS_FCNTL, fd, F_GETLK, (word)lock, 0);
+}
+
+static int record_matches(long fd, long start, long length, short type, long owner) {
+    struct file_lock lock;
+    if (get_record(fd, start, length, &lock) || lock.type != type) return 0;
+    return type == F_UNLCK || (!lock.whence && lock.start == 4 && lock.length == 8 && lock.pid == owner);
+}
+
+static long flock_exclusive(long fd) {
+    return call(SYS_FLOCK, fd, LOCK_EX | LOCK_NB, 0, 0);
 }
 
 static int same_bytes(const void *data, const void *expected, word size) {
@@ -142,6 +186,58 @@ static int check_deep_path(long parent, int create) {
     return 0;
 }
 
+static int check_live_locks(long directory) {
+    long posix = open_at(directory, current, O_RDWR, 0);
+    long bsd = open_at(directory, current, O_RDWR, 0);
+    long alias = open_at(directory, link_name, O_RDWR, 0);
+    long owner = call(SYS_GETPID, 0, 0, 0, 0);
+    if (posix < 0 || bsd < 0 || alias < 0 || owner <= 0 || set_record(posix, F_WRLCK, 4, 8) ||
+        flock_exclusive(bsd) || flock_exclusive(alias) != -EAGAIN) return 34;
+
+    long child = call(SYS_FORK, 0, 0, 0, 0);
+    if (!child) {
+        finish(!record_matches(alias, 8, 1, F_WRLCK, owner) || !record_matches(alias, 12, 1, F_UNLCK, 0) ||
+               set_record(alias, F_WRLCK, 11, 2) != -EAGAIN || set_record(alias, F_WRLCK, 12, 1) ||
+               set_record(alias, F_UNLCK, 12, 1) || flock_exclusive(bsd) || flock_exclusive(alias) != -EAGAIN);
+    }
+    if (!child_passed(child) || close_fd(alias)) return 35;
+
+    long duplicate = call(SYS_DUP, bsd, 0, 0, 0);
+    if (duplicate < 0 || close_fd(bsd) || flock_exclusive(posix) != -EAGAIN) return 36;
+    int gate[2];
+    if (call(SYS_PIPE, (word)gate, 0, 0, 0)) return 37;
+    child = call(SYS_FORK, 0, 0, 0, 0);
+    if (!child) {
+        char ready;
+        if (close_fd(gate[1]) || call(SYS_READ, gate[0], (word)&ready, 1, 0) != 1 || ready != 'g' ||
+            !record_matches(posix, 4, 8, F_UNLCK, 0) || set_record(posix, F_WRLCK, 4, 8) ||
+            flock_exclusive(posix) != -EAGAIN || close_fd(duplicate)) finish(1);
+        long reopened = open_at(directory, current, O_RDWR, 0);
+        finish(reopened < 0 || flock_exclusive(reopened));
+    }
+    /* Родитель закрыл все ссылки на flock; последняя копия остаётся у потомка до сигнала. */
+    if (child < 0 || close_fd(gate[0]) || close_fd(duplicate) || flock_exclusive(posix) != -EAGAIN ||
+        call(SYS_WRITE, gate[1], (word)"g", 1, 0) != 1 || close_fd(gate[1]) || !child_passed(child)) return 38;
+
+    /* Выход процесса освобождает обе блокировки; второй запуск открывает тот же inode. */
+    if (flock_exclusive(posix) || set_record(posix, F_WRLCK, 4, 8)) return 39;
+    return 0;
+}
+
+static int check_profile_locks(long parent, int first_boot) {
+    long directory = open_at(parent, final_dir, O_RDONLY | O_DIRECTORY, 0);
+    if (directory < 0) return 40;
+    if (first_boot) {
+        int status = check_live_locks(directory);
+        if (status) return status;
+    } else {
+        long fd = open_at(directory, current, O_RDONLY, 0);
+        if (fd < 0 || !record_matches(fd, 4, 8, F_UNLCK, 0) || set_record(fd, F_RDLCK, 4, 8) ||
+            flock_exclusive(fd) || close_fd(fd)) return 41;
+    }
+    return close_fd(directory) ? 42 : 0;
+}
+
 static int directory_entries_match(long directory) {
     static const struct { const char *name; word size; unsigned char type; } expected[] = {
         {".", sizeof("."), DT_DIR}, {"..", sizeof(".."), DT_DIR},
@@ -189,6 +285,27 @@ static int invalid_renames(long parent, long directory) {
     return 0;
 }
 
+static int check_replaced_locks(long directory, long previous, long old_observer, long replacement) {
+    long fresh = open_at(directory, current, O_RDONLY, 0);
+    if (fresh < 0 || flock_exclusive(old_observer) != -EAGAIN || flock_exclusive(fresh) ||
+        flock_exclusive(replacement) != -EAGAIN) return 44;
+
+    long owner = call(SYS_GETPID, 0, 0, 0, 0);
+    long child = call(SYS_FORK, 0, 0, 0, 0);
+    if (!child) {
+        const long start = sizeof(old_contents) - 3;
+        struct file_lock lock;
+        finish(get_record(old_observer, start, 1, &lock) || lock.type != F_WRLCK || lock.whence ||
+               lock.start != start || lock.length != 1 || lock.pid != owner);
+    }
+    if (owner <= 0 || !child_passed(child)) return 45;
+
+    /* Освобождение последней ссылки на старый flock не затрагивает новый inode. */
+    if (close_fd(previous) || flock_exclusive(old_observer) || close_fd(old_observer) ||
+        flock_exclusive(replacement) != -EAGAIN || close_fd(fresh)) return 46;
+    return 0;
+}
+
 static int verify_profile(long parent) {
     long directory = open_at(parent, final_dir, O_RDONLY | O_DIRECTORY, 0);
     struct file_stat info, alias;
@@ -229,10 +346,13 @@ static int write_profile(long parent) {
 
     /* Новый файл создаётся через дескриптор каталога, открытый до rename. */
     long previous = open_at(directory, current, create, 0666);
+    long old_observer = open_at(directory, current, O_RDWR, 0);
     long replacement = open_at(directory, temporary, create, 0666);
-    if (previous < 0 || replacement < 0 || call(SYS_UMASK, mask, 0, 0, 0) != 0077 ||
+    if (previous < 0 || old_observer < 0 || replacement < 0 || call(SYS_UMASK, mask, 0, 0, 0) != 0077 ||
         call(SYS_WRITE, previous, (word)old_contents, sizeof(old_contents) - 1, 0) != sizeof(old_contents) - 1 ||
         call(SYS_FSYNC, previous, 0, 0, 0) || stat_fd(previous, &old) || stat_fd(replacement, &next)) return 9;
+    if (flock_exclusive(previous) || flock_exclusive(old_observer) != -EAGAIN ||
+        set_record_at(old_observer, F_WRLCK, SEEK_END, -2, 1)) return 43;
     for (unsigned i = 0; i < PAYLOAD_BYTES; ++i) buffer[i] = pattern(i);
     if (call(SYS_WRITE, replacement, (word)buffer, PAYLOAD_BYTES, 0) != PAYLOAD_BYTES ||
         call(SYS_FDATASYNC, replacement, 0, 0, 0) || !contents_match(replacement) ||
@@ -249,7 +369,9 @@ static int write_profile(long parent) {
         call(SYS_SYMLINKAT, (word)"different", directory, (word)lock_name, 0) != -EEXIST) return 12;
     int invalid = invalid_renames(parent, directory);
     if (invalid) return invalid;
-    if (close_fd(previous) || close_fd(replacement) || call(SYS_FSYNC, directory, 0, 0, 0) ||
+    int locks = check_replaced_locks(directory, previous, old_observer, replacement);
+    if (locks) return locks;
+    if (close_fd(replacement) || call(SYS_FSYNC, directory, 0, 0, 0) ||
         call(SYS_FSYNC, parent, 0, 0, 0) || close_fd(directory)) return 13;
     return 0;
 }
@@ -266,6 +388,7 @@ void _start(void) {
         if (!status && phase == '1') status = write_profile(parent);
         if (!status) status = verify_profile(parent);
         if (!status) status = check_deep_path(parent, phase == '1');
+        if (!status) status = check_profile_locks(parent, phase == '1');
         if (!status && close_fd(parent)) status = 3;
         if (!status) {
             static const char wrote[] = "Linux MyFS guest wrote profile PASS\n";
@@ -275,6 +398,5 @@ void _start(void) {
             if (call(SYS_WRITE, 1, (word)message, length, 0) != (long)length) status = 24;
         }
     }
-    call(SYS_EXIT, status, 0, 0, 0);
-    __builtin_trap();
+    finish(status);
 }
