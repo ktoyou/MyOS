@@ -35,6 +35,9 @@ extern bool net64_check(void);
 #ifdef X64_TEST_NVME
 extern bool nvme64_check(const struct boot_info *boot);
 #endif
+#ifdef X64_TEST_MYFS
+extern bool myfs64_check(const struct boot_info *boot);
+#endif
 
 struct idt_gate {
     u16 offset_low, selector;
@@ -407,6 +410,11 @@ __attribute__((noreturn)) void kernel64_main(const struct boot_info *boot, u32 e
 #ifdef X64_TEST_NVME
     linux64_clock_init();
     serial_puts(nvme64_check(boot) ? "x86-64 NVMe data PASS\n" : "x86-64 NVMe data FAIL\n");
+    halt();
+#endif
+#ifdef X64_TEST_MYFS
+    linux64_clock_init();
+    serial_puts(myfs64_check(boot) ? "x86-64 MyFS data PASS\n" : "x86-64 MyFS data FAIL\n");
     halt();
 #endif
 #ifdef X64_TEST_LINUX
