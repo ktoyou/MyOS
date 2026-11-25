@@ -87,6 +87,8 @@ long linux64_mprotect(uptr address, uptr length, uptr protection);
 long linux64_munmap(uptr address, uptr length);
 long linux64_madvise(uptr address, uptr length, i32 advice);
 uptr linux64_random_bytes(void *buffer, uptr length);
+bool linux64_net_init(void);
+bool linux64_net_poll(void);
 long linux64_getrandom(uptr address, uptr length, u32 flags);
 void linux64_clock_init(void);
 bool linux64_monotonic_ns(u64 *nanos);

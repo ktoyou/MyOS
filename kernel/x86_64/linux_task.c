@@ -689,7 +689,7 @@ static struct linux64_task *pick_task(const struct linux64_task *current) {
     unsigned index = (unsigned)(current - tasks);
     bool timed;
     do {
-        timed = false;
+        timed = linux64_net_poll();
         for (unsigned i = 1; i <= LINUX64_TASK_COUNT; ++i) {
             struct linux64_task *candidate = &tasks[(index + i) % LINUX64_TASK_COUNT];
             if (candidate->state == TASK_RUNNABLE ||
