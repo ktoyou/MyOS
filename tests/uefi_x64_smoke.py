@@ -32,7 +32,7 @@ def test_disk(image, payload, kernel_end, live_root_header):
 
 
 def boot_x64(directory, name, payload, kernel_end, markers, *, live_root_header=None, cpu='max', rtc=None,
-             screenshot=None, interact=None):
+             screenshot=None, interact=None, extra=(), before_boot=None):
     image = directory / 'disk.img'
     test_disk(image, payload, kernel_end, live_root_header)
     args = uefi_firmware(directory, name) + [
@@ -41,9 +41,15 @@ def boot_x64(directory, name, payload, kernel_end, markers, *, live_root_header=
     ]
     if rtc is not None:
         args += ['-rtc', rtc]
+    args.extend(extra)
+    if before_boot is not None:
+        args.append('-S')
     vm = VM(name, args, binary='qemu-system-x86_64', cpu=cpu)
     vm.boot_timeout = 45
     try:
+        if before_boot is not None:
+            before_boot(vm)
+            vm.qmp('cont')
         vm.wait('UEFI: leaving boot services, entering x86-64 kernel')
         if interact is not None:
             interact(vm)

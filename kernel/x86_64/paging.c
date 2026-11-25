@@ -22,9 +22,12 @@
 #define EFER_MSR      0xc0000080u
 #define EFER_NXE      (1u << 11)
 #define PAT_MSR       0x277u
+#define MMIO_BASE     0xffffc10000000000ul
+#define MMIO_SPAN     (1ul << 39)
 
 extern const u8 _start[], __text_end[], __rodata_end[], __kernel_end[];
 static uptr live_first, live_end;
+static uptr framebuffer_first, framebuffer_end;
 
 static bool nx_supported(void) {
     u32 eax = 0x80000000u, ebx, ecx, edx;
@@ -132,6 +135,8 @@ bool paging64_init(const struct boot_info *boot, const struct gop64_framebuffer 
     uptr previous;
     __asm__ volatile("mov %%cr3,%0" : "=r"(previous));
     if (!nx_supported()) return false;
+    framebuffer_first = fb->physical;
+    framebuffer_end = fb->physical + fb->page_bytes;
     if (boot->root_phys && boot->root_phys < BOOT_MEMORY_LIMIT &&
         boot->root_bytes <= BOOT_MEMORY_LIMIT - boot->root_phys) {
         live_first = boot->root_phys;
@@ -234,6 +239,39 @@ static void prune_empty_tables(uptr root, uptr address) {
         pmm64_free(physical);
         table = (void *)((uptr)entry & ~(PMM_PAGE_SIZE - 1ul));
     }
+}
+
+void paging64_unmap_mmio(volatile void *mapping, uptr bytes) {
+    uptr start = (uptr)mapping;
+    if (start < MMIO_BASE || start - MMIO_BASE >= MMIO_SPAN || bytes > MMIO_SPAN - (start - MMIO_BASE) ||
+        ((start | bytes) & (PMM_PAGE_SIZE - 1))) return;
+    uptr root = paging64_active_root();
+    while (bytes) {
+        bytes -= PMM_PAGE_SIZE;
+        uptr address = start + bytes;
+        u64 *leaf = find_leaf(root, address);
+        if (!leaf || !*leaf) continue;
+        *leaf = 0;
+        invalidate(address);
+        prune_empty_tables(root, address);
+    }
+}
+
+volatile void *paging64_map_mmio(uptr physical, uptr bytes) {
+    /* Нижний диапазон может иметь кешируемый псевдоним в прямом отображении. */
+    if (physical < BOOT_MEMORY_LIMIT || physical >= MMIO_SPAN || !bytes ||
+        bytes > MMIO_SPAN - physical || ((physical | bytes) & (PMM_PAGE_SIZE - 1)) ||
+        (physical < framebuffer_end && framebuffer_first < physical + bytes)) return NULL;
+    u64 flags;
+    if (!uncached_flags(&flags)) return NULL;
+    uptr root = paging64_active_root(), start = MMIO_BASE + physical;
+    for (uptr mapped = 0; mapped < bytes; mapped += PMM_PAGE_SIZE) {
+        if (!map_page(root, start + mapped, physical + mapped, flags | WRITE | NO_EXECUTE)) {
+            paging64_unmap_mmio((volatile void *)start, mapped);
+            return NULL;
+        }
+    }
+    return (volatile void *)start;
 }
 
 static void set_alias_write(uptr root, uptr physical, bool writable) {

@@ -1,10 +1,9 @@
 #include "paging.h"
 #include "framebuffer.h"
-#ifdef X64_TEST_LINUX
-#include "linux_fb.h"
-#endif
 #include "segments.h"
 #ifdef X64_TEST_LINUX
+#include "e1000.h"
+#include "linux_fb.h"
 #include "linux.h"
 #endif
 
@@ -27,6 +26,9 @@ extern bool ring3_check(unsigned mode);
 #endif
 #ifdef X64_TEST_GOP
 extern bool gop64_check(const struct boot_info *boot, const struct gop64_framebuffer *fb);
+#endif
+#ifdef X64_TEST_ETHERNET
+extern bool e1000_check(void);
 #endif
 
 struct idt_gate {
@@ -391,7 +393,11 @@ __attribute__((noreturn)) void kernel64_main(const struct boot_info *boot, u32 e
 #ifdef X64_TEST_RING3
     if (!ring3_check(X64_TEST_RING3)) serial_puts("x86-64 ring3 FAIL\n");
 #endif
+#ifdef X64_TEST_ETHERNET
+    serial_puts(e1000_check() ? "x86-64 e1000 ARP PASS\n" : "x86-64 e1000 ARP FAIL\n");
+#endif
 #ifdef X64_TEST_LINUX
+    if (e1000_init()) serial_puts("MyOS x86-64: e1000 Ethernet ready\n");
     linux64_fb_init(&fb.surface);
     linux_test_boot(boot->root_phys, boot->root_bytes);
     serial_puts("Linux x86-64 ELF rejected\n");

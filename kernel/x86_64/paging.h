@@ -6,6 +6,9 @@
 #define X64_USER_TOP 0x0000800000000000ul
 
 bool paging64_init(const struct boot_info *boot, const struct gop64_framebuffer *fb);
+/* Отображения устройств создаются до первого пользовательского CR3. */
+volatile void *paging64_map_mmio(uptr physical, uptr bytes);
+void paging64_unmap_mmio(volatile void *mapping, uptr bytes);
 uptr paging64_active_root(void);
 void paging64_switch_root(uptr root);
 uptr paging64_fork_root(void);
