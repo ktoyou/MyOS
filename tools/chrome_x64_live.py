@@ -21,6 +21,7 @@ REPO = Path(__file__).resolve().parents[1]
 CHROME_GUEST = '/opt/google/chrome'
 CHROME_ML_LIBRARY = 'liboptimization_guide_internal.so'
 CHROME_ML_ASSETS = (CHROME_ML_LIBRARY, 'libLiteRtWebGpuAccelerator.so')
+CHROME_VM_MEMORY = '1280M'
 LAUNCHER_GUEST = '/myos/chrome-launch'
 URL_GUEST = '/myos/chrome-url'
 PROFILE_TOKEN_GUEST = '/myos/myfs-volume'
@@ -276,7 +277,7 @@ def run_image(image: Path, headless: bool, profile: Path | None = None) -> None:
         copy = Path(directory) / 'vars.fd'
         shutil.copyfile(variables, copy)
         subprocess.run((
-            'qemu-system-x86_64', '-machine', 'q35', '-cpu', 'max', '-m', '1024M', '-no-reboot',
+            'qemu-system-x86_64', '-machine', 'q35', '-cpu', 'max', '-m', CHROME_VM_MEMORY, '-no-reboot',
             '-display', 'none' if headless else 'gtk', '-serial', 'stdio', '-monitor', 'none',
             '-fw_cfg', 'name=opt/ovmf/X-PciMmio64Mb,string=0',
             '-drive', f'if=pflash,format=raw,unit=0,readonly=on,file={qemu_path(code)}',

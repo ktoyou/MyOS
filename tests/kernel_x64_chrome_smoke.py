@@ -26,7 +26,7 @@ from uefi_x64_smoke import VM, clean
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / 'tools'))
 import make_uefi
-from chrome_x64_live import CHROME_ML_LIBRARY, chrome_files, firmware, make_image, qemu_path
+from chrome_x64_live import CHROME_ML_LIBRARY, CHROME_VM_MEMORY, chrome_files, firmware, make_image, qemu_path
 
 
 HOST = 'chrome-https.test'
@@ -197,7 +197,7 @@ def examine_browser(directory, run_name, disk, certificate, key, trusted, artifa
             vm = VM(run_name, firmware_args(directory) + [
                 '-S', '-drive', f'if=none,id=root,format=raw,file={qemu_path(disk)}',
                 '-device', 'nvme,drive=root,serial=UEFIX64,bootindex=1', *args,
-            ], memory='1024M', binary='qemu-system-x86_64', cpu='max')
+            ], memory=CHROME_VM_MEMORY, binary='qemu-system-x86_64', cpu='max')
             try:
                 with ExitStack() as stack:
                     peers = [connect(stack, path) for path in (egress, forward, injector)]

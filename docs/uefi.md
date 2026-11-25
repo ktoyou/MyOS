@@ -84,7 +84,7 @@ make kernel-x64-chrome-run CHROME_BIN=/path/to/chrome/opt/google/chrome/chrome
 ```
 
 Результат сборки — `build/x86_64/myos-chrome.img`. Цель запуска загружает
-его в QEMU и открывает Chrome на Wayland. Начальную страницу можно выбрать
+его в QEMU с 1280 МиБ RAM и открывает Chrome на Wayland. Начальную страницу можно выбрать
 через `CHROME_URL`, например `CHROME_URL=about:blank`. Для пользовательской
 прошивки задайте переменные окружения `OVMF_CODE` и `OVMF_VARS` из одной
 поставки OVMF.
