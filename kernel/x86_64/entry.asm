@@ -73,10 +73,14 @@ exception_entry:
 
 global segments64_enter_user
 segments64_enter_user:
-    ; SS:RSP и CS:RIP берутся из кадра IRETQ, IOPL и IF сброшены.
+    mov edx,2
+
+global segments64_enter_user_flags
+segments64_enter_user_flags:
+    ; Начальные флаги задаёт ядро, IOPL остаётся сброшенным.
     push qword 0x1b
     push rsi
-    push qword 2
+    push rdx
     push qword 0x23
     push rdi
     mov ax,0x1b

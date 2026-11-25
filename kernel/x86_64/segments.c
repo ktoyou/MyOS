@@ -16,7 +16,7 @@ _Static_assert(sizeof(struct tss64) == 104, "x86-64 TSS layout");
 _Static_assert(sizeof(struct gdtr64) == 10, "x86-64 GDTR layout");
 
 static struct tss64 tss;
-static _Alignas(4096) u8 entry_stack[16384];
+static _Alignas(4096) u8 entry_stack[32768];
 static u64 gdt[] = {
     0,
     0x00af9a000000ffffull, /* 0x08: код ядра, также используется IDT. */

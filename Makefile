@@ -1597,7 +1597,7 @@ X64_MYFS := $(X64BUILD)/storage-block.o $(X64BUILD)/storage-myfs.o $(X64BUILD)/s
 X64_LINUX_RUNTIME := $(X64BUILD)/linux_elf.o \
     $(X64BUILD)/linux_syscall.o $(X64BUILD)/linux_file.o $(X64BUILD)/linux_fb.o \
     $(X64BUILD)/linux_input.o $(X64BUILD)/linux_mmap.o $(X64BUILD)/linux_random.o \
-    $(X64BUILD)/linux_time.o $(X64BUILD)/linux_signal.o $(X64BUILD)/linux_socket.o \
+    $(X64BUILD)/linux_time.o $(X64BUILD)/linux_timer.o $(X64BUILD)/acpi-smp.o $(X64BUILD)/linux_signal.o $(X64BUILD)/linux_socket.o \
     $(X64BUILD)/linux_pipe.o $(X64BUILD)/linux_userns.o $(X64BUILD)/linux_pidns.o $(X64BUILD)/linux_netns.o \
     $(X64BUILD)/linux_vfs.o $(X64BUILD)/linux_seccomp.o $(X64BUILD)/linux_seccomp_bpf.o \
     $(X64BUILD)/linux_task.o $(X64BUILD)/linux-entry.o $(X64BUILD)/linux_myfs.o $(X64BUILD)/linux-myfs-mmap.o
@@ -1700,7 +1700,7 @@ $(X64BUILD)/storage-string.o: kernel/string.c kernel/string.h kernel/types.h | $
 	$(CC) $(X64CFLAGS) -c $< -o $@
 $(X64BUILD)/nvme-check.o: tests/kernel_x64_nvme_check.c kernel/nvme.h $(X64_HEADERS) | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
-$(X64BUILD)/linux_elf.o $(X64BUILD)/linux_syscall.o $(X64BUILD)/linux_file.o $(X64BUILD)/linux_fb.o $(X64BUILD)/linux_mmap.o $(X64BUILD)/linux_random.o $(X64BUILD)/linux_time.o $(X64BUILD)/linux_signal.o $(X64BUILD)/linux_socket.o $(X64BUILD)/linux_pipe.o $(X64BUILD)/linux_userns.o $(X64BUILD)/linux_pidns.o $(X64BUILD)/linux_netns.o $(X64BUILD)/linux_vfs.o $(X64BUILD)/linux_seccomp.o $(X64BUILD)/linux_seccomp_bpf.o $(X64BUILD)/linux_task.o: $(X64BUILD)/%.o: kernel/x86_64/%.c kernel/x86_64/linux.h kernel/x86_64/linux_task.h $(X64_HEADERS) | $(X64BUILD)
+$(X64BUILD)/linux_elf.o $(X64BUILD)/linux_syscall.o $(X64BUILD)/linux_file.o $(X64BUILD)/linux_fb.o $(X64BUILD)/linux_mmap.o $(X64BUILD)/linux_random.o $(X64BUILD)/linux_time.o $(X64BUILD)/linux_timer.o $(X64BUILD)/linux_signal.o $(X64BUILD)/linux_socket.o $(X64BUILD)/linux_pipe.o $(X64BUILD)/linux_userns.o $(X64BUILD)/linux_pidns.o $(X64BUILD)/linux_netns.o $(X64BUILD)/linux_vfs.o $(X64BUILD)/linux_seccomp.o $(X64BUILD)/linux_seccomp_bpf.o $(X64BUILD)/linux_task.o: $(X64BUILD)/%.o: kernel/x86_64/%.c kernel/x86_64/linux.h kernel/x86_64/linux_task.h $(X64_HEADERS) | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
 $(X64BUILD)/linux_myfs.o: kernel/x86_64/linux_myfs.c kernel/x86_64/linux_myfs.h kernel/x86_64/linux_task.h kernel/x86_64/linux.h kernel/myfs.h kernel/fs.h kernel/block.h kernel/nvme.h $(X64_HEADERS) | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
@@ -1709,6 +1709,9 @@ $(X64BUILD)/linux-myfs-mmap.o: kernel/x86_64/linux_myfs_mmap.c kernel/x86_64/lin
 $(X64BUILD)/linux_file.o $(X64BUILD)/linux_vfs.o $(X64BUILD)/linux_elf.o $(X64BUILD)/linux_mmap.o: kernel/x86_64/linux_myfs.h
 $(X64BUILD)/linux_syscall.o: X64CFLAGS += -I$(BUILD)
 $(X64BUILD)/linux_syscall.o: $(BUILD)/build_info.h
+$(X64BUILD)/linux_timer.o: kernel/acpi_smp.h kernel/smp.h
+$(X64BUILD)/acpi-smp.o: kernel/acpi_smp.c kernel/acpi_smp.h kernel/smp.h kernel/string.h kernel/types.h | $(X64BUILD)
+	$(CC) $(X64CFLAGS) -c $< -o $@
 $(X64BUILD)/linux-entry.o: kernel/x86_64/linux_syscall.asm | $(X64BUILD)
 	$(NASM) -f elf64 $< -o $@
 $(X64BUILD)/early-linux.o $(X64BUILD)/early-nvme.o $(X64BUILD)/early-myfs.o $(X64BUILD)/linux_file.o $(X64BUILD)/linux_fb.o: kernel/x86_64/linux_fb.h

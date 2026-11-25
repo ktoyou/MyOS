@@ -57,7 +57,12 @@ _Static_assert(sizeof(struct idt_gate) == 16, "x86-64 IDT gate");
 _Static_assert(sizeof(struct idt_pointer) == 10, "x86-64 IDTR");
 
 extern const uptr kernel64_vectors[EXCEPTION_COUNT];
+#ifdef X64_TEST_LINUX
+extern void linux64_timer_entry(void), linux64_external_irq_entry(void), linux64_spurious_entry(void);
+static struct idt_gate idt[LINUX64_SPURIOUS_VECTOR + 1];
+#else
 static struct idt_gate idt[EXCEPTION_COUNT];
+#endif
 
 static void serial_init(void) {
     outb(COM1 + 1, 0);
@@ -276,22 +281,31 @@ static void check_paging(unsigned mode, const struct boot_info *boot) {
 }
 #endif
 
+static void install_gate(unsigned vector, u16 cs, uptr offset) {
+    idt[vector] = (struct idt_gate){
+        .offset_low = (u16)offset,
+        .selector = cs,
+        .flags = 0x8e,
+        .offset_mid = (u16)(offset >> 16),
+        .offset_high = (u32)(offset >> 32),
+    };
+}
+
 static void install_idt(void) {
     u16 cs;
     __asm__ volatile("mov %%cs,%0" : "=r"(cs));
     for (unsigned vector = 0; vector < EXCEPTION_COUNT; ++vector) {
-        uptr offset = kernel64_vectors[vector];
-        idt[vector] = (struct idt_gate){
-            .offset_low = (u16)offset,
-            .selector = cs,
-            .flags = 0x8e,
-            .offset_mid = (u16)(offset >> 16),
-            .offset_high = (u32)(offset >> 32),
-        };
+        install_gate(vector, cs, kernel64_vectors[vector]);
 #ifdef X64_TEST_LINUX
         if (vector == 3) idt[vector].flags |= 0x60; /* INT3 разрешён из ring 3. */
 #endif
     }
+#ifdef X64_TEST_LINUX
+    for (unsigned vector = EXCEPTION_COUNT; vector < LINUX64_SPURIOUS_VECTOR; ++vector)
+        install_gate(vector, cs, (uptr)linux64_external_irq_entry);
+    install_gate(LINUX64_TIMER_VECTOR, cs, (uptr)linux64_timer_entry);
+    install_gate(LINUX64_SPURIOUS_VECTOR, cs, (uptr)linux64_spurious_entry);
+#endif
     const struct idt_pointer pointer = {sizeof(idt) - 1, (uptr)idt};
     __asm__ volatile("lidt %0" : : "m"(pointer) : "memory");
 }
@@ -309,8 +323,8 @@ static bool valid_boot_map(const struct boot_info *boot, u32 entry_magic) {
 
     const struct boot_region *map = (const void *)(uptr)boot->map_phys;
     for (u32 i = 0; i < boot->map_count; ++i) {
-        if (map[i].base >= BOOT_MEMORY_LIMIT || !map[i].length ||
-            map[i].length > BOOT_MEMORY_LIMIT - map[i].base ||
+        u64 limit = (map[i].type == 3 || map[i].type == 4) ? 1ull << 32 : BOOT_MEMORY_LIMIT;
+        if (map[i].base >= limit || !map[i].length || map[i].length > limit - map[i].base ||
             ((map[i].base | map[i].length) & 4095u))
             return false;
         u64 end = map[i].base + map[i].length;
@@ -376,6 +390,10 @@ __attribute__((noreturn)) void kernel64_main(const struct boot_info *boot, u32 e
     else if (boot->root_bytes) serial_puts("x86-64 PMM live PASS\n");
     else serial_puts("x86-64 PMM disk PASS\n");
 #else
+#ifdef X64_TEST_LINUX
+    if (!linux64_timer_probe_ioapic(boot))
+        serial_puts("MyOS x86-64: ACPI interrupt routing unavailable\n");
+#endif
     if (!paging64_init(boot, &fb)) {
         serial_puts("MyOS x86-64: cannot activate kernel page tables\n");
         halt();

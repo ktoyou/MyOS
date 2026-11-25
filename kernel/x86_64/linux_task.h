@@ -205,6 +205,8 @@ struct linux64_task {
 };
 
 extern struct linux64_task *linux64_current;
+extern u64 linux64_user_rflags;
+__attribute__((noreturn)) void linux64_invalid_return(void);
 
 struct linux64_netns *linux64_netns_init(void);
 long linux64_netns_create(struct linux64_userns *owner, struct linux64_netns **result);
