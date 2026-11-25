@@ -175,6 +175,9 @@ static long check_memfd(void) {
     if (ro < 0 || ro == fd || fcntl(ro, 1, 0) != 1 || (fcntl(ro, 3, 0) & 3) != 0 ||
         (fcntl(fd, 3, 0) & 3) != 2 || fcntl(ro, 1034, 0) != 0x27 ||
         resize_fd(ro, size) != -22 || mmap(0, size, 3, 1, ro, 0) != -13) return 44;
+    if (call(8, fd, 0, 2, 0, 0, 0) != (long)size || call(8, ro, 0, 1, 0, 0, 0) ||
+        call(8, ro, (word)-1, 2, 0, 0, 0) != (long)size - 1 || call(8, fd, 0, 1, 0, 0, 0) != (long)size ||
+        call(8, fd, 0, 0, 0, 0, 0) || call(8, ro, 0, 0, 0, 0, 0)) return 87;
     word stat_rw[18], stat_ro[18];
     if (call(5, fd, (word)stat_rw, 0, 0, 0, 0) || call(5, ro, (word)stat_ro, 0, 0, 0, 0) ||
         stat_rw[0] != stat_ro[0] || stat_rw[1] != stat_ro[1] ||
