@@ -86,6 +86,103 @@ static bool find_node(const struct linux64_file_source *source, const char *path
     return true;
 }
 
+static const char *child_name(const char *entry, const char *parent, uptr *length) {
+    while (*parent && *entry == *parent) { ++entry; ++parent; }
+    if (*parent) return NULL;
+    if (entry[-1] != '/') {
+        if (*entry != '/') return NULL;
+        ++entry;
+    }
+    uptr size = 0;
+    while (entry[size] && entry[size] != '/') ++size;
+    if (!size || size > NAME_LIMIT ||
+        (entry[0] == '.' && (size == 1 || (size == 2 && entry[1] == '.')))) return NULL;
+    *length = size;
+    return entry;
+}
+
+static bool same_child(const char *parent, const char *entry, const char *name, uptr length) {
+    uptr candidate_length;
+    const char *candidate = child_name(entry, parent, &candidate_length);
+    if (!candidate || candidate_length != length) return false;
+    for (uptr i = 0; i < length; ++i) {
+        if (candidate[i] != name[i]) return false;
+    }
+    return true;
+}
+
+static bool live_child(const struct linux64_file_source *source, const char *parent,
+                       uptr *index, const char **name, uptr *length) {
+    const char *path;
+    while ((path = source->entry_path(source->context, *index))) {
+        uptr current = (*index)++;
+        const char *child = child_name(path, parent, length);
+        if (!child) continue;
+        /* Один каталог Live-образа может быть префиксом нескольких записей. */
+        uptr earlier = 0;
+        while (earlier < current &&
+               !same_child(parent, source->entry_path(source->context, earlier), child, *length))
+            ++earlier;
+        if (earlier != current) continue;
+        *name = child;
+        return true;
+    }
+    return false;
+}
+
+bool linux64_vfs_next_entry(const struct linux64_directory *dir, uptr *position,
+                            char name[256], struct linux64_file *file) {
+    const struct linux64_file_source *source = linux64_file_source();
+    const struct linux64_directory *root = &linux64_current->process->fs->root;
+    char path[LINUX64_PATH_LIMIT];
+    uptr length = 0;
+    while ((path[length] = dir->path[length])) ++length;
+    if (*position < 2) {
+        bool parent = (*position)++ != 0;
+        name[0] = '.';
+        name[1] = parent ? '.' : 0;
+        name[2] = 0;
+        *file = dir->file;
+        if (parent && length > 1 && !same_path(path, root->path)) {
+            while (length > 1 && path[--length] != '/') {}
+            path[length] = 0;
+            find_node(source, path, file);
+        }
+        return true;
+    }
+    if (dir->file.private_directory) return false;
+
+    const char *child = NULL;
+    uptr size;
+    /* Смещения временных узлов остаются неизменными при добавлении соседей. */
+    while (*position < TEMP_NODES + 2) {
+        const struct temporary_node *node = &temporary[(*position)++ - 2];
+        if (!node->path) continue;
+        child = child_name(node->path, dir->path, &size);
+        if (child && !child[size]) {
+            *file = node->file;
+            break;
+        }
+        child = NULL;
+    }
+    if (!child) {
+        if (!source->entry_path) return false;
+        uptr index = *position - TEMP_NODES - 2;
+        if (length > 1) path[length++] = '/';
+        while (live_child(source, dir->path, &index, &child, &size)) {
+            for (uptr i = 0; i < size; ++i) path[length + i] = child[i];
+            path[length + size] = 0;
+            if (find_node(source, path, file)) break;
+            child = NULL;
+        }
+        if (!child) return false;
+        *position = index + TEMP_NODES + 2;
+    }
+    for (uptr i = 0; i < size; ++i) name[i] = child[i];
+    name[size] = 0;
+    return true;
+}
+
 u32 linux64_file_permissions(const struct linux64_file *file) {
     unsigned shift = file->uid == LINUX64_UID ? 6 : file->gid == LINUX64_GID ? 3 : 0;
     return (file->mode >> shift) & 7u;

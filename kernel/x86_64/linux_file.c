@@ -1617,12 +1617,45 @@ struct linux_dirent64 {
 _Static_assert(FD_COUNT <= 10000 && sizeof(struct linux_dirent64) == 24 &&
                __builtin_offsetof(struct linux_dirent64, name) == 19, "Linux x86-64 proc dirent");
 
+static long linux_directory_getdents(struct file_handle *handle, uptr address, u32 capacity) {
+    const struct linux64_directory dir = {
+        .path = pmm64_pointer(handle->directory_path), .file = handle->file,
+    };
+    struct {
+        u64 inode, next;
+        u16 length;
+        u8 type;
+        char name[256];
+        u8 padding[5];
+    } entry;
+    uptr copied = 0;
+    for (;;) {
+        entry = (__typeof__(entry)){0};
+        uptr position = handle->offset;
+        struct linux64_file file;
+        if (!linux64_vfs_next_entry(&dir, &position, entry.name, &file)) return (long)copied;
+        uptr name_length = 0;
+        while (entry.name[name_length]) ++name_length;
+        entry.length = (u16)((__builtin_offsetof(__typeof__(entry), name) + name_length + 8) & ~7u);
+        entry.inode = file.inode;
+        entry.next = position;
+        entry.type = file.mode ? (u8)((file.mode & LINUX64_S_IFMT) >> 12) : 8; /* DT_REG */
+        if (entry.length > capacity - copied) return copied ? (long)copied : -EINVAL;
+        if (address >= X64_USER_TOP || copied > X64_USER_TOP - address ||
+            paging64_copy_to_user(address + copied, &entry, entry.length) != entry.length)
+            return copied ? (long)copied : -EFAULT;
+        handle->offset = position;
+        copied += entry.length;
+    }
+}
+
 static long linux_getdents64(i32 fd, uptr address, u32 capacity) {
     if (!open_file(fd)) return -EBADF;
     struct file_handle *dir = file_at(fd);
     if (dir->proc_node != PROC_FDS) {
         enum file_kind kind = kind_of(dir);
-        return kind == FILE_DIRECTORY || kind == FILE_PROC_DIR ? -ENOSYS : -ENOTDIR;
+        if (kind == FILE_DIRECTORY) return linux_directory_getdents(dir, address, capacity);
+        return kind == FILE_PROC_DIR ? -ENOSYS : -ENOTDIR;
     }
     const struct linux64_process *process;
     long result = proc_fd_table(dir->file.proc_fd_owner, &process);
@@ -1719,7 +1752,7 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
         }
         if (file_at(fd)->device == FILE_EPOLL) return -ESPIPE;
         if (file_at(fd)->device) return (u32)arg2 <= 4 ? 0 : -EINVAL;
-        if (file_at(fd)->proc_node == PROC_FDS) {
+        if (file_at(fd)->proc_node == PROC_FDS || file_at(fd)->directory_path) {
             long offset = (long)arg1;
             u32 whence = (u32)arg2;
             if (whence > 1 ||

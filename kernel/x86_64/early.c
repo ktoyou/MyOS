@@ -100,6 +100,13 @@ struct linux_test_entry {
 } __attribute__((packed));
 
 static struct linux_test_files test_files;
+enum { LINUX_TEST_MAX_FILES = 1024 };
+static const char *test_paths[LINUX_TEST_MAX_FILES + 1];
+
+static const char *linux_test_entry_path(const void *context, uptr index) {
+    const struct linux_test_files *files = context;
+    return index <= files->count ? test_paths[index] : NULL;
+}
 
 static bool valid_test_path(const char *path, uptr size) {
     if (size < 2 || size > LINUX64_PATH_LIMIT || path[0] != '/' || path[size - 1]) return false;
@@ -183,7 +190,7 @@ static void linux_test_boot(uptr root_phys, uptr root_bytes) {
     const u64 *header = pmm64_pointer(root_phys);
     bool aligned = header[0] == 0x3636584c534f594dull; /* MYOSLX66 */
     if ((!aligned && header[0] != 0x3536584c534f594dull) || header[3] > root_bytes - 32 ||
-        header[2] > 1024)
+        header[2] > LINUX_TEST_MAX_FILES)
         return;
     const char *path = (const void *)(header + 4);
     if (!valid_test_path(path, header[3])) return;
@@ -196,13 +203,16 @@ static void linux_test_boot(uptr root_phys, uptr root_bytes) {
         .executable = {.bytes = image, .size = header[1], .inode = 1, .live_pages = aligned},
     };
     struct linux_test_files scan = test_files;
+    test_paths[0] = path;
     for (uptr i = 0; i < scan.count; ++i) {
         const char *entry_path;
         struct linux64_file file;
         if (!linux_test_next(&scan, &entry_path, &file)) return;
+        test_paths[i + 1] = entry_path;
     }
     const struct linux64_file_source source = {
         .lookup = linux_test_lookup, .context = &test_files, .directory = linux_test_directory,
+        .entry_path = linux_test_entry_path,
     };
     linux64_run(&test_files.executable, path, header[3] - 1, &source);
 }

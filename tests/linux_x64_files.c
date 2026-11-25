@@ -468,6 +468,69 @@ struct proc_dirent {
     char name[5];
 };
 
+static int same_name(const char *actual, const char *expected, unsigned capacity) {
+    while (capacity && *expected && *actual == *expected) {
+        ++actual;
+        ++expected;
+        --capacity;
+    }
+    return capacity && *actual == *expected;
+}
+
+static long check_live_directory(void) {
+    static const char directory[] = "/myos/live-directory";
+    static const char font[] = "scan-this-font-name.ttf";
+    long dir = call(2, (word)directory, 0x10000, 0, 0);
+    if (dir == -2) return 0;
+    struct proc_dirent *entry = (void *)buffer;
+    long other = call(2, (word)directory, 0x10000, 0, 0);
+    long duplicate = call(32, dir, 0, 0, 0);
+    if (dir < 3 || other < 3 || duplicate < 3 ||
+        call(217, dir, (word)buffer, 23, 0) != -22 || call(217, dir, 0, 24, 0) != -14 ||
+        call(217, dir, (word)buffer, 24, 0) != 24 || entry->type != 4 ||
+        !same_name(entry->name, ".", 5)) return 142;
+    if (call(217, duplicate, (word)buffer, 24, 0) != 24 ||
+        !same_name(entry->name, "..", 5)) return 143;
+    word first = entry->next;
+    if (call(217, other, (word)buffer, 24, 0) != 24 || !same_name(entry->name, ".", 5) ||
+        call(8, other, first, 0, 0) != (long)first) return 144;
+    long count = call(217, dir, (word)buffer, 512, 0);
+    if (count < 48 || call(217, duplicate, (word)(buffer + 512), 512, 0) != 0) return 145;
+    long same = call(217, other, (word)(buffer + 512), 512, 0);
+    if (same != count) return 146;
+    unsigned seen = 0;
+    for (long offset = 0; offset < count;) {
+        const struct proc_dirent *record = (const void *)(buffer + offset);
+        if (count - offset < 24 || record->length < 24 || record->length % 8 ||
+            record->length > count - offset || !record->inode) return 147;
+        const unsigned char *bytes = (const void *)record;
+        for (unsigned i = 0; i < record->length; ++i) {
+            if (bytes[i] != buffer[512 + offset + i]) return 148;
+        }
+        const char *name = (const char *)bytes + 19;
+        unsigned name_capacity = record->length - 19;
+        unsigned bit;
+        if (record->type == 4 && same_name(name, "nested", name_capacity)) bit = 1;
+        else if (record->type == 8 && same_name(name, font, name_capacity)) bit = 2;
+        else return 149;
+        if (seen & bit) return 150;
+        seen |= bit;
+        offset += record->length;
+    }
+    long file = call(257, dir, (word)font, 0, 0);
+    if (seen != 3 || file < 3 || call(0, file, (word)buffer, 1, 0) != 1 || buffer[0] != 'F')
+        return 151;
+    static const char empty[] = "/tmp/myos-empty-dir";
+    if (call(83, (word)empty, 0700, 0, 0)) return 152;
+    long empty_fd = call(2, (word)empty, 0x10000, 0, 0);
+    if (empty_fd < 3 || call(217, empty_fd, (word)buffer, 512, 0) != 48 ||
+        call(217, empty_fd, (word)buffer, 512, 0)) return 153;
+    if (call(3, empty_fd, 0, 0, 0) || call(3, file, 0, 0, 0) || call(3, duplicate, 0, 0, 0) ||
+        call(3, other, 0, 0, 0) || call(3, dir, 0, 0, 0)) return 154;
+    static const char marker[] = "Linux ELF64 Live directory listing\n";
+    return call(1, 1, (word)marker, sizeof(marker) - 1, 0) == sizeof(marker) - 1 ? 0 : 155;
+}
+
 static long proc_entries(long scanner, unsigned *seen, word *inode_29) {
     long count = call(217, scanner, (word)buffer, 512, 0);
     if (count <= 0) return count;
@@ -660,6 +723,7 @@ __attribute__((noreturn)) void _start(void) {
     if (!status) status = check_urandom();
     if (!status) status = check_dup();
     if (!status) status = check_directories();
+    if (!status) status = check_live_directory();
     if (!status) status = check_proc_fds();
     if (!status) status = check_high_proc_fd();
     if (!status) status = check_limits();
