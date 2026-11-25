@@ -331,6 +331,13 @@ def check_pidns(build):
     print('OVMF: PID namespaces, translated waits and credentials, and subtree teardown: PASS', flush=True)
 
 
+def check_netns(build):
+    probe = (build / 'linux-netns.elf').read_bytes()
+    serial = check_guest('netns', probe, 'Linux x86-64 exit status=0x00')
+    assert 'Linux ELF64 netns probe' in serial, serial
+    print('OVMF: Linux network namespace identity, socket isolation and inherited UDP: PASS', flush=True)
+
+
 def check_fork(build):
     probe = (build / 'linux-fork.elf').resolve()
     marker = 'Linux ELF64 fork probe'
@@ -476,6 +483,7 @@ def main():
     check_pthread(build)
     check_userns(build)
     check_pidns(build)
+    check_netns(build)
     check_shared_fs(build)
     check_vfork(build)
     check_exec(build)

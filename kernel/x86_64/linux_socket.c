@@ -116,6 +116,7 @@ struct peer_snapshot {
 
 struct linux64_socket {
     struct tcp64_connection *tcp;
+    struct linux64_netns *net_ns;
     struct linux64_socket *peer;
     struct linux64_socket *accept_head, *accept_tail, *accept_next;
     struct packet *head, *tail;
@@ -169,7 +170,9 @@ long linux64_socket_create(i32 domain, u32 type, i32 protocol, struct linux64_so
     }
     struct linux64_socket *slot = free_pair();
     if (!slot) return -ENFILE;
-    *slot = (struct linux64_socket){.type = (u8)base, .open = true, .inet = domain == AF_INET};
+    struct linux64_netns *net_ns = linux64_current->process->net_ns;
+    linux64_netns_retain(net_ns);
+    *slot = (struct linux64_socket){.net_ns = net_ns, .type = (u8)base, .open = true, .inet = domain == AF_INET};
     *socket = slot;
     return 0;
 }
@@ -180,8 +183,11 @@ long linux64_socket_pair(i32 domain, u32 type, i32 protocol, struct linux64_sock
     if (protocol != 0 && protocol != AF_UNIX) return -EPROTONOSUPPORT;
     struct linux64_socket *pair = free_pair();
     if (!pair) return -ENFILE;
-    pair[0] = (struct linux64_socket){.peer = &pair[1], .type = type, .open = true};
-    pair[1] = (struct linux64_socket){.peer = &pair[0], .type = type, .open = true};
+    struct linux64_netns *net_ns = linux64_current->process->net_ns;
+    linux64_netns_retain(net_ns);
+    linux64_netns_retain(net_ns);
+    pair[0] = (struct linux64_socket){.net_ns = net_ns, .peer = &pair[1], .type = type, .open = true};
+    pair[1] = (struct linux64_socket){.net_ns = net_ns, .peer = &pair[0], .type = type, .open = true};
     struct peer_snapshot creator = current_credentials();
     store_credentials(&pair[0], creator);
     store_credentials(&pair[1], creator);
@@ -258,11 +264,12 @@ static long put_udp_name(uptr address, uptr length, struct linux64_udp_address e
 }
 
 static bool port_used(const struct linux64_socket *self, struct linux64_udp_address endpoint) {
-    if (linux64_socket_is_tcp(self) && tcp64_port_used(endpoint.port)) return true;
+    if (linux64_socket_is_tcp(self) && linux64_netns_is_initial(self->net_ns) &&
+        tcp64_port_used(endpoint.port)) return true;
     for (unsigned i = 0; i < sizeof(pairs) / sizeof(*pairs); ++i) {
         const struct linux64_socket *socket = pairs[i];
         if (socket != self && socket->open && socket->inet && socket->type == self->type &&
-            socket->local.port == endpoint.port &&
+            socket->net_ns == self->net_ns && socket->local.port == endpoint.port &&
             (!socket->local.ip || !endpoint.ip || socket->local.ip == endpoint.ip)) return true;
     }
     return false;
@@ -270,11 +277,15 @@ static bool port_used(const struct linux64_socket *self, struct linux64_udp_addr
 
 static long inet_bind(struct linux64_socket *socket, struct linux64_udp_address endpoint) {
     if (socket->local.port) return -EINVAL;
-    if (endpoint.ip && endpoint.ip != net64_address() &&
-        !(linux64_socket_is_udp(socket) && loopback(endpoint.ip))) return -EADDRNOTAVAIL;
+    bool initial = linux64_netns_is_initial(socket->net_ns);
+    /* В дочернем пространстве нет назначенных адресов, включая выключенный lo. */
+    if (endpoint.ip && (!initial || (endpoint.ip != net64_address() &&
+        !(linux64_socket_is_udp(socket) && loopback(endpoint.ip))))) return -EADDRNOTAVAIL;
     if (!endpoint.port) {
         static u16 udp_next = UDP_FIRST_PORT, tcp_next = UDP_FIRST_PORT;
-        u16 *next = linux64_socket_is_tcp(socket) ? &tcp_next : &udp_next;
+        u16 isolated_next = UDP_FIRST_PORT;
+        u16 *next = &isolated_next;
+        if (initial) next = linux64_socket_is_tcp(socket) ? &tcp_next : &udp_next;
         for (unsigned i = UDP_FIRST_PORT; i <= 65535u; ++i) {
             endpoint.port = *next;
             *next = *next == 65535u ? UDP_FIRST_PORT : *next + 1;
@@ -296,6 +307,7 @@ static u32 udp_source(const struct linux64_socket *socket, u32 destination) {
 }
 
 static long udp_route(const struct linux64_socket *socket, u32 dest, u32 *source, bool *local) {
+    if (!linux64_netns_is_initial(socket->net_ns)) return -ENETUNREACH;
     u32 interface = net64_address();
     *source = udp_source(socket, dest);
     *local = loopback(dest) || (interface && dest == interface);
@@ -354,6 +366,7 @@ long linux64_tcp_path(struct linux64_socket *socket, bool bind, uptr address, u3
     }
 
     if (!name.port) return -EINVAL;
+    if (!linux64_netns_is_initial(socket->net_ns)) return -ENETUNREACH;
     u64 now;
     if (!linux64_monotonic_ns(&now)) return -ENETDOWN;
     if (socket->tcp) {
@@ -423,8 +436,11 @@ long linux64_socket_connect(struct linux64_socket *socket, u64 inode) {
     if (listener->pending > listener->backlog) return -EAGAIN;
     /* Клиент занимает первый элемент пары, второй остаётся за очередью accept. */
     struct linux64_socket *accepted = socket + 1;
-    *accepted = (struct linux64_socket){.peer = socket, .type = SOCK_STREAM, .open = true,
-                                       .passcred = listener->passcred};
+    linux64_netns_retain(socket->net_ns);
+    *accepted = (struct linux64_socket){
+        .net_ns = socket->net_ns, .peer = socket, .type = SOCK_STREAM, .open = true,
+        .passcred = listener->passcred,
+    };
     /* accept может выполняться другой задачей, поэтому снимки берём здесь. */
     store_credentials(socket, listener->peer_credentials);
     store_credentials(accepted, current_credentials());
@@ -583,12 +599,18 @@ static void free_packet(struct packet *packet) {
     pmm64_free((uptr)packet - (uptr)pmm64_pointer(0));
 }
 
+static void release_socket_netns(struct linux64_socket *socket) {
+    linux64_netns_release(socket->net_ns);
+    socket->net_ns = NULL;
+}
+
 static void drop_udp_tx(struct linux64_socket *socket) {
     struct packet *packet = socket->udp_tx_head;
     socket->udp_tx_head = packet->next;
     if (!socket->udp_tx_head) socket->udp_tx_tail = NULL;
     --socket->udp_tx_count;
     free_packet(packet);
+    if (!socket->open && !socket->udp_tx_head) release_socket_netns(socket);
 }
 
 static void drop_udp_error(struct linux64_socket *socket) {
@@ -617,6 +639,8 @@ static void close_endpoint(struct linux64_socket *socket) {
     if (unread && socket->peer && socket->peer->open) socket->peer->reset = true;
     while (socket->head) drop_packet(socket);
     while (socket->udp_err_head) drop_udp_error(socket);
+    /* Принятые к отправке датаграммы удерживают пространство до конца очереди. */
+    if (!socket->udp_tx_head) release_socket_netns(socket);
 }
 
 void linux64_socket_close(struct linux64_socket *socket) {
@@ -794,21 +818,26 @@ static void enqueue(struct linux64_socket *peer, struct packet *packet) {
     ++peer->queued;
 }
 
-static struct linux64_socket *udp_receiver(struct linux64_udp_address source, struct linux64_udp_address dest) {
+static struct linux64_socket *udp_receiver(const struct linux64_socket *sender,
+                                           struct linux64_udp_address source, struct linux64_udp_address dest) {
     for (unsigned i = 0; i < sizeof(pairs) / sizeof(*pairs); ++i) {
         struct linux64_socket *socket = pairs[i];
         if (!socket->open || !linux64_socket_is_udp(socket) || socket->local.port != dest.port ||
             (socket->local.ip && socket->local.ip != dest.ip) ||
             (socket->remote.port && (socket->remote.ip != source.ip || socket->remote.port != source.port)))
             continue;
+        /* Пакеты с физического интерфейса принадлежат начальному пространству. */
+        if (sender ? socket->net_ns != sender->net_ns : !linux64_netns_is_initial(socket->net_ns))
+            continue;
         return socket;
     }
     return NULL;
 }
 
-static bool udp_deliver(struct linux64_udp_address source, struct linux64_udp_address dest,
+static bool udp_deliver(const struct linux64_socket *sender,
+                        struct linux64_udp_address source, struct linux64_udp_address dest,
                         const u8 *data, u32 length) {
-    struct linux64_socket *socket = udp_receiver(source, dest);
+    struct linux64_socket *socket = udp_receiver(sender, source, dest);
     if (!socket) return false;
     if (socket->read_shutdown || socket->queued >= MAX_QUEUED) return true;
     struct packet *packet = allocate_packet();
@@ -821,8 +850,9 @@ static bool udp_deliver(struct linux64_udp_address source, struct linux64_udp_ad
     return true;
 }
 
-void linux64_udp_icmp_error(u32 offender, u32 local_ip, u32 peer_ip, u16 local_port, u16 peer_port,
-                            u8 type, u8 code, u32 info, const u8 *payload, u32 length) {
+static void udp_icmp_error(const struct linux64_socket *sender,
+                           u32 offender, u32 local_ip, u32 peer_ip, u16 local_port, u16 peer_port,
+                           u8 type, u8 code, u32 info, const u8 *payload, u32 length) {
     static const u8 unreachable[] = {
         ENETUNREACH, EHOSTUNREACH, ENOPROTOOPT, ECONNREFUSED, EMSGSIZE, EOPNOTSUPP, ENETUNREACH, EHOSTDOWN,
         ENONET, ENETUNREACH, EHOSTUNREACH, ENETUNREACH, EHOSTUNREACH, EHOSTUNREACH, EHOSTUNREACH, EHOSTUNREACH,
@@ -834,7 +864,7 @@ void linux64_udp_icmp_error(u32 offender, u32 local_ip, u32 peer_ip, u16 local_p
     else return;
     if (!local_port || !peer_port || length > UDP_MAX || (length && !payload)) return;
     struct linux64_udp_address peer = {peer_ip, peer_port};
-    struct linux64_socket *socket = udp_receiver(peer, (struct linux64_udp_address){local_ip, local_port});
+    struct linux64_socket *socket = udp_receiver(sender, peer, (struct linux64_udp_address){local_ip, local_port});
     if (!linux64_udp_recverr_enabled(socket)) return;
     socket->udp_icmp_errno = number;
     if (socket->udp_err_count >= UDP_ERROR_LIMIT) return;
@@ -853,6 +883,11 @@ void linux64_udp_icmp_error(u32 offender, u32 local_ip, u32 peer_ip, u16 local_p
     ++socket->udp_err_count;
 }
 
+void linux64_udp_icmp_error(u32 offender, u32 local_ip, u32 peer_ip, u16 local_port, u16 peer_port,
+                            u8 type, u8 code, u32 info, const u8 *payload, u32 length) {
+    udp_icmp_error(NULL, offender, local_ip, peer_ip, local_port, peer_port, type, code, info, payload, length);
+}
+
 static u32 udp_checksum_seed(u32 source, u32 dest, u32 length) {
     return (source >> 16) + (source & 0xffffu) + (dest >> 16) + (dest & 0xffffu) + IPPROTO_UDP + length;
 }
@@ -864,7 +899,7 @@ void linux64_udp_receive(void *context, u32 source, u32 destination, u8 protocol
     u16 source_port = net_read16(data), dest_port = net_read16(data + 2);
     if (!dest_port || size < UDP_HEADER || size > length ||
         (net_read16(data + 6) && net64_checksum(data, size, udp_checksum_seed(source, destination, size)))) return;
-    udp_deliver((struct linux64_udp_address){source, source_port},
+    udp_deliver(NULL, (struct linux64_udp_address){source, source_port},
                 (struct linux64_udp_address){destination, dest_port}, data + UDP_HEADER, size - UDP_HEADER);
 }
 
@@ -894,7 +929,7 @@ bool linux64_udp_flush(u64 now) {
         struct linux64_socket *socket = pairs[i];
         /* Уже принятые датаграммы переживают последний close до отправки или сетевой ошибки. */
         while (socket->udp_tx_head) {
-            u32 source = net64_address();
+            u32 source = linux64_netns_is_initial(socket->net_ns) ? net64_address() : 0;
             long result = source && source == socket->udp_tx_source ?
                           udp_transmit(socket->udp_tx_head, now, source) : -ENETDOWN;
             if (result == -EAGAIN) {
@@ -941,12 +976,12 @@ static long udp_send(struct linux64_socket *socket, const struct iovec *iov, upt
     result = socket->local.port ? 0 : inet_bind(socket, (struct linux64_udp_address){0});
     packet->datagram.source_port = socket->local.port;
     if (!result && local) {
-        bool delivered = udp_deliver((struct linux64_udp_address){source, socket->local.port},
+        bool delivered = udp_deliver(socket, (struct linux64_udp_address){source, socket->local.port},
                                      dest, packet->bytes, packet->length);
         if (!delivered) {
             if (socket->udp_recverr) {
-                linux64_udp_icmp_error(dest.ip, source, dest.ip, socket->local.port, dest.port,
-                                      ICMP_DEST_UNREACH, ICMP_PORT_UNREACH, 0, packet->bytes, packet->length);
+                udp_icmp_error(socket, dest.ip, source, dest.ip, socket->local.port, dest.port,
+                               ICMP_DEST_UNREACH, ICMP_PORT_UNREACH, 0, packet->bytes, packet->length);
             } else if (socket->remote.port == dest.port && socket->remote.ip == dest.ip) {
                 socket->udp_error = ECONNREFUSED;
             }
