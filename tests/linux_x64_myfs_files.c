@@ -5,7 +5,7 @@ enum {
     SYS_PREAD = 17, SYS_PWRITE = 18,
     SYS_PIPE = 22, SYS_DUP = 32, SYS_GETPID = 39, SYS_FORK = 57, SYS_EXIT = 60, SYS_WAIT4 = 61,
     SYS_FCNTL = 72, SYS_FLOCK = 73, SYS_FSYNC = 74, SYS_FDATASYNC = 75, SYS_FTRUNCATE = 77,
-    SYS_GETCWD = 79, SYS_CHDIR = 80, SYS_UMASK = 95,
+    SYS_GETCWD = 79, SYS_CHDIR = 80, SYS_CREAT = 85, SYS_UMASK = 95,
     SYS_STATFS = 137, SYS_FSTATFS = 138,
     SYS_GETDENTS64 = 217, SYS_OPENAT = 257, SYS_MKDIRAT = 258, SYS_STATAT = 262, SYS_UNLINKAT = 263, SYS_RENAMEAT = 264,
     SYS_SYMLINKAT = 266, SYS_READLINKAT = 267,
@@ -538,6 +538,22 @@ static int check_filesystem_space(long parent) {
     return 0;
 }
 
+static int check_creat(long parent) {
+    static const char path[] = "/profile/owned/creat-probe";
+    static const char payload[] = "CacheStorage index";
+    struct file_stat info;
+    long fd = call(SYS_CREAT, (word)path, 0640, 0, 0);
+    if (fd < 0 || call(SYS_READ, fd, (word)buffer, 1, 0) != -9 ||
+        call(SYS_WRITE, fd, (word)payload, sizeof(payload), 0) != sizeof(payload) ||
+        stat_fd(fd, &info) || info.size != sizeof(payload) || (info.mode & 0777) != 0640 ||
+        close_fd(fd)) return 78;
+
+    fd = call(SYS_CREAT, (word)path, 0600, 0, 0);
+    if (fd < 0 || stat_fd(fd, &info) || info.size || (info.mode & 0777) != 0640 ||
+        close_fd(fd) || call(SYS_UNLINKAT, parent, (word)"creat-probe", 0, 0)) return 79;
+    return 0;
+}
+
 static int check_resize(long parent) {
     enum { SECTOR = 512 };
     static const char name[] = "resize-probe";
@@ -599,6 +615,7 @@ void _start(void) {
         prepare_long_target();
         status = parent < 0 ? 2 : check_permissions(parent);
         if (!status) status = check_filesystem_space(parent);
+        if (!status && phase == '1') status = check_creat(parent);
         if (!status && phase == '1') status = check_resize(parent);
         if (!status && phase == '1') status = write_profile(parent);
         if (!status) status = verify_profile(parent);

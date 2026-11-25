@@ -2595,6 +2595,8 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
         return linux_rename(AT_FDCWD, arg0, AT_FDCWD, arg1);
     case 83: /* mkdir */
         return linux_mkdir(AT_FDCWD, arg0, (u32)arg1);
+    case 85: /* creat */
+        return linux_open(AT_FDCWD, arg0, O_WRONLY | O_CREAT | O_TRUNC, (u32)arg1);
     case 87: /* unlink */
         return linux_unlink(AT_FDCWD, arg0, 0);
     case 88: /* symlink */
