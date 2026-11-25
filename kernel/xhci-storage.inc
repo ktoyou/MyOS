@@ -12,7 +12,7 @@ static void bot_beput(u8 *p,u32 v) {for(int i=0;i<4;i++)p[i]=v>>((3-i)*8);}
 static bool bulk_transfer(struct usbdev *d,bool input,unsigned length) {
     if(poisoned || d->failed || d->removing || length>4096)return false;
     unsigned at=input?1:0,dci=d->bulk_dci[at];
-    u32 ptr=enqueue(&d->bulk[at],(u32)d->storage_buffer,0,length,TYPE(1)|(1u<<5)|(1u<<2));
+    u32 ptr=enqueue(&d->bulk[at],dma_address(d->storage_buffer),0,length,TYPE(1)|(1u<<5)|(1u<<2));
     ring_doorbell(d->slot,dci);waiting_slot=d->slot;waiting_dci=dci;
     unsigned code=completion(ptr,5000,false);waiting_slot=waiting_dci=0;
     if(code!=1 || wait_left) {d->failed=true;return false;}
@@ -52,11 +52,11 @@ static bool configure_storage(struct usbdev *d,const u8 *descriptors,unsigned to
     for(unsigned at=0;at<2;at++) {
         unsigned dci=d->bulk_dci[at];if(dci<2 || dci>31)return false;
         u32 *ep=ctx(d->input,dci+1);ep[1]=(packets[at]<<16)|((at?6:2)<<3)|(3<<1);
-        ep[2]=(u32)d->bulk[at].base|1;ep[4]=512;
+        ep[2]=dma_address(d->bulk[at].base)|1;ep[4]=512;
         d->input[1]|=1u<<dci;if(dci>maxdci)maxdci=dci;
     }
     ctx(d->input,1)[0]=(ctx(d->input,1)[0]&0x07ffffff)|(maxdci<<27);
-    if(!command((u32)d->input,TYPE(12)|(d->slot<<24)) || !control(d,0,9,config,0,0))return false;
+    if(!command(dma_address(d->input),TYPE(12)|(d->slot<<24)) || !control(d,0,9,config,0,0))return false;
     (void)iface; /* LUN 0 is mandatory; optional GET_MAX_LUN need not succeed. */
     u8 capacity[8],cdb[16]={0x25};bool ready=false;
     for(unsigned retry=0;retry<5 && !d->failed;retry++) {

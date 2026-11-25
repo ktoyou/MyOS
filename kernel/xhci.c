@@ -75,6 +75,7 @@ static struct hw_usb_info inventory[256];
 #ifdef HOST_TEST
 u32 xhci_test_read(u32 offset);
 void xhci_test_write(u32 offset,u32 value);
+u32 xhci_test_dma_address(const volatile void *pointer);
 static u32 rd(u32 o) { return xhci_test_read(o); }
 static void wr(u32 o,u32 v) { xhci_test_write(o,v); }
 #else
@@ -82,6 +83,16 @@ static u32 rd(u32 o) { return *(volatile u32 *)(mmio+o); }
 static void wr(u32 o,u32 v) { *(volatile u32 *)(mmio+o)=v; }
 #endif
 static void pump(void);
+
+/* Дескрипторы и события xHCI содержат адрес устройства, а не указатель CPU. */
+static u32 dma_address(const volatile void *pointer) {
+#ifdef HOST_TEST
+    return xhci_test_dma_address(pointer);
+#else
+    return (u32)(uptr)pointer;
+#endif
+}
+
 static void wr64(u32 o,u32 low) { wr(o,low); wr(o+4,0); }
 static void *page(void) {
     u32 p=pmm_alloc();
@@ -103,7 +114,7 @@ static bool ring_init(struct ring *r) {
 }
 static void ring_link(struct ring *r) {
     struct trb *link=&r->base[r->next];
-    link->lo=(u32)r->base; link->hi=0; link->status=0;
+    link->lo=dma_address(r->base); link->hi=0; link->status=0;
     BARRIER(); link->control=TYPE(6)|2|r->cycle;
     r->cycle^=1; r->next=0;
 }
@@ -112,7 +123,7 @@ static u32 enqueue(struct ring *r,u32 lo,u32 hi,u32 status,u32 control) {
     struct trb *t=&r->base[r->next++];
     t->lo=lo; t->hi=hi; t->status=status;
     BARRIER(); t->control=control|r->cycle;
-    return (u32)t;
+    return dma_address(t);
 }
 static void ring_doorbell(unsigned slot,unsigned dci) {
     BARRIER(); wr(db+slot*4,dci);
@@ -120,7 +131,7 @@ static void ring_doorbell(unsigned slot,unsigned dci) {
 static void arm(struct hid *h) {
     if (!h->active || h->dev->removing || h->dev->failed) return;
     memset(h->report,0,64);
-    h->pending=enqueue(&h->ring,(u32)h->report,0,h->packet,TYPE(1)|(1<<5)|(1<<2));
+    h->pending=enqueue(&h->ring,dma_address(h->report),0,h->packet,TYPE(1)|(1<<5)|(1<<2));
     ring_doorbell(h->dev->slot,h->dci);
 }
 static bool contains(const u8 *report,u8 key) {
@@ -244,7 +255,7 @@ static void pump(void) {
         }
         event_index++;
         if (event_index==NCYCLE) { event_index=0; event_cycle^=1; }
-        wr64(rt+0x38,(u32)&events[event_index]|8); /* ERDP, clear EHB */
+        wr64(rt+0x38,dma_address(&events[event_index])|8); /* ERDP, clear EHB */
     }
     repeat_keys();
 }
@@ -284,7 +295,7 @@ static bool control(struct usbdev *d,u8 request_type,u8 request,u16 value,u16 in
     if(d->control.next+(length?3u:2u)>NCYCLE-1) ring_link(&d->control);
     enqueue(&d->control,request_type|((u32)request<<8)|((u32)value<<16),
             index|((u32)length<<16),8,TYPE(2)|(1<<6)|((length?(input?3:2):0)<<16));
-    if (length) enqueue(&d->control,(u32)d->buffer,0,length,TYPE(3)|(input?(1<<16):0));
+    if (length) enqueue(&d->control,dma_address(d->buffer),0,length,TYPE(3)|(input?(1<<16):0));
     u32 pointer=enqueue(&d->control,0,0,0,TYPE(4)|(1<<5)|((!length || !input)?(1<<16):0));
     ring_doorbell(d->slot,1);
     waiting_slot=d->slot; waiting_dci=1;
@@ -296,7 +307,7 @@ static bool control(struct usbdev *d,u8 request_type,u8 request,u16 value,u16 in
          * optional request can fall back to another protocol. */
         if(command(0,TYPE(14)|(1u<<16)|(d->slot<<24))) {
             memset(d->control.base,0,4096); d->control.next=0; d->control.cycle=1;
-            if(command((u32)d->control.base|1,TYPE(16)|(1u<<16)|(d->slot<<24))) return false;
+            if(command(dma_address(d->control.base)|1,TYPE(16)|(1u<<16)|(d->slot<<24))) return false;
         }
     }
     d->failed=true;
@@ -333,7 +344,7 @@ static bool configure_hub(struct usbdev *d,unsigned config) {
     slot[0]=(slot[0]|(1u<<26))&~(1u<<25); /* USB2 default alternate: single TT */
     slot[1]=(slot[1]&0x00ffffffu)|(count<<24);
     if(d->speed==3) slot[2]=(slot[2]&~(3u<<16))|(((characteristics>>5)&3)<<16);
-    if(!command((u32)d->input,TYPE(13)|(d->slot<<24))) return false;
+    if(!command(dma_address(d->input),TYPE(13)|(d->slot<<24))) return false;
     for(unsigned port=1;port<=count;port++) if(!control(d,0x23,3,8,port,0)) return false;
     d->hub_ports=count;
     settle(power_good<20?20:power_good);
@@ -357,7 +368,7 @@ static bool configure(struct usbdev *d) {
         u32 *ep=ctx(d->input,2);
         ep[0]&=~7u;
         ep[1]=(ep[1]&0xffff)|(mps<<16);
-        if (!command((u32)d->input,TYPE(13)|(d->slot<<24))) return false;
+        if (!command(dma_address(d->input),TYPE(13)|(d->slot<<24))) return false;
         d->mps=mps;
     }
     if (!control(d,0x80,6,0x100,0,18) || d->buffer[0]!=18 || d->buffer[1]!=1) return false;
@@ -407,7 +418,7 @@ static bool configure(struct usbdev *d) {
             u32 *ep=ctx(d->input,dci+1);
             ep[0]=interval(d->speed,p[6])<<16;
             ep[1]=(packet<<16)|(7<<3)|(3<<1);
-            ep[2]=(u32)h->ring.base|1;
+            ep[2]=dma_address(h->ring.base)|1;
             ep[4]=packet|(packet<<16);
             d->input[1]|=1u<<dci;
             if (dci>maxdci) maxdci=dci;
@@ -417,7 +428,7 @@ static bool configure(struct usbdev *d) {
     }
     if (!found) return true; /* Descriptor-only device; no class driver. */
     u32 *slot=ctx(d->input,1); slot[0]=(slot[0]&0x07ffffff)|(maxdci<<27);
-    if (!command((u32)d->input,TYPE(12)|(d->slot<<24))) return false;
+    if (!command(dma_address(d->input),TYPE(12)|(d->slot<<24))) return false;
     if (!control(d,0,9,config,0,0)) return false;
     for (unsigned i=0;i<NHID;i++) {
         struct hid *h=&hids[i];
@@ -492,14 +503,14 @@ static bool address_device(int parent,unsigned port,unsigned speed) {
     if(!command(0,TYPE(9))) { detach(d); return false; }
     d->slot=wait_slot;
     if(!d->slot || d->slot>maxslots) { poisoned=true; return false; }
-    dcbaa[d->slot]=(u32)d->context; BARRIER();
+    dcbaa[d->slot]=dma_address(d->context); BARRIER();
     d->input[1]=3;
     u32 *slot=ctx(d->input,1),*ep=ctx(d->input,2);
     slot[0]=d->route|(speed<<20)|(1u<<27); slot[1]=d->port<<16;
     slot[2]=d->tt_slot|(d->tt_port<<8);
     ep[1]=(d->mps<<16)|(4<<3)|(3<<1);
-    ep[2]=(u32)d->control.base|1; ep[4]=8;
-    if(!command((u32)d->input,TYPE(11)|(d->slot<<24)) || !configure(d) || d->failed) {
+    ep[2]=dma_address(d->control.base)|1; ep[4]=8;
+    if(!command(dma_address(d->input),TYPE(11)|(d->slot<<24)) || !configure(d) || d->failed) {
         kprintf("USB enumeration failed: root %u route %x\n",d->port,d->route);
         detach(d); return false;
     }
@@ -696,16 +707,16 @@ bool xhci_init(void) {
     if (scratch>64) return false;
     if (scratch) {
         u64 *array=page(); if (!array) return false;
-        for (unsigned i=0;i<scratch;i++) { void *p=page(); if (!p) return false; array[i]=(u32)p; }
-        dcbaa[0]=(u32)array;
+        for (unsigned i=0;i<scratch;i++) { void *p=page(); if (!p) return false; array[i]=dma_address(p); }
+        dcbaa[0]=dma_address(array);
     }
-    erst[0]=(u32)events; erst[2]=NCYCLE;
+    erst[0]=dma_address(events); erst[2]=NCYCLE;
     event_index=0; event_cycle=1;
-    wr64(op+0x30,(u32)dcbaa);
-    wr64(op+0x18,(u32)commands.base|1);
+    wr64(op+0x30,dma_address(dcbaa));
+    wr64(op+0x18,dma_address(commands.base)|1);
     wr(op+0x38,maxslots);
     wr(rt+0x20,0); /* IMAN: poll instead of enabling interrupt delivery */
-    wr(rt+0x28,1); wr64(rt+0x30,(u32)erst); wr64(rt+0x38,(u32)events);
+    wr(rt+0x28,1); wr64(rt+0x30,dma_address(erst)); wr64(rt+0x38,dma_address(events));
     wr(op+4,0x1c); /* clear HSE/EINT/PCD */
     wr(op,1);
     if (!wait_reg(op+4,1,0,1000)) return false;
