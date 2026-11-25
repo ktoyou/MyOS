@@ -254,3 +254,10 @@ fail:
 void linux64_timer_ack(void) {
     if (timer_ready) apic_write(APIC_EOI, 0);
 }
+
+bool linux64_timer_idle(void) {
+    if (!timer_ready) return false;
+    /* IRQ из ring 0 только подтверждает тик и возвращает управление сюда. */
+    __asm__ volatile ("sti; hlt; cli" ::: "memory");
+    return true;
+}

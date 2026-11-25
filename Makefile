@@ -1619,7 +1619,7 @@ X64_NETWORK := $(X64_ETHERNET) $(X64BUILD)/ethernet.o $(X64BUILD)/net.o
 X64_LINUX_NET := $(X64_NETWORK) $(X64BUILD)/dhcp.o $(X64BUILD)/tcp.o $(X64BUILD)/linux_net.o
 X64_NVME := $(X64BUILD)/nvme.o $(X64BUILD)/storage-pci.o $(X64BUILD)/storage-string.o
 X64_MYFS := $(X64BUILD)/storage-block.o $(X64BUILD)/storage-myfs.o $(X64BUILD)/storage-alloc.o
-X64_LINUX_RUNTIME := $(X64BUILD)/linux_elf.o $(X64BUILD)/xhci.o $(X64BUILD)/xhci64_platform.o $(X64BUILD)/hid_mouse.o \
+X64_LINUX_RUNTIME := $(X64BUILD)/linux_elf.o $(X64BUILD)/xhci.o $(X64BUILD)/xhci64_platform.o $(X64BUILD)/xhci64_switch.o $(X64BUILD)/hid_mouse.o \
     $(X64BUILD)/linux_syscall.o $(X64BUILD)/linux_file.o $(X64BUILD)/linux_fb.o \
     $(X64BUILD)/linux_input.o $(X64BUILD)/linux_mmap.o $(X64BUILD)/linux_random.o \
     $(X64BUILD)/linux_time.o $(X64BUILD)/linux_timer.o $(X64BUILD)/acpi-smp.o $(X64BUILD)/linux_signal.o $(X64BUILD)/linux_socket.o \
@@ -1745,12 +1745,15 @@ $(X64BUILD)/linux-entry.o: kernel/x86_64/linux_syscall.asm | $(X64BUILD)
 $(X64BUILD)/early-linux.o $(X64BUILD)/early-nvme.o $(X64BUILD)/early-myfs.o $(X64BUILD)/linux_file.o $(X64BUILD)/linux_fb.o: kernel/x86_64/linux_fb.h
 $(X64BUILD)/linux_file.o: kernel/x86_64/linux_input.h
 $(X64BUILD)/linux_task.o $(X64BUILD)/linux_seccomp.o: kernel/x86_64/linux_seccomp.h
+$(X64BUILD)/linux_task.o: kernel/x86_64/xhci64.h
 $(X64BUILD)/linux_seccomp.o $(X64BUILD)/linux_seccomp_bpf.o: kernel/x86_64/linux_seccomp_bpf.h
 $(X64BUILD)/linux_socket.o: kernel/x86_64/net.h kernel/x86_64/net_bytes.h kernel/x86_64/tcp.h
 $(X64BUILD)/xhci.o: kernel/xhci.c kernel/xhci.h kernel/hid_mouse.h kernel/hwinfo.h kernel/string.h kernel/x86_64/xhci64.h kernel/x86_64/pci.h kernel/x86_64/linux_input.h kernel/x86_64/linux.h $(X64_HEADERS) | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -DMYOS_XHCI_X64 -c $< -o $@
 $(X64BUILD)/xhci64_platform.o: kernel/x86_64/xhci64_platform.c kernel/x86_64/xhci64.h kernel/x86_64/pci.h kernel/x86_64/linux.h $(X64_HEADERS) | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
+$(X64BUILD)/xhci64_switch.o: kernel/x86_64/xhci64_switch.asm | $(X64BUILD)
+	$(NASM) -f elf64 $< -o $@
 $(X64BUILD)/hid_mouse.o: kernel/hid_mouse.c kernel/hid_mouse.h kernel/string.h kernel/types.h | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
 $(X64BUILD)/linux_input.o: kernel/x86_64/linux_input.c kernel/x86_64/linux_input.h kernel/x86_64/xhci64.h kernel/x86_64/linux.h kernel/x86_64/linux_task.h $(X64_HEADERS) | $(X64BUILD)

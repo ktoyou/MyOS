@@ -1,6 +1,7 @@
 #include "linux_task.h"
 #include "linux_seccomp.h"
 #include "paging.h"
+#include "xhci64.h"
 
 #define NS_PER_SECOND 1000000000l
 
@@ -821,9 +822,10 @@ static long unshare(uptr flags) {
 
 static struct linux64_task *pick_task(const struct linux64_task *current) {
     unsigned index = (unsigned)(current - tasks);
-    bool timed;
+    bool timed, usb_work;
     do {
         timed = linux64_net_poll();
+        usb_work = xhci64_service();
         for (unsigned i = 1; i <= LINUX64_TASK_COUNT; ++i) {
             struct linux64_task *candidate = &tasks[(index + i) % LINUX64_TASK_COUNT];
             if (candidate->state == TASK_RUNNABLE ||
@@ -851,9 +853,9 @@ static struct linux64_task *pick_task(const struct linux64_task *current) {
                     timed = true;
             }
         }
-        /* Таймерных прерываний в этом режиме пока нет. */
-        if (timed) __asm__ volatile("pause");
-    } while (timed);
+        /* Без таймера опрос USB нужен даже до появления первого evdev. */
+        if (timed || (usb_work && !linux64_timer_idle())) __asm__ volatile("pause");
+    } while (timed || usb_work);
     static const char message[] = "Linux x86-64 scheduler has no runnable process\n";
     for (unsigned i = 0; message[i]; ++i) kernel64_serial_char(message[i]);
     for (;;) __asm__ volatile("cli; hlt");

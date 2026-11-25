@@ -75,6 +75,8 @@ int main(void) {
     CHECK(!buttons && !key_refs[4] && !mod_refs[0] && !mod_refs[1]);
     CHECK(codes[ncodes-1]==0x9e); /* 'a' released, after Ctrl and Shift. */
     reset();device(0,-1,1);fail_slot=1;
+    /* Slot Not Enabled от другой команды не подтверждает остановку DMA. */
+    wait_code=11;
     CHECK(!detach(&devices[0]) && !freed && devices[0].quarantined && devices[0].used && poisoned);
     CHECK(!device_visible(&devices[0]));
     reset();

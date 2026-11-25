@@ -4,13 +4,9 @@
 #include "pci.h"
 #include "../bootinfo.h"
 
-struct xhci64_hid {
-    bool keyboard, mouse, wheel;
-};
-
 bool xhci64_init(const struct boot_info *boot);
 void xhci64_poll(void);
-struct xhci64_hid xhci64_hid_status(void);
+bool xhci64_service(void);
 
 struct xhci64_resources {
     struct pci64_device pci;
@@ -26,6 +22,9 @@ void *xhci64_dma_alloc(void);
 void xhci64_dma_free(void *page);
 u32 xhci64_dma_address(const volatile void *pointer);
 
+void xhci64_worker_start(void (*entry)(void));
+void xhci64_worker_step(void);
+void xhci64_checkpoint(void);
 u32 xhci64_ticks(void);
 void xhci64_sleep_ms(unsigned ms);
 void xhci64_log(const char *format, ...);
