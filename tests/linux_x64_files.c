@@ -417,7 +417,7 @@ static long check_named_file(long dir) {
         call(257, dir, (word)name, 0x202, 0) != -24 ||
         call(302, 0, 7, (word)previous, 0) ||
         call(262, dir, (word)"uncreated", (word)stat, 0) != -2 ||
-        call(17, next, (word)buffer, 1, 1) != 1 || buffer[0] != 'Q') return 168;
+        call(17, next, (word)buffer, 1, 0) != 1 || buffer[0] != 'Q') return 168;
     if (call(3, next, 0, 0, 0) || call(263, dir, (word)alias, 0, 0) ||
         call(263, dir, (word)name, 0, 0)) return 169;
     return 0;
