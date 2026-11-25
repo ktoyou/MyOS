@@ -213,11 +213,12 @@ __attribute__((noreturn)) void exec_shared(word argc) {
 }
 
 __attribute__((noreturn)) void exec_oom(void) {
-    const word size = 0x9000000;
+    const word size = 0x9000000, page = 4096;
     long address = sys(9, 0, size, 3, 0x22, -1, 0);
     long fd = sys(319, (word)"exec-oom", 1, 0, 0, 0, 0);
     if (address < 0 || fd < 0) finish(50);
     volatile unsigned char *memory = (void *)address;
+    for (word offset = 0; offset < size; offset += page) memory[offset] = 0;
     memory[0] = 0xa1;
     memory[size - 1] = 0x2b;
     if (sys(59, (word)"./linux-exec-oom.elf", 0, 0, 0, 0, 0) != -12 ||
