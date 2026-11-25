@@ -105,26 +105,30 @@ static int myfs_setattr_impl(u32 ino,u32 mode,u32 uid,u32 gid) {
 
 /* Время файла — отдельная разреженная таблица. Ноль значит «ещё не записано». */
 #define TIMES_PER_BLOCK (BS / 4)
-static int times_block(u32 ino,bool alloc,u32 *out) {
+static int times_block(u32 ino, bool nanos, bool alloc, u32 *out) {
     int ret;*out=0;
-    if(!sb.times_root) {
+    u32 tree = nanos ? sb.nanos_root : sb.times_root;
+    if(!tree) {
         if(!alloc)return 0;
         u32 root=balloc();if(!root)return FS_ENOSPC;
         if((ret=write_zero_block(root)) || (ret=bitmap_flush())){bfree(root);return ret;}
-        struct superblock old=sb;sb.times_root=root;
+        struct superblock old=sb;
+        if (nanos) sb.nanos_root = root;
+        else sb.times_root = root;
         if(bwrite(0,&sb)){sb=old;bfree(root);return FS_EIO;}
+        tree = root;
     }
     u32 pointers[NINDIRECT];
     u32 index=ino/TIMES_PER_BLOCK;
     if(index/NINDIRECT>=NINDIRECT)return FS_EINVAL;
-    ret=permissions_read(sb.times_root,pointers);if(ret)return ret;
+    ret=permissions_read(tree,pointers);if(ret)return ret;
     u32 leaf=pointers[index/NINDIRECT];
     if(!leaf) {
         if(!alloc)return 0;
         leaf=balloc();if(!leaf)return FS_ENOSPC;
         if((ret=write_zero_block(leaf))){bfree(leaf);return ret;}
         pointers[index/NINDIRECT]=leaf;
-        if((ret=permissions_write(sb.times_root,pointers))){bfree(leaf);return ret;}
+        if((ret=permissions_write(tree,pointers))){bfree(leaf);return ret;}
     }
     if((ret=permissions_read(leaf,pointers)))return ret;
     u32 block=pointers[index%NINDIRECT];
@@ -137,20 +141,23 @@ static int times_block(u32 ino,bool alloc,u32 *out) {
     *out=block;return 0;
 }
 #ifdef HOST_TEST
-static u32 kern_now(void) { return 1; }
+static u32 kern_now(u32 *nanos) { *nanos = 0; return 1; }
 #elif defined(MYOS_STORAGE_X64)
 #include "x86_64/linux.h"
-static u32 kern_now(void) {
+static u32 kern_now(u32 *fraction) {
     long seconds;
     u64 nanos;
+    *fraction = 0;
     if (!linux64_clock_sample(true, &seconds, &nanos) || seconds < 0 || (u64)seconds > (u32)-1)
         return 0;
+    *fraction = (u32)nanos;
     return (u32)seconds;
 }
 #else
 #include "ipc.h"
 #include "timer.h"
-static u32 kern_now(void) {
+static u32 kern_now(u32 *nanos) {
+    *nanos = 0;
     /* UIP у CMOS держится миллисекунды, а touch зовётся на каждую запись.
      * Внутри одной секунды повторно в порты не ходим. */
     static u32 cached, at;
@@ -170,18 +177,40 @@ static u32 kern_now(void) {
     return cached;
 }
 #endif
-static int times_store(u32 ino,u32 when) {
-    u32 block;int ret=times_block(ino,true,&block);if(ret)return ret;
-    u32 rec[TIMES_PER_BLOCK];
-    if((ret=permissions_read(block,rec)))return ret;
-    rec[ino%TIMES_PER_BLOCK]=when?when:1;
-    return permissions_write(block,rec);
+static int times_store(u32 ino, bool nanos, u32 value) {
+    u32 block;
+    int result = times_block(ino, nanos, value != 0, &block);
+    if (result || !block) return result;
+    u32 records[TIMES_PER_BLOCK];
+    result = permissions_read(block, records);
+    if (result) return result;
+    if (records[ino % TIMES_PER_BLOCK] == value) return 0;
+    records[ino % TIMES_PER_BLOCK] = value;
+    return permissions_write(block, records);
 }
-static u32 times_load(u32 ino) {
-    u32 block;if(times_block(ino,false,&block) || !block) return 0;
-    u32 rec[TIMES_PER_BLOCK];
-    if(permissions_read(block,rec)) return 0;
-    return rec[ino%TIMES_PER_BLOCK];
+
+static int times_load(u32 ino, bool nanos, u32 *value) {
+    *value = 0;
+    u32 block;
+    int result = times_block(ino, nanos, false, &block);
+    if (result || !block) return result;
+    u32 records[TIMES_PER_BLOCK];
+    result = permissions_read(block, records);
+    if (result) return result;
+    u32 record = records[ino % TIMES_PER_BLOCK];
+    if (nanos && record >= MYFS_TIME_SECOND_NS) return FS_EIO;
+    *value = record;
+    return 0;
 }
-static int myfs_touch_impl(u32 ino) { return sb.version<3?0:times_store(ino,kern_now()); }
-static int myfs_set_time_impl(u32 ino, u32 when) { return times_store(ino, when ? when : kern_now()); }
+
+static int myfs_set_time_impl(u32 ino, u32 seconds, u32 nanos) {
+    int result = times_store(ino, false, seconds);
+    if (!result && myfs_has_precise_time()) result = times_store(ino, true, nanos);
+    return result;
+}
+
+static int myfs_touch_impl(u32 ino) {
+    if (sb.version < 3) return 0;
+    u32 nanos, seconds = kern_now(&nanos);
+    return myfs_set_time_impl(ino, seconds ? seconds : 1, nanos);
+}

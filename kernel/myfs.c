@@ -16,9 +16,11 @@ void *malloc(unsigned long); void free(void *);
 #define bitmap_free(p) kfree(p)
 #endif
 
+#define MYFS_TIME_SECOND_NS 1000000000u
 #define BS            512                       /* размер блока */
 #define MAGIC         0x5346594D                /* "MYFS" в little-endian */
-#define VERSION       5                       /* format() пишет её; монтирование принимает и 1 */
+#define VERSION       MYFS_SECONDS_VERSION
+#define VERSION_MAX   MYFS_PRECISE_TIME_VERSION
 #define VERSION_MIN   1
 #define NDIRECT       12                        /* версия 1; у версии 2 последний слот — тройной косвенный */
 #define NDIRECT_V2    11
@@ -42,7 +44,8 @@ struct superblock {
     u32 layout_version, permissions_root; /* version 3; inode/data layout stays v1/v2 */
     u32 journal_start, journal_blocks; /* v4: reserved tail, physical redo log */
     u32 times_root; /* v4 extension: preserve journal offsets 44/48 */
-    u8 pad[BS - 14 * 4];
+    u32 nanos_root; /* v6: дробные части времени, отдельное дерево */
+    u8 pad[BS - 15 * 4];
 } __attribute__((packed));
 
 struct inode {
@@ -350,7 +353,8 @@ static u32 ialloc(int type) {
             in.type = type;
             in.links = 1;
             if (iwrite(i, &in)) return 0;
-            if (permissions_store(i,type==FS_TYPE_DIR?0755:0644,0,0)) {
+            if (permissions_store(i,type==FS_TYPE_DIR?0755:0644,0,0) ||
+                (myfs_has_precise_time() && myfs_touch_impl(i))) {
                 memset(&in,0,sizeof(in));iwrite(i,&in);ino_note_free(i);return 0;
             }
             available_inodes--;
@@ -751,7 +755,9 @@ static int myfs_stat_impl(u32 ino, struct fs_stat *st) {
     st->links=in.links;
     st->size = in.size;
     r=permissions_load(ino,&in,&st->mode,&st->uid,&st->gid);if(r)return r;
-    st->mtime=st->atime=st->ctime=times_load(ino);
+    r = times_load(ino, false, &st->mtime);
+    if (r && myfs_has_precise_time()) return r;
+    st->atime = st->ctime = st->mtime;
     u32 data = (in.size + BS - 1) / BS;
     u32 nd = n_direct();
     st->blocks = data + (in.indirect ? 1 : 0);
@@ -1357,7 +1363,7 @@ static int myfs_init_impl(bool *formatted, bool allow_format) {
         return myfs_format();
     }
 
-    if (sb.version < VERSION_MIN || sb.version > VERSION || sb.total_blocks > MAX_BLOCKS || sb.total_blocks > block_get(states[selected].device)->sectors ||
+    if (sb.version < VERSION_MIN || sb.version > VERSION_MAX || sb.total_blocks > MAX_BLOCKS || sb.total_blocks > block_get(states[selected].device)->sectors ||
         sb.bitmap_start != 1 || sb.bitmap_blocks != (sb.total_blocks + BITS_PER_BLK - 1) / BITS_PER_BLK ||
         sb.inode_start != 1 + sb.bitmap_blocks || (sb.inode_count < MIN_INODES || sb.inode_count > MAX_INODES || sb.inode_count % INODES_PER_BLK) ||
         sb.inode_blocks != sb.inode_count / INODES_PER_BLK || sb.data_start != sb.inode_start + sb.inode_blocks ||
@@ -1393,6 +1399,7 @@ static int myfs_init_impl(bool *formatted, bool allow_format) {
         sb.version=VERSION;
         if(bwrite(0,&sb) || disk_barrier())return FS_EIO;
     }
+    if (sb.version < MYFS_PRECISE_TIME_VERSION) sb.nanos_root = 0;
     if(sb.version==4) {
         /* Publish the new format before any timestamp metadata can be logged.
          * Older v4 checkers do not know this sidecar and must refuse the volume. */
@@ -1502,6 +1509,7 @@ static void rollback_syscall(void) {
     block_epoch_rollback();
     cache_forget();
     if(!undo_lost) {
+        sb = saved_super;
         for(unsigned i=0;i<bitmap_undo_n;i++)
             memcpy(bitmap+bitmap_undo_sec[i]*BS,bitmap_undo_data+i*BS,BS);
         available_blocks=saved_blocks;
@@ -1601,6 +1609,12 @@ int myfs_truncate(u32 ino) {
 int myfs_stat(u32 ino, struct fs_stat *st) { int r = myfs_stat_impl(ino, st); return r; }
 int myfs_readdir(u32 dir, u32 *pos, struct fs_dirent *out) { int r = myfs_readdir_impl(dir, pos, out); return r; }
 int myfs_getpath(u32 ino, char *buf, u32 len) { int r = myfs_getpath_impl(ino, buf, len); return r; }
+int myfs_stat_precise(u32 ino, struct fs_stat *st, u32 *nanos) {
+    *nanos = 0;
+    int result = myfs_stat_impl(ino, st);
+    if (result || !myfs_has_precise_time()) return result;
+    return times_load(ino, true, nanos);
+}
 void myfs_info(struct fs_info *info) { myfs_info_impl(info); }
 
 
@@ -1618,13 +1632,50 @@ int myfs_sync(void) {
     r=transaction_end(sync_meta());
     return r?r:commit_pending();
 }
+bool myfs_has_precise_time(void) {
+    return mounted && sb.version == MYFS_PRECISE_TIME_VERSION;
+}
+
+int myfs_enable_precise_time(void) {
+    if (myfs_has_precise_time()) return 0;
+    if (!mounted) return FS_ENODEV;
+    if (sb.version != MYFS_SECONDS_VERSION || transaction_depth) return FS_EINVAL;
+    int result = myfs_sync();
+    if (result) return result;
+
+    /* Старое ядро проверяет версию до replay. Запись версии должна стать
+     * стойкой до первой журнальной транзакции с указателем на новое дерево. */
+    struct superblock updated = sb;
+    updated.version = MYFS_PRECISE_TIME_VERSION;
+    updated.nanos_root = 0;
+    if (disk_write(0, &updated) || disk_barrier()) {
+        block_cache_invalidate();
+        cache_forget();
+        mounted = false;
+        journal_failed[selected] = true;
+        return FS_EIO;
+    }
+    sb = updated;
+    return 0;
+}
+
 int myfs_unmount(void) {int r=myfs_sync();if(r)return r;mounted=false;cache_drop_all();journal_enabled[selected]=false;return 0;}
 
 int myfs_transaction_begin(void){return transaction_begin();}
 int myfs_transaction_end(int result){return transaction_end(result);}
 
 int myfs_touch(u32 ino) {int r=transaction_begin();return r?r:transaction_end(myfs_touch_impl(ino));}
-int myfs_set_time(u32 ino,u32 when) {int r=transaction_begin();return r?r:transaction_end(myfs_set_time_impl(ino,when));}
+int myfs_set_time_precise(u32 ino, u32 when, u32 nanos) {
+    if (nanos >= MYFS_TIME_SECOND_NS || (nanos && !myfs_has_precise_time())) return FS_EINVAL;
+    int result = transaction_begin();
+    return result ? result : transaction_end(myfs_set_time_impl(ino, when, nanos));
+}
+
+int myfs_set_time(u32 ino, u32 when) {
+    if (when) return myfs_set_time_precise(ino, when, 0);
+    u32 nanos, seconds = kern_now(&nanos);
+    return myfs_set_time_precise(ino, seconds ? seconds : 1, myfs_has_precise_time() ? nanos : 0);
+}
 int myfs_set_size(u32 ino, u32 size) {
     return myfs_resize_transaction(ino, size, false);
 }

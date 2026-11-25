@@ -39,7 +39,7 @@ struct linux64_file {
     u32 mode, uid, gid;
     i32 proc_fd_owner, proc_fd_number;
     u32 dns_server;
-    u32 myfs_ino, myfs_links, myfs_blocks, myfs_times[3];
+    u32 myfs_ino, myfs_links, myfs_blocks, myfs_times[3], myfs_time_nsec;
     bool writable_directory, live_pages, private_directory;
     bool proc_fd_directory, proc_exe;
 };

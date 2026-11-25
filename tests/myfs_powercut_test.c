@@ -54,6 +54,75 @@ static int large_save(const u8 *large){
  if(w!=32768)return -1;
  return fs_sync();
 }
+enum { PRECISE_SECONDS = 123456789u, PRECISE_NANOS = 987654321u };
+static int publish_precise_time(void) {
+    int result = myfs_enable_precise_time();
+    if (!result) result = myfs_set_time_precise(file, PRECISE_SECONDS, PRECISE_NANOS);
+    return result ? result : myfs_sync();
+}
+
+static unsigned check_precise_time_power_cuts(void) {
+    policy = 0;
+    reset();
+    struct fs_stat before;
+    u32 fraction;
+    CHECK(myfs_stat_precise(file, &before, &fraction) == 0 && fraction == 0);
+    CHECK(publish_precise_time() == 0);
+    unsigned count = events;
+    CHECK(((u32 *)stable[0])[1] == MYFS_PRECISE_TIME_VERSION);
+    CHECK(((u32 *)stable[0])[14] != 0);
+    unsigned crashes = 0;
+    for (policy = 0; policy < 3; ++policy) for (cut = 1; cut <= count; ++cut) {
+        reset();
+        armed = true;
+        if (!__builtin_setjmp(jump)) {
+            publish_precise_time();
+            CHECK(false);
+        }
+        armed = false;
+        boot();
+        const u32 version = ((u32 *)stable[0])[1];
+        const u32 root = ((u32 *)stable[0])[14];
+        struct fs_stat got;
+        CHECK(myfs_stat_precise(file, &got, &fraction) == 0);
+        CHECK(version == MYFS_SECONDS_VERSION || version == MYFS_PRECISE_TIME_VERSION);
+        if (fraction) {
+            CHECK(version == MYFS_PRECISE_TIME_VERSION && root != 0);
+            CHECK(got.mtime == PRECISE_SECONDS && fraction == PRECISE_NANOS);
+        } else {
+            CHECK(root == 0 && got.mtime == before.mtime);
+        }
+        CHECK(publish_precise_time() == 0);
+        boot();
+        CHECK(myfs_stat_precise(file, &got, &fraction) == 0 &&
+              got.mtime == PRECISE_SECONDS && fraction == PRECISE_NANOS);
+        ++crashes;
+    }
+    reset();
+    CHECK(myfs_enable_precise_time() == 0);
+    CHECK(myfs_transaction_begin() == 0);
+    CHECK(myfs_set_time_precise(file, PRECISE_SECONDS, PRECISE_NANOS) == 0);
+    CHECK(myfs_transaction_end(FS_EINVAL) == FS_EINVAL);
+    struct fs_stat rolled_back;
+    CHECK(myfs_stat_precise(file, &rolled_back, &fraction) == 0 &&
+          rolled_back.mtime == before.mtime && fraction == 0);
+    CHECK(publish_precise_time() == 0);
+    boot();
+    CHECK(myfs_stat_precise(file, &rolled_back, &fraction) == 0 &&
+          rolled_back.mtime == PRECISE_SECONDS && fraction == PRECISE_NANOS);
+    reset();
+    char cached_byte;
+    CHECK(myfs_read(file, 0, &cached_byte, 1) == 1);
+    fail_flush = true;
+    CHECK(myfs_enable_precise_time() == FS_EIO);
+    CHECK(myfs_read(file, 0, &cached_byte, 1) == FS_EIO);
+    fail_flush = false;
+    boot();
+    CHECK(myfs_read(file, 0, &cached_byte, 1) == 1);
+    printf("POWER precise time: %u cuts x 3 cache policies, rollback and failed barrier PASS\n", count);
+    return crashes;
+}
+
 struct snap{int data_err;u32 size,mode;u8 bytes[8192];int a,child,b,moved,newer,link_n;char link[64];};
 static void fill_snap(struct snap *s){
  memset(s,0,sizeof *s);u32 ino=0;
@@ -161,6 +230,7 @@ int main(void){
  boot();struct fs_stat time_stat;CHECK(fs_stat(file,&time_stat)==0 && time_stat.mtime==123456789u);
  boot();CHECK(fs_stat(file,&time_stat)==0 && time_stat.mtime==123456789u);
  printf("TIMESTAMP MIGRATION PASS: legacy timestamps and v4 journal offsets preserved in v5\n");
+ crashes += check_precise_time_power_cuts();
  /* Return the fixture to a valid disk before atexit flush. */
  reset();
  printf("POWER CUT PASS: %u crashes; bitmap repair, duplicate rejection, I/O errors, idempotent recovery\n",crashes);

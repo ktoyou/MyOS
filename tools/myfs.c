@@ -17,11 +17,13 @@
 #include "string.h"
 
 int  host_open_image(const char *path);
-int  host_create_image(const char *path, unsigned sectors);
+int  host_create_image(const char *path, unsigned sectors, bool private_image);
 int  host_replace_image(const char *path, const char *neu);
 unsigned host_sectors(void);
 int  host_read_sector(unsigned lba, void *buf);
 int  host_write_sector(unsigned lba, const void *buf);
+int  host_read_trailing_sector(unsigned filesystem_sectors, void *buf);
+int  host_append_sector(const void *buf);
 void host_close_image(void);
 void host_remove_file(const char *path);
 void *host_load_file(const char *path, unsigned *len);
@@ -143,12 +145,12 @@ struct snap {
     bool link;
     unsigned char *data;
     u32 len;
-    u32 mode,uid,gid;
+    u32 mode, uid, gid, mtime, nanos;
 };
 static struct snap *snaps;
 static int n_snaps, cap_snaps;
 
-static int snap_add(const char *path, bool dir, bool link, unsigned char *data, u32 len) {
+static void snap_add(const char *path, const struct fs_stat *st, u32 nanos, unsigned char *data) {
     if (n_snaps == cap_snaps) {
         cap_snaps = cap_snaps ? cap_snaps * 2 : 64;
         struct snap *p = host_alloc(sizeof(struct snap) * cap_snaps);
@@ -157,14 +159,13 @@ static int snap_add(const char *path, bool dir, bool link, unsigned char *data, 
         snaps = p;
     }
     u32 n = strlen(path);
-    snaps[n_snaps].path = host_alloc(n + 1);
-    memcpy(snaps[n_snaps].path, path, n + 1);
-    snaps[n_snaps].dir = dir;
-    snaps[n_snaps].link = link;
-    snaps[n_snaps].data = data;
-    snaps[n_snaps].len = len;
-    n_snaps++;
-    return FS_OK;
+    char *saved_path = host_alloc(n + 1);
+    memcpy(saved_path, path, n + 1);
+    snaps[n_snaps++] = (struct snap){
+        .path = saved_path, .dir = st->type == FS_TYPE_DIR, .link = st->type == FS_TYPE_LINK,
+        .data = data, .len = st->size, .mode = st->mode, .uid = st->uid, .gid = st->gid,
+        .mtime = st->mtime, .nanos = nanos,
+    };
 }
 
 static int snap_dir(u32 ino, const char *path) {
@@ -186,11 +187,11 @@ static int snap_dir(u32 ino, const char *path) {
             memcpy(child + pl + 1, de.name, nl + 1);
         }
         struct fs_stat st;
-        if ((r = myfs_stat(de.ino, &st))) return r;
+        u32 nanos;
+        if ((r = myfs_stat_precise(de.ino, &st, &nanos))) return r;
         if (st.type == FS_TYPE_DIR) {
-            if ((r = snap_add(child, true, false, NULL, 0)))return r;
-            snaps[n_snaps-1].mode=st.mode;snaps[n_snaps-1].uid=st.uid;snaps[n_snaps-1].gid=st.gid;
-            if((r=snap_dir(de.ino,child)))return r;
+            snap_add(child, &st, nanos, NULL);
+            if ((r = snap_dir(de.ino, child))) return r;
         } else if (st.type == FS_TYPE_LINK || st.type == FS_TYPE_FILE) {
             unsigned char *data = NULL;
             if (st.size) {
@@ -203,8 +204,7 @@ static int snap_dir(u32 ino, const char *path) {
                     off += n;
                 }
             }
-            if ((r = snap_add(child, false, st.type == FS_TYPE_LINK, data, st.size))) return r;
-            snaps[n_snaps-1].mode=st.mode;snaps[n_snaps-1].uid=st.uid;snaps[n_snaps-1].gid=st.gid;
+            snap_add(child, &st, nanos, data);
         } else {
             err("myfs: cannot copy %s\n", child);
             return FS_EINVAL;
@@ -223,6 +223,29 @@ static unsigned parse_mb(const char *s) {
     return v >= 1 && v <= 65536 ? v : 0;
 }
 
+enum { IMAGE_SECTOR_BYTES = 512, PROFILE_TOKEN_OFFSET = 8, PROFILE_TOKEN_BYTES = 16 };
+
+static u32 image_le32(const u8 *p) {
+    return (u32)p[0] | (u32)p[1] << 8 | (u32)p[2] << 16 | (u32)p[3] << 24;
+}
+
+static int read_profile_marker(u8 marker[IMAGE_SECTOR_BYTES], bool *profile) {
+    u8 header[IMAGE_SECTOR_BYTES];
+    *profile = false;
+    if (host_read_sector(0, header)) return FS_EIO;
+    u32 version = image_le32(header + 4), blocks = image_le32(header + 8);
+    if (memcmp(header, "MYFS", 4) ||
+        (version != MYFS_SECONDS_VERSION && version != MYFS_PRECISE_TIME_VERSION) ||
+        !blocks || blocks > FS_MAX_BLOCKS || host_sectors() != blocks + 1)
+        return FS_OK;
+    int result = host_read_trailing_sector(blocks, marker);
+    if (result < 0) return FS_EIO;
+    if (!result || memcmp(marker, "MYOSPROF", PROFILE_TOKEN_OFFSET)) return FS_OK;
+    for (unsigned i = 0; i < PROFILE_TOKEN_BYTES; ++i)
+        *profile |= marker[PROFILE_TOKEN_OFFSET + i] != 0;
+    return FS_OK;
+}
+
 static int cmd_grow(const char *image, const char *mb_text) {
     unsigned mb = parse_mb(mb_text);
     if (!mb) { err("myfs: grow size is megabytes, from 1 to 65536\n"); return FS_EINVAL; }
@@ -230,15 +253,21 @@ static int cmd_grow(const char *image, const char *mb_text) {
 
     unsigned old_kb = host_sectors() / 2;
     myfs_select(0, 0);
-    struct fs_stat root_attributes;int r=fs_stat(FS_ROOT,&root_attributes);
-    if(!r)r = snap_dir(FS_ROOT, "/");
+    bool precise = myfs_has_precise_time(), profile;
+    u8 marker[IMAGE_SECTOR_BYTES];
+    struct fs_stat root_attributes;
+    u32 root_nanos;
+    int r = read_profile_marker(marker, &profile);
+    bool preserve_times = precise || profile;
+    if (!r) r = myfs_stat_precise(FS_ROOT, &root_attributes, &root_nanos);
+    if (!r) r = snap_dir(FS_ROOT, "/");
     if (r) return r;
     host_close_image();
 
     char *neu = host_alloc(strlen(image) + 5);
     memcpy(neu, image, strlen(image));
     memcpy(neu + strlen(image), ".new", 5);
-    if (host_create_image(neu, mb * 2048)) { err("myfs: cannot create %s\n", neu); return FS_EIO; }
+    if (host_create_image(neu, mb * 2048, profile)) { err("myfs: cannot create %s\n", neu); return FS_EIO; }
     bool formatted = false;
     r = fs_init(&formatted);
     if (!r && !formatted) r = FS_EINVAL;            /* новый образ обязан быть пустым */
@@ -255,17 +284,25 @@ static int cmd_grow(const char *image, const char *mb_text) {
         } else r = put_bytes(snaps[i].path, snaps[i].data, snaps[i].len);
     }
     myfs_select(0, 0);
-    if(!r)r=myfs_setattr(FS_ROOT,root_attributes.mode,root_attributes.uid,root_attributes.gid);
-    for(int i=0;!r && i<n_snaps;i++) {
-        u32 ino;r=fs_resolve_nofollow(FS_ROOT,snaps[i].path,&ino);
-        if(!r)r=myfs_setattr(ino,snaps[i].mode,snaps[i].uid,snaps[i].gid);
+    if (!r && precise) r = myfs_enable_precise_time();
+    if (!r) r = myfs_setattr(FS_ROOT, root_attributes.mode, root_attributes.uid, root_attributes.gid);
+    if (!r && preserve_times) r = myfs_set_time_precise(FS_ROOT, root_attributes.mtime, root_nanos);
+    for (int i = 0; !r && i < n_snaps; i++) {
+        const struct snap *entry = &snaps[i];
+        u32 ino;
+        r = fs_resolve_nofollow(FS_ROOT, entry->path, &ino);
+        if (!r) r = myfs_setattr(ino, entry->mode, entry->uid, entry->gid);
+        if (!r && preserve_times) r = myfs_set_time_precise(ino, entry->mtime, entry->nanos);
     }
     for (int i = 0; !r && i < n_snaps; i++) {
         u32 ino;
         struct fs_stat st;
-        r = myfs_resolve(FS_ROOT, snaps[i].path, &ino);
-        if (!r) r = myfs_stat(ino, &st);
+        u32 nanos;
+        r = preserve_times ? fs_resolve_nofollow(FS_ROOT, snaps[i].path, &ino)
+                           : myfs_resolve(FS_ROOT, snaps[i].path, &ino);
+        if (!r) r = myfs_stat_precise(ino, &st, &nanos);
         if (r) break;
+        if (preserve_times && (st.mtime != snaps[i].mtime || nanos != snaps[i].nanos)) { r = FS_EIO; break; }
         if (snaps[i].dir) { if (st.type != FS_TYPE_DIR) r = FS_EIO; continue; }
         if (snaps[i].link) {
             if (st.type != FS_TYPE_LINK || st.size != snaps[i].len) { r = FS_EIO; break; }
@@ -292,6 +329,7 @@ static int cmd_grow(const char *image, const char *mb_text) {
     fs_info(&after);
     /* Группа ещё в памяти: закрытие сбрасывает только кэш секторов. */
     r = fs_sync();
+    if (!r && profile && host_append_sector(marker)) r = FS_EIO;
     host_close_image();
     if (r) {
         host_remove_file(neu);

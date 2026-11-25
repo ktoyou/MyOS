@@ -216,8 +216,9 @@ def read_profile_token(path: Path) -> bytes:
         sectors, remainder = divmod(info.st_size, PROFILE_SECTOR)
         if not stat.S_ISREG(info.st_mode) or remainder or not 1 < sectors <= MYFS_MAX_SECTORS + 1:
             raise ValueError(f'{path}: ожидается файл-образ профиля MyFS')
-        if disk.read(12) != struct.pack('<4sII', b'MYFS', 5, sectors - 1):
-            raise ValueError(f'{path}: неверный заголовок тома профиля MyFS v5')
+        magic, version, blocks = struct.unpack('<4sII', disk.read(12))
+        if magic != b'MYFS' or version not in (5, 6) or blocks != sectors - 1:
+            raise ValueError(f'{path}: неверный заголовок тома профиля MyFS')
         disk.seek(-PROFILE_SECTOR, os.SEEK_END)
         record = disk.read(len(PROFILE_MAGIC) + PROFILE_TOKEN_BYTES)
         token = record[len(PROFILE_MAGIC):]

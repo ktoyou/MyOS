@@ -67,8 +67,10 @@ void linux64_myfs_mount(const struct boot_info *boot, const struct linux64_file_
         if (selected >= 0) return;
         selected = unit;
     }
-    if (selected < 0 || nvme_read(selected, 0, sector) ||
-        !bytes_equal(sector, (const u8 *)"MYFS", 4) || le32(sector + 4) != 5 ||
+    if (selected < 0 || nvme_read(selected, 0, sector)) return;
+    u32 version = le32(sector + 4);
+    if (!bytes_equal(sector, (const u8 *)"MYFS", 4) ||
+        (version != MYFS_SECONDS_VERSION && version != MYFS_PRECISE_TIME_VERSION) ||
         le32(sector + 8) != nvme_sectors(selected) - 1 ||
         block_rescan(selected) || block_disk_partitioned(selected)) return;
     myfs_select(0, selected * 5);
@@ -82,7 +84,8 @@ bool linux64_myfs_mounted(void) {
 
 long linux64_myfs_stat(u32 ino, struct linux64_file *file) {
     struct fs_stat stat;
-    int result = myfs_stat(ino, &stat);
+    u32 nanos;
+    int result = myfs_stat_precise(ino, &stat, &nanos);
     if (result) return error(result);
     u32 type;
     switch (stat.type) {
@@ -95,7 +98,7 @@ long linux64_myfs_stat(u32 ino, struct linux64_file *file) {
         .size = stat.size, .inode = (1ull << 40) | ino, .mode = type | stat.mode,
         .uid = stat.uid, .gid = stat.gid, .writable_directory = stat.type == FS_TYPE_DIR,
         .myfs_ino = ino, .myfs_links = stat.links, .myfs_blocks = stat.blocks,
-        .myfs_times = {stat.atime, stat.mtime, stat.ctime},
+        .myfs_times = {stat.atime, stat.mtime, stat.ctime}, .myfs_time_nsec = nanos,
     };
     return 0;
 }
@@ -128,7 +131,8 @@ long linux64_myfs_create(u32 parent, const char *name, const struct linux64_file
     case LINUX64_S_IFLNK: type = FS_TYPE_LINK; break;
     default: return -95;
     }
-    int result = myfs_transaction_begin();
+    int result = myfs_enable_precise_time();
+    if (!result) result = myfs_transaction_begin();
     if (result) return error(result);
     u32 ino = 0;
     result = myfs_create(parent, name, type, &ino);
@@ -175,7 +179,8 @@ void linux64_myfs_release(u32 ino) {
 
 long linux64_myfs_remove(u32 parent, const char *name, u32 ino) {
     struct myfs_pin *pin = find_pin(ino);
-    int result = myfs_remove_keep(parent, name, pin != NULL);
+    int result = myfs_enable_precise_time();
+    if (!result) result = myfs_remove_keep(parent, name, pin != NULL);
     if (!result && pin) pin->orphan = true;
     return error(result);
 }
@@ -183,7 +188,8 @@ long linux64_myfs_remove(u32 parent, const char *name, u32 ino) {
 long linux64_myfs_rename(u32 old_parent, const char *old_name, u32 new_parent, const char *new_name,
                          u32 victim) {
     struct myfs_pin *pin = victim ? find_pin(victim) : NULL;
-    int result = myfs_rename_at(old_parent, old_name, new_parent, new_name, pin != NULL);
+    int result = myfs_enable_precise_time();
+    if (!result) result = myfs_rename_at(old_parent, old_name, new_parent, new_name, pin != NULL);
     if (!result && pin) pin->orphan = true;
     return error(result);
 }
@@ -205,7 +211,10 @@ long linux64_myfs_read(u32 ino, uptr offset, void *buffer, uptr length) {
 
 long linux64_myfs_write(u32 ino, uptr offset, const void *buffer, uptr length) {
     if (offset > (u32)-1 || length > (u32)-1 - offset) return -27;
-    int result = myfs_write(ino, (u32)offset, buffer, (u32)length);
+    if (!length) return 0;
+    int result = myfs_enable_precise_time();
+    if (result) return error(result);
+    result = myfs_write(ino, (u32)offset, buffer, (u32)length);
     if (result > 0) linux64_myfs_map_update(ino, offset, buffer, (uptr)result);
     return result < 0 ? error(result) : result;
 }
@@ -217,7 +226,8 @@ long linux64_myfs_truncate(u32 ino, uptr size) {
     if (result) return result;
     if (size && size == file.size) return 0;
     if (linux64_myfs_has_mapping(ino)) return -16;
-    return error(myfs_resize(ino, (u32)size));
+    int upgrade = myfs_enable_precise_time();
+    return error(upgrade ? upgrade : myfs_resize(ino, (u32)size));
 }
 
 long linux64_myfs_sync(void) {

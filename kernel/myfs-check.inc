@@ -14,14 +14,21 @@ static int check_claim(u32 b) {
     if(b<sb.data_start || b>=end || (check_bits[b/8]&(1u<<(b%8))))return FS_EIO;
     check_bits[b/8]|=1u<<(b%8);return 0;
 }
-static int check_tree(u32 b,unsigned depth) {
-    if(!b)return 0;
-    if(check_claim(b))return FS_EIO;
-    if(depth) {
-        u32 pointers[NINDIRECT];if(bread(b,pointers))return FS_EIO;
-        for(unsigned i=0;i<NINDIRECT;i++)if(check_tree(pointers[i],depth-1))return FS_EIO;
+static int check_tree_records(u32 b, unsigned depth, u32 record_limit) {
+    if (!b) return 0;
+    if (check_claim(b)) return FS_EIO;
+    if (!depth && !record_limit) return 0;
+    u32 records[NINDIRECT];
+    if (bread(b, records)) return FS_EIO;
+    for (unsigned i = 0; i < NINDIRECT; ++i) {
+        if (depth) {
+            if (check_tree_records(records[i], depth - 1, record_limit)) return FS_EIO;
+        } else if (records[i] >= record_limit) return FS_EIO;
     }
     return 0;
+}
+static int check_tree(u32 b, unsigned depth) {
+    return check_tree_records(b, depth, 0);
 }
 static int check_readdir(u32 ino,u32 size,u32 *pos,struct fs_dirent *out) {
  while(*pos<size) {
@@ -42,6 +49,8 @@ static int myfs_check_impl(bool repair) {
     if(sb.version>=4)for(u32 b=sb.journal_start;b<sb.total_blocks;b++)check_bits[b/8]|=1u<<(b%8);
     if(sb.version>=3 && sb.permissions_root && check_tree(sb.permissions_root,2)){CHECK_ERROR();}
     if(sb.times_root && check_tree(sb.times_root,2)){CHECK_ERROR();}
+    if (sb.version >= MYFS_PRECISE_TIME_VERSION &&
+        check_tree_records(sb.nanos_root, 2, MYFS_TIME_SECOND_NS)) {CHECK_ERROR();}
     struct inode in;
     for(u32 ino=FS_ROOT;ino<sb.inode_count;ino++) {
         if(iread(ino,&in)){CHECK_ERROR();}
