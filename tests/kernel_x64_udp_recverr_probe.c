@@ -33,6 +33,7 @@ struct error_control {
 };
 
 static const char enabled_data[] = "myos-recverr:enabled\xd1", disabled_data[] = "myos-recverr:disabled\xd2";
+static const char purge_data[] = "myos-recverr:purge\xd3";
 
 static long call6(word number, word a, word b, word c, word d, word e, word f) {
     register word arg4 __asm__("r10") = d;
@@ -122,7 +123,21 @@ static int check_recverr(void) {
     if (call(47, enabled, (word)&message, MSG_ERRQUEUE | MSG_DONTWAIT) != -EAGAIN ||
         call(47, disabled, (word)&message, MSG_ERRQUEUE | MSG_DONTWAIT) != -EAGAIN ||
         call(7, (word)poll, 2, 0) || poll[0].revents || poll[1].revents ||
-        !option_is(enabled, SOL_SOCKET, SO_ERROR, 0) || call(3, enabled, 0, 0) || call(3, disabled, 0, 0)) return 5;
+        !option_is(enabled, SOL_SOCKET, SO_ERROR, 0)) return 5;
+
+    static const char purge_sent[] = "UDP RECVERR purge probe sent\n";
+    if (call(1, enabled, (word)purge_data, sizeof(purge_data) - 1) != (long)(sizeof(purge_data) - 1) ||
+        !marker(purge_sent, sizeof(purge_sent) - 1) ||
+        call(7, (word)poll, 2, 4000) != 1 || poll[0].revents != POLLERR || poll[1].revents) return 6;
+
+    // Выключение удаляет запись MSG_ERRQUEUE, а обычная ошибка остаётся до чтения SO_ERROR.
+    if (!set_recverr(enabled, 0) || !option_is(enabled, IPPROTO_IP, IP_RECVERR, 0) ||
+        call(47, enabled, (word)&message, MSG_ERRQUEUE) != -EAGAIN ||
+        call(7, (word)poll, 2, 0) != 1 || poll[0].revents != POLLERR || poll[1].revents ||
+        !option_is(enabled, SOL_SOCKET, SO_ERROR, ECONNREFUSED) ||
+        !option_is(enabled, SOL_SOCKET, SO_ERROR, 0) ||
+        call(7, (word)poll, 2, 0) || poll[0].revents || poll[1].revents ||
+        call(3, enabled, 0, 0) || call(3, disabled, 0, 0)) return 7;
     return 0;
 }
 
@@ -130,7 +145,7 @@ __attribute__((noreturn)) void _start(void) {
     int result = check_recverr();
     if (!result) {
         static const char passed[] = "UDP RECVERR guest PASS\n";
-        if (!marker(passed, sizeof(passed) - 1)) result = 6;
+        if (!marker(passed, sizeof(passed) - 1)) result = 8;
     }
     call(60, result, 0, 0);
     __builtin_trap();

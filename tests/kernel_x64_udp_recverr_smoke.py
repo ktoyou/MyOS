@@ -18,7 +18,10 @@ PEER, PEER_MAC = PEERS[0]
 OFFENDER, OFFENDER_MAC = PEERS[1]
 WRONG_OFFENDER = bytes((10, 44, 0, 83))
 ENABLED_PORT, DISABLED_PORT, REMOTE_PORT = 42003, 42004, 42005
-PAYLOADS = {ENABLED_PORT: b'myos-recverr:enabled\xd1', DISABLED_PORT: b'myos-recverr:disabled\xd2'}
+ENABLED_DATA = b'myos-recverr:enabled\xd1'
+DISABLED_DATA = b'myos-recverr:disabled\xd2'
+PURGE_DATA = b'myos-recverr:purge\xd3'
+PAYLOADS = {ENABLED_DATA: ENABLED_PORT, DISABLED_DATA: DISABLED_PORT, PURGE_DATA: ENABLED_PORT}
 LEASE = 'MyOS x86-64: DHCP address=10.44.0.20 mask=255.255.255.0'
 
 
@@ -29,11 +32,11 @@ def sent_datagrams(pcap):
             continue
         udp = ipv4_data(frame)
         source, dest, length, value = struct.unpack_from('!HHHH', udp)
-        assert source in PAYLOADS and dest == REMOTE_PORT and length == len(udp), udp.hex()
+        data = udp[8:]
+        assert PAYLOADS.get(data) == source and dest == REMOTE_PORT and length == len(udp), udp.hex()
         assert not value or checksum(pseudo_header(ADDRESS, PEER, length) + udp) == 0, udp.hex()
-        assert udp[8:] == PAYLOADS[source], udp.hex()
         ip_size, = struct.unpack_from('!H', frame, 16)
-        yield source, frame[14:14 + ip_size]
+        yield data, frame[14:14 + ip_size]
 
 
 def other_remote_port(quote):
@@ -52,6 +55,16 @@ def icmp_unreachable(quote, source, identification):
     return MAC + OFFENDER_MAC + b'\x08\x00' + ip + icmp
 
 
+def wait_datagrams(pcap, *payloads):
+    deadline = time.monotonic() + 4
+    while time.monotonic() < deadline:
+        quotes = dict(sent_datagrams(pcap))
+        if quotes.keys() >= set(payloads):
+            return quotes
+        time.sleep(.05)
+    raise AssertionError(f'missing UDP datagrams for ICMP quotation: {payloads!r}')
+
+
 def exercise(vm, pcap, injector):
     vm.wait('UDP RECVERR guest ready')
     assert LEASE not in vm.log.read_text(errors='replace'), 'lease before link up'
@@ -63,18 +76,14 @@ def exercise(vm, pcap, injector):
         wait_frame(pcap, lambda frame: frame.startswith(arp_query()), 'ARP request for UDP peer')
         send_frames(peer, arp_reply())
         vm.wait('UDP RECVERR probes sent', timeout=6)
-        deadline = time.monotonic() + 4
-        while time.monotonic() < deadline:
-            quotes = dict(sent_datagrams(pcap))
-            if quotes.keys() == PAYLOADS.keys():
-                break
-            time.sleep(.05)
-        else:
-            raise AssertionError('missing both quoted UDP datagrams')
+        quotes = wait_datagrams(pcap, DISABLED_DATA, ENABLED_DATA)
         # Сначала кадры, которые не должны попасть в очередь включённого сокета.
-        send_frames(peer, icmp_unreachable(quotes[DISABLED_PORT], OFFENDER, 0x204),
-                    icmp_unreachable(other_remote_port(quotes[ENABLED_PORT]), WRONG_OFFENDER, 0x205),
-                    icmp_unreachable(quotes[ENABLED_PORT], OFFENDER, 0x206))
+        send_frames(peer, icmp_unreachable(quotes[DISABLED_DATA], OFFENDER, 0x204),
+                    icmp_unreachable(other_remote_port(quotes[ENABLED_DATA]), WRONG_OFFENDER, 0x205),
+                    icmp_unreachable(quotes[ENABLED_DATA], OFFENDER, 0x206))
+        vm.wait('UDP RECVERR purge probe sent', timeout=6)
+        quote = wait_datagrams(pcap, PURGE_DATA)[PURGE_DATA]
+        send_frames(peer, icmp_unreachable(quote, OFFENDER, 0x207))
 
 
 def check_capture(pcap):
@@ -88,9 +97,10 @@ def check_capture(pcap):
         icmp = ipv4_data(frame)
         assert icmp[:2] == b'\x03\x03' and not checksum(icmp), icmp.hex()
         errors.append((frame[26:30], icmp[8:]))
-    assert errors == [(OFFENDER, quotes[DISABLED_PORT]),
-                      (WRONG_OFFENDER, other_remote_port(quotes[ENABLED_PORT])),
-                      (OFFENDER, quotes[ENABLED_PORT])], errors
+    assert errors == [(OFFENDER, quotes[DISABLED_DATA]),
+                      (WRONG_OFFENDER, other_remote_port(quotes[ENABLED_DATA])),
+                      (OFFENDER, quotes[ENABLED_DATA]),
+                      (OFFENDER, quotes[PURGE_DATA])], errors
 
 
 def main():

@@ -700,8 +700,10 @@ static long udp_recverr_option(struct linux64_socket *socket, bool get, uptr val
         }
         socket->udp_recverr = enabled != 0;
         if (!enabled) {
+            /* Выключение опции удаляет очередь, но уже выставленный SO_ERROR остаётся. */
+            i32 pending = socket->udp_icmp_errno;
             while (socket->udp_err_head) drop_udp_error(socket);
-            socket->udp_icmp_errno = 0;
+            socket->udp_icmp_errno = pending;
         }
         return 0;
     }
