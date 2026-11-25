@@ -269,6 +269,17 @@ const struct linux64_process *linux64_process_by_pid(i32 pid) {
     return NULL;
 }
 
+const struct linux64_process *linux64_process_by_visible_pid(i32 pid) {
+    if (pid <= 0) return NULL;
+    const struct linux64_pidns *ns = linux64_current->process->pid_ns;
+    for (unsigned i = 0; i < LINUX64_PROCESS_COUNT; ++i) {
+        const struct linux64_process *process = &processes[i];
+        if (process->threads && linux64_pid_number(process->pid_identity, ns) == pid)
+            return process;
+    }
+    return NULL;
+}
+
 static void reap_process(struct linux64_process *process) {
     linux64_pid_release(process->group_identity);
     linux64_pid_release(process->pid_identity);

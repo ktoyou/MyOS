@@ -960,8 +960,67 @@ static enum linux64_proc_node proc_path(const char *path) {
     return USERNS_NONE;
 }
 
+static bool proc_peer_exe_node(const char *path, struct linux64_file *file) {
+    const char *part = path_tail(path, "/proc/");
+    if (!part || *part < '1' || *part > '9') return false;
+    unsigned pid = 0;
+    do {
+        unsigned digit = (unsigned)(*part++ - '0');
+        if (pid > (0x7fffffffu - digit) / 10) return false;
+        pid = pid * 10 + digit;
+    } while (*part >= '0' && *part <= '9');
+    if (*part) return false;
+    const struct linux64_process *target = linux64_process_by_visible_pid((i32)pid);
+    if (!target) return false;
+    /* В inode входит внутренний PID, который не меняется при переходе между PID namespace. */
+    u64 inode = (1ull << 38) + 2ull * (u32)target->pid;
+    *file = (struct linux64_file){
+        .mode = LINUX64_S_IFDIR | 0555, .inode = inode,
+        .uid = LINUX64_UID, .gid = LINUX64_GID,
+        .proc_peer_exe_owner = target->pid,
+    };
+    return true;
+}
+
+static const struct linux64_process *proc_peer_exe_process(i32 owner) {
+    const struct linux64_process *target = linux64_process_by_pid(owner);
+    if (!target || !target->threads || !target->executable_path_length ||
+        !linux64_pid_number(target->pid_identity, linux64_current->process->pid_ns))
+        return NULL;
+    return target;
+}
+
+bool linux64_proc_peer_exe_entry(const struct linux64_file *directory, const char *name,
+                                 struct linux64_file *file) {
+    if (!path_equal(name, "exe", false) || !proc_peer_exe_process(directory->proc_peer_exe_owner))
+        return false;
+    /* Дескриптор каталога сохраняет исходный PID даже при смене пространства имён. */
+    *file = (struct linux64_file){
+        .mode = LINUX64_S_IFLNK | 0777, .inode = directory->inode + 1,
+        .uid = directory->uid, .gid = directory->gid,
+        .proc_peer_exe_owner = directory->proc_peer_exe_owner,
+    };
+    return true;
+}
+
+long linux64_proc_peer_exe_target(i32 owner, const char **path) {
+    const struct linux64_process *target = proc_peer_exe_process(owner);
+    const struct linux64_process *caller = linux64_current->process;
+    if (!target) return -ENOENT;
+    if (target->userns != caller->userns) return -EACCES;
+
+    const char *name = target->executable_path;
+    const char *root = caller->fs->root.path;
+    if (!path_equal(root, "/", false)) {
+        name = path_tail(name, root);
+        if (!name || *name != '/') return -EACCES;
+    }
+    *path = name;
+    return (long)(target->executable_path_length - (uptr)(name - target->executable_path));
+}
+
 bool linux64_special_node(const char *path, struct linux64_file *file) {
-    if (device_node(path, file)) return true;
+    if (device_node(path, file) || proc_peer_exe_node(path, file)) return true;
     if (path_equal(path, "/proc/self/fdinfo", false)) {
         struct linux64_process *process = linux64_current->process;
         if (!process->fdinfo_inode) process->fdinfo_inode = next_fdinfo_inode++;
@@ -1756,7 +1815,13 @@ static long linux_readlink(i32 dirfd, uptr path_address, uptr destination, i32 s
         return linux64_netns_readlink(linux64_current->process->net_ns, destination, (uptr)size);
     const u8 *target = file.bytes;
     uptr length = file.size;
-    if (proc == PROC_EXE) {
+    if (file.proc_peer_exe_owner && (file.mode & LINUX64_S_IFMT) == LINUX64_S_IFLNK) {
+        const char *exe;
+        result = linux64_proc_peer_exe_target(file.proc_peer_exe_owner, &exe);
+        if (result < 0) return result;
+        target = (const u8 *)exe;
+        length = (uptr)result;
+    } else if (proc == PROC_EXE) {
         target = (const u8 *)linux64_current->process->executable_path;
         length = linux64_current->process->executable_path_length;
     } else if ((file.mode & LINUX64_S_IFMT) != LINUX64_S_IFLNK) return -EINVAL;

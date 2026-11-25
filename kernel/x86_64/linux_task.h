@@ -270,6 +270,10 @@ bool linux64_task_init(uptr data_bytes);
 void linux64_task_clock_resume(void);
 bool linux64_task_cpu_ns(u64 *nanos);
 const struct linux64_process *linux64_process_by_pid(i32 pid);
+const struct linux64_process *linux64_process_by_visible_pid(i32 pid);
+bool linux64_proc_peer_exe_entry(const struct linux64_file *directory, const char *name,
+                                 struct linux64_file *file);
+long linux64_proc_peer_exe_target(i32 owner, const char **path);
 u16 linux64_task_count(void);
 void linux64_task_syscall(struct linux64_frame *frame);
 bool linux64_build_signal_frame(struct linux64_frame *frame, const struct linux64_siginfo *info,

@@ -523,6 +523,8 @@ static long walk_inner(const struct linux64_directory *base, const char *input,
             long result = linux64_proc_fd_entry(file->proc_fd_owner, start, count, &child);
             if (result && result != -ENOENT) return result;
             found = !result;
+        } else if (file->proc_peer_exe_owner) {
+            found = linux64_proc_peer_exe_entry(file, name, &child);
         } else {
             found = !file->private_directory && find_node(source, path, &child);
         }
@@ -572,6 +574,9 @@ static long walk_inner(const struct linux64_directory *base, const char *input,
             if (child.myfs_ino) {
                 long result = read_link(scratch, &child, &absolute);
                 if (result) return result;
+            } else if (child.proc_peer_exe_owner) {
+                long result = linux64_proc_peer_exe_target(child.proc_peer_exe_owner, &absolute);
+                if (result < 0) return result;
             } else {
                 absolute = (const char *)child.bytes;
             }

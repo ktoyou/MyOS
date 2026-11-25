@@ -41,6 +41,7 @@ struct linux64_file {
     u32 dns_server;
     u32 myfs_ino, myfs_links, myfs_blocks, myfs_times[3], myfs_time_nsec;
     bool writable_directory, live_pages, private_directory;
+    i32 proc_peer_exe_owner;
     bool proc_fd_directory, proc_exe;
 };
 
