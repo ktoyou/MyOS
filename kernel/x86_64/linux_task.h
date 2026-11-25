@@ -174,6 +174,8 @@ struct linux64_poll_wait {
     bool input;
 };
 
+struct linux64_seccomp_filter;
+
 struct linux64_task {
     struct linux64_frame frame;
     u64 cpu_ns;
@@ -194,6 +196,7 @@ struct linux64_task {
     i32 tid, visible_tid, vfork_child;
     u16 ds_selector, es_selector, fs_selector, gs_selector;
     enum linux64_task_state state;
+    struct linux64_seccomp_filter *seccomp;
     bool finish_wait, no_new_privs;
     uptr xstate_physical;
 };

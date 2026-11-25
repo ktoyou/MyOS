@@ -1,4 +1,5 @@
 #include "linux_task.h"
+#include "linux_seccomp.h"
 #include "paging.h"
 
 #define NS_PER_SECOND 1000000000l
@@ -15,7 +16,9 @@ enum {
                     CLONE_SYSVSEM | CLONE_SETTLS | CLONE_PARENT_SETTID | CHILD_CLEARTID,
     FUTEX_WAIT = 0, FUTEX_WAKE = 1, FUTEX_WAIT_BITSET = 9, FUTEX_WAKE_BITSET = 10,
     FUTEX_PRIVATE_FLAG = 128, FUTEX_CLOCK_REALTIME = 256,
-    PR_SET_NO_NEW_PRIVS = 38, PR_GET_NO_NEW_PRIVS = 39,
+    PR_GET_SECCOMP = 21, PR_SET_SECCOMP = 22, PR_SET_NO_NEW_PRIVS = 38, PR_GET_NO_NEW_PRIVS = 39,
+    SECCOMP_MODE_FILTER = 2, SECCOMP_SET_MODE_FILTER = 1, SECCOMP_GET_ACTION_AVAIL = 2,
+    SECCOMP_TSYNC = 1, SECCOMP_TSYNC_ESRCH = 0x10, SIGSYS = 31,
     SA_NOCLDWAIT = 2, SIG_IGN = 1,
     WNOHANG = 1, WUNTRACED = 2, WEXITED = 4, WCONTINUED = 8, WNOWAIT = 0x01000000,
     P_ALL = 0, P_PID = 1, P_PGID = 2,
@@ -277,6 +280,7 @@ static long clone_task(struct linux64_frame *frame, uptr flags, uptr stack, uptr
     child->vfork_child = 0;
     child->signal_mask = parent->signal_mask;
     child->no_new_privs = parent->no_new_privs;
+    child->seccomp = linux64_seccomp_retain(parent->seccomp);
     child->caps = parent->caps;
     if (new_user) linux64_userns_caps(child);
     if (!thread) {
@@ -582,6 +586,8 @@ static void stop_task(struct linux64_task *task) {
     linux64_epoll_wait_finish(task);
     linux64_flock_wait_finish(task);
     linux64_input_wait_finish(task);
+    linux64_seccomp_release(task->seccomp);
+    task->seccomp = NULL;
     release_xstate(task);
     task->state = TASK_DEAD;
     --task->process->threads;
@@ -634,7 +640,10 @@ static void finish_task(i32 wait_status, bool group) {
     process->userns = NULL;
     linux64_fs_release(process->fs);
     process->fs = NULL;
-    if (process->pid == LINUX64_PID) halt_init((u32)process->exit_status >> 8);
+    if (process->pid == LINUX64_PID) {
+        u32 signal = (u32)wait_status & 0x7fu;
+        halt_init(signal ? 128u + signal : (u32)wait_status >> 8);
+    }
     complete_vfork(process->pid);
     i32 namespace_init = linux64_pidns_reaper(process->pid_ns);
     if (process->pid == namespace_init) {
@@ -839,8 +848,70 @@ void linux64_task_exception(u64 vector) {
     linux64_task_resume(&frame);
 }
 
+static i32 task_seccomp(u32 operation, u32 flags, uptr address) {
+    if (operation == SECCOMP_GET_ACTION_AVAIL)
+        return flags ? -EINVAL : linux64_seccomp_action_available(address);
+    if (operation != SECCOMP_SET_MODE_FILTER || (flags & ~(SECCOMP_TSYNC | SECCOMP_TSYNC_ESRCH)))
+        return -EINVAL;
+    struct linux64_task *current = linux64_current;
+    bool permitted = current->no_new_privs || (current->caps.effective & LINUX64_CAP_SYS_ADMIN);
+    struct linux64_seccomp_filter *filter;
+    i32 result = linux64_seccomp_prepare(address, permitted, current->seccomp, &filter);
+    if (result) return result;
+    if (flags & SECCOMP_TSYNC) {
+        /* До проверки всей группы фильтры потоков остаются неизменными. */
+        for (unsigned i = 0; i < LINUX64_TASK_COUNT; ++i) {
+            struct linux64_task *peer = &tasks[i];
+            if (peer->state == TASK_FREE || peer->state == TASK_DEAD || peer->process != current->process)
+                continue;
+            if (linux64_seccomp_ancestor(peer->seccomp, current->seccomp)) continue;
+            linux64_seccomp_release(filter);
+            return flags & SECCOMP_TSYNC_ESRCH ? -ESRCH : peer->visible_tid;
+        }
+        for (unsigned i = 0; i < LINUX64_TASK_COUNT; ++i) {
+            struct linux64_task *peer = &tasks[i];
+            if (peer == current || peer->state == TASK_FREE || peer->state == TASK_DEAD ||
+                peer->process != current->process) continue;
+            linux64_seccomp_release(peer->seccomp);
+            peer->seccomp = linux64_seccomp_retain(filter);
+            peer->no_new_privs |= current->no_new_privs;
+        }
+    }
+    linux64_seccomp_release(current->seccomp);
+    current->seccomp = filter;
+    return 0;
+}
+
+static bool seccomp_allows(struct linux64_frame *frame) {
+    u32 decision = linux64_seccomp_evaluate(linux64_current->seccomp, frame);
+    u32 action = decision & LINUX64_SECCOMP_ACTION;
+    switch (action) {
+    case LINUX64_SECCOMP_ALLOW:
+        return true;
+    case LINUX64_SECCOMP_ERRNO: {
+        u32 error = decision & LINUX64_SECCOMP_DATA;
+        frame->rax = (u64)-(long)(error > 4095 ? 4095 : error);
+        break;
+    }
+    case LINUX64_SECCOMP_TRACE:
+    case LINUX64_SECCOMP_USER_NOTIF:
+        frame->rax = (u64)-ENOSYS;
+        break;
+    default:
+        /* Для действий без обслуживающего ABI вызов остаётся запрещённым. */
+        finish_task(SIGSYS, action != LINUX64_SECCOMP_KILL_THREAD);
+        break;
+    }
+    return false;
+}
+
 static long task_prctl(i32 option, uptr value, uptr third, uptr fourth, uptr fifth) {
     switch (option) {
+    case PR_GET_SECCOMP:
+        return linux64_current->seccomp ? SECCOMP_MODE_FILTER : 0;
+    case PR_SET_SECCOMP:
+        if (value != SECCOMP_MODE_FILTER || fourth || fifth) return -EINVAL;
+        return task_seccomp(SECCOMP_SET_MODE_FILTER, 0, third);
     case PR_SET_NO_NEW_PRIVS:
         if (value != 1 || third || fourth || fifth) return -EINVAL;
         linux64_current->no_new_privs = true;
@@ -854,6 +925,10 @@ static long task_prctl(i32 option, uptr value, uptr third, uptr fourth, uptr fif
 }
 
 void linux64_task_syscall(struct linux64_frame *frame) {
+    if (!seccomp_allows(frame)) {
+        schedule(frame);
+        return;
+    }
     uptr number = frame->rax;
     switch (number) {
     case 24: /* sched_yield */
@@ -910,6 +985,9 @@ void linux64_task_syscall(struct linux64_frame *frame) {
         break;
     case 272: /* unshare */
         frame->rax = (u64)unshare((u32)frame->rdi);
+        break;
+    case 317: /* seccomp */
+        frame->rax = (u64)task_seccomp((u32)frame->rdi, (u32)frame->rsi, frame->rdx);
         break;
     default:
         frame->rax = (u64)linux64_syscall(number, frame->rdi, frame->rsi, frame->rdx,
