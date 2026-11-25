@@ -1,5 +1,6 @@
 #include "linux_task.h"
 #include "paging.h"
+#include "linux_myfs.h"
 
 /* MAP_FIXED меняет только страницы отдельной области mmap. */
 #define MAP_START 0x1000000000ul
@@ -160,6 +161,7 @@ long linux64_mmap(uptr address, uptr length, u32 protection, u32 flags, i32 fd, 
     struct linux64_fd_view view;
     struct paging64_mmap_file mapping = {0};
     bool no_write = false;
+    u32 myfs_ino = 0;
     if (!anonymous) {
         long result = linux64_get_file(fd, &view);
         if (result) return result;
@@ -173,6 +175,14 @@ long linux64_mmap(uptr address, uptr length, u32 protection, u32 flags, i32 fd, 
         mapping.offset = offset;
         mapping.frame = view.frame;
         mapping.object = view.object;
+        myfs_ino = view.file.myfs_ino;
+        if (myfs_ino) {
+            if (((mapping.length + PAGE_MASK) & ~PAGE_MASK) < length) return -EINVAL;
+            no_write = shared;
+            mapping.frame = linux64_myfs_map_frame;
+            mapping.object = (const void *)(uptr)myfs_ino;
+            mapping.cached = true;
+        }
     }
 
     if (flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) {
@@ -198,10 +208,15 @@ long linux64_mmap(uptr address, uptr length, u32 protection, u32 flags, i32 fd, 
     if (data_bytes > memory->data_bytes && data_bytes > linux64_current->process->data_limit.soft)
         return -ENOMEM;
     if (!stage_range(address, end, reserve)) return -ENOMEM;
-    if (reserve ? !paging64_remove_mmap(address, end)
-                : !paging64_map_mmap(address, end, anonymous ? NULL : &mapping,
-                                     protection != 0, writable, executable, shared, no_write))
-        return -ENOMEM;
+    if (myfs_ino) {
+        long result = linux64_myfs_map_prepare(myfs_ino, offset, mapping.length);
+        if (result) return result;
+    }
+    bool mapped = reserve ? paging64_remove_mmap(address, end)
+                          : paging64_map_mmap(address, end, anonymous ? NULL : &mapping,
+                                              protection != 0, writable, executable, shared, no_write);
+    if (myfs_ino) linux64_myfs_map_finish(myfs_ino, offset, mapping.length);
+    if (!mapped) return -ENOMEM;
     memory->data_bytes = data_bytes;
     commit_ranges();
     return (long)address;

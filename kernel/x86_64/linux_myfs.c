@@ -206,12 +206,13 @@ long linux64_myfs_read(u32 ino, uptr offset, void *buffer, uptr length) {
 long linux64_myfs_write(u32 ino, uptr offset, const void *buffer, uptr length) {
     if (offset > (u32)-1 || length > (u32)-1 - offset) return -27;
     int result = myfs_write(ino, (u32)offset, buffer, (u32)length);
+    if (result > 0) linux64_myfs_map_update(ino, offset, buffer, (uptr)result);
     return result < 0 ? error(result) : result;
 }
 
 long linux64_myfs_truncate(u32 ino, uptr size) {
     struct linux64_file file;
-    if (!size) return error(myfs_truncate(ino));
+    if (!size) return linux64_myfs_has_mapping(ino) ? -16 : error(myfs_truncate(ino));
     long result = linux64_myfs_stat(ino, &file);
     return result ? result : size == file.size ? 0 : -95;
 }

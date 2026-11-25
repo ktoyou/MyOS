@@ -740,10 +740,9 @@ long linux64_get_file(i32 fd, struct linux64_fd_view *view) {
     if (!open_file(fd)) return -EBADF;
     if (kind_of(file_at(fd)) != FILE_REGULAR) return -ENODEV;
     if ((file_at(fd)->flags & O_ACCMODE) == O_WRONLY) return -EACCES;
-    /* Для mmap нужен постоянный источник страниц, которого у дискового файла пока нет. */
-    if (file_at(fd)->file.myfs_ino) return -ENODEV;
     const struct memfd *memfd = file_at(fd)->memfd;
     *view = (struct linux64_fd_view){.file = file_at(fd)->file};
+    if (view->file.myfs_ino) return linux64_myfs_stat(view->file.myfs_ino, &view->file);
     if (memfd) {
         view->file.size = memfd->size;
         if (!view->file.backing) view->file.inode = memfd->inode;

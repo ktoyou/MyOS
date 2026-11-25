@@ -1,16 +1,21 @@
 typedef unsigned long word;
 
 enum {
-    SYS_READ = 0, SYS_WRITE = 1, SYS_CLOSE = 3, SYS_FSTAT = 5, SYS_PREAD = 17,
+    SYS_READ = 0, SYS_WRITE = 1, SYS_CLOSE = 3, SYS_FSTAT = 5, SYS_MMAP = 9, SYS_MPROTECT = 10, SYS_MUNMAP = 11,
+    SYS_PREAD = 17, SYS_PWRITE = 18,
     SYS_PIPE = 22, SYS_DUP = 32, SYS_GETPID = 39, SYS_FORK = 57, SYS_EXIT = 60, SYS_WAIT4 = 61,
-    SYS_FCNTL = 72, SYS_FLOCK = 73, SYS_FSYNC = 74, SYS_FDATASYNC = 75, SYS_GETCWD = 79, SYS_CHDIR = 80, SYS_UMASK = 95,
+    SYS_FCNTL = 72, SYS_FLOCK = 73, SYS_FSYNC = 74, SYS_FDATASYNC = 75, SYS_FTRUNCATE = 77,
+    SYS_GETCWD = 79, SYS_CHDIR = 80, SYS_UMASK = 95,
     SYS_GETDENTS64 = 217, SYS_OPENAT = 257, SYS_MKDIRAT = 258, SYS_STATAT = 262, SYS_UNLINKAT = 263, SYS_RENAMEAT = 264,
     SYS_SYMLINKAT = 266, SYS_READLINKAT = 267,
     AT_FDCWD = -100, AT_SYMLINK_NOFOLLOW = 0x100, O_RDONLY = 0, O_RDWR = 2,
     O_CREAT = 0100, O_EXCL = 0200, O_DIRECTORY = 0200000, O_NOFOLLOW = 0400000,
-    ENOENT = 2, EAGAIN = 11, EACCES = 13, EEXIST = 17, EXDEV = 18, ENOTDIR = 20, EISDIR = 21, ELOOP = 40,
+    ENOENT = 2, EAGAIN = 11, EACCES = 13, EBUSY = 16, EEXIST = 17, EXDEV = 18,
+    ENOTDIR = 20, EISDIR = 21, EINVAL = 22, ELOOP = 40,
     DT_DIR = 4, DT_REG = 8, DT_LNK = 10, PAYLOAD_BYTES = 9728, PATH_LIMIT = 4096, DEEP_LEVELS = 36,
     F_GETLK = 5, F_SETLK = 6, F_RDLCK = 0, F_WRLCK = 1, F_UNLCK = 2, LOCK_EX = 2, LOCK_NB = 4, SEEK_END = 2,
+    PAGE_BYTES = 4096, MAP_BYTES = 2 * PAGE_BYTES, PATCH_OFFSET = 2 * PAGE_BYTES - 2, PATCH_BYTES = 4,
+    PROT_READ = 1, PROT_WRITE = 2, PROT_EXEC = 4, MAP_SHARED = 1, MAP_PRIVATE = 2, MAP_FIXED = 0x10,
 };
 
 struct file_stat {
@@ -54,6 +59,20 @@ static long call(word number, word a0, word a1, word a2, word a3) {
     __asm__ volatile("syscall" : "+a"(number) : "D"(a0), "S"(a1), "d"(a2), "r"(fourth)
                      : "rcx", "r11", "memory");
     return (long)number;
+}
+
+static long map_file(long fd, word address, word length, word protection, word mode, word offset) {
+    word number = SYS_MMAP;
+    register word flags __asm__("r10") = mode;
+    register word file __asm__("r8") = fd;
+    register word position __asm__("r9") = offset;
+    __asm__ volatile("syscall" : "+a"(number) : "D"(address), "S"(length), "d"(protection), "r"(flags), "r"(file), "r"(position)
+                     : "rcx", "r11", "memory");
+    return (long)number;
+}
+
+static long map_shared(long fd, word length, word protection, word offset) {
+    return map_file(fd, 0, length, protection, MAP_SHARED, offset);
 }
 
 static long open_at(long directory, const char *name, word flags, word mode) {
@@ -126,6 +145,108 @@ static int contents_match(long fd) {
     for (unsigned i = 0; i < PAYLOAD_BYTES; ++i)
         if (buffer[i] != pattern(i)) return 0;
     return 1;
+}
+
+static int mapped_contents(const volatile unsigned char *mapping, const unsigned char *patch) {
+    for (unsigned i = 0; i < MAP_BYTES; ++i) {
+        unsigned offset = PAGE_BYTES + i;
+        unsigned char expected = offset < PAYLOAD_BYTES ? pattern(offset) : 0;
+        if (patch && offset >= PATCH_OFFSET && offset < PATCH_OFFSET + PATCH_BYTES)
+            expected = patch[offset - PATCH_OFFSET];
+        if (mapping[i] != expected) return 0;
+    }
+    return 1;
+}
+
+static int patch_mapped_file(long directory, const volatile unsigned char *mapping) {
+    static const char moved[] = "Preferences.moved";
+    struct file_stat info;
+    if (call(SYS_RENAMEAT, directory, (word)current, directory, (word)moved) ||
+        stat_at(directory, current, &info, 0) != -ENOENT || !mapped_contents(mapping, 0)) return 50;
+
+    unsigned char original[PATCH_BYTES], patch[PATCH_BYTES];
+    for (unsigned i = 0; i < PATCH_BYTES; ++i) {
+        original[i] = pattern(PATCH_OFFSET + i);
+        patch[i] = (unsigned char)~original[i];
+    }
+    long writer = open_at(directory, moved, O_RDWR, 0);
+    if (writer < 0 || call(SYS_PWRITE, writer, (word)patch, sizeof(patch), PATCH_OFFSET) != sizeof(patch) ||
+        close_fd(writer) || !mapped_contents(mapping, patch)) return 51;
+
+    /* У потомка есть общее отображение, а дескрипторы файла уже закрыты. */
+    long child = call(SYS_FORK, 0, 0, 0, 0);
+    if (!child) finish(!mapped_contents(mapping, patch));
+    if (!child_passed(child)) return 52;
+
+    writer = open_at(directory, moved, O_RDWR, 0);
+    if (writer < 0 || call(SYS_PWRITE, writer, (word)original, sizeof(original), PATCH_OFFSET) != sizeof(original) ||
+        call(SYS_FDATASYNC, writer, 0, 0, 0) || close_fd(writer) || !mapped_contents(mapping, 0) ||
+        call(SYS_RENAMEAT, directory, (word)moved, directory, (word)current) || call(SYS_FSYNC, directory, 0, 0, 0))
+        return 53;
+    return 0;
+}
+
+static int check_fixed_replacement(long directory, long address) {
+    long fd = open_at(directory, current, O_RDONLY, 0);
+    if (fd < 0 || map_file(fd, address, MAP_BYTES, PROT_READ, MAP_FIXED | MAP_PRIVATE, PAGE_BYTES) != address ||
+        !mapped_contents((const void *)address, 0)) return 58;
+    if (call(SYS_MPROTECT, address, MAP_BYTES, PROT_READ | PROT_WRITE, 0)) return 59;
+    volatile unsigned char *snapshot = (void *)address;
+    unsigned char first = (unsigned char)~pattern(PAGE_BYTES), second = (unsigned char)~pattern(2 * PAGE_BYTES);
+    snapshot[0] = first;
+    snapshot[PAGE_BYTES] = second;
+    if (snapshot[0] != first || snapshot[PAGE_BYTES] != second || !contents_match(fd) || close_fd(fd)) return 60;
+    return 0;
+}
+
+static int check_map_reclamation(long directory) {
+    static const char name[] = "mapping-reclaim";
+    long fd = open_at(directory, name, O_CREAT | O_EXCL | O_RDWR, 0600);
+    for (unsigned i = 0; i < MAP_BYTES; ++i) buffer[i] = pattern(i);
+    if (fd < 0 || call(SYS_WRITE, fd, (word)buffer, MAP_BYTES, 0) != MAP_BYTES) return 61;
+    long address = map_shared(fd, MAP_BYTES, PROT_READ, 0);
+    if (address < 0 || call(SYS_FTRUNCATE, fd, 0, 0, 0) != -EBUSY) return 62;
+    struct file_stat info;
+    if (call(SYS_MUNMAP, address, MAP_BYTES, 0, 0) || call(SYS_FTRUNCATE, fd, 0, 0, 0) ||
+        stat_fd(fd, &info) || info.size || call(SYS_PREAD, fd, (word)buffer, 1, 0) || close_fd(fd) ||
+        call(SYS_UNLINKAT, directory, (word)name, 0, 0) || call(SYS_FSYNC, directory, 0, 0, 0)) return 63;
+    return 0;
+}
+
+static int check_profile_mmap(long parent, int first_boot) {
+    long directory = open_at(parent, final_dir, O_RDONLY | O_DIRECTORY, 0);
+    long fd = directory < 0 ? directory : open_at(directory, current, first_boot ? O_RDWR : O_RDONLY, 0);
+    if (fd < 0 || map_shared(fd, PAGE_BYTES, PROT_READ, 3 * PAGE_BYTES) != -EINVAL ||
+        map_shared(fd, PAGE_BYTES, PROT_READ | PROT_EXEC, PAGE_BYTES) != -EACCES ||
+        (first_boot && map_shared(fd, PAGE_BYTES, PROT_READ | PROT_WRITE, PAGE_BYTES) != -EACCES)) return 47;
+
+    long address = map_shared(fd, MAP_BYTES, PROT_READ, PAGE_BYTES);
+    const volatile unsigned char *mapping = (const void *)address;
+    if (address < 0 || close_fd(fd) || !mapped_contents(mapping, 0)) return 48;
+    if (call(SYS_MPROTECT, address, MAP_BYTES, PROT_READ | PROT_WRITE, 0) != -EACCES) return 49;
+    if (first_boot) {
+        int status = patch_mapped_file(directory, mapping);
+        if (status) return status;
+    } else {
+        long child = call(SYS_FORK, 0, 0, 0, 0);
+        if (!child) finish(!mapped_contents(mapping, 0));
+        if (!child_passed(child)) return 54;
+    }
+
+    if (!mapped_contents(mapping, 0)) return 55;
+    int fixed = check_fixed_replacement(directory, address);
+    if (fixed) return fixed;
+    if (call(SYS_MUNMAP, address, MAP_BYTES, 0, 0)) return 55;
+    fd = open_at(directory, current, O_RDONLY, 0);
+    if (fd < 0) return 56;
+    address = map_shared(fd, MAP_BYTES, PROT_READ, PAGE_BYTES);
+    if (address < 0 || close_fd(fd) || !mapped_contents((const void *)address, 0) ||
+        call(SYS_MUNMAP, address, MAP_BYTES, 0, 0)) return 57;
+    if (first_boot) {
+        int reclaimed = check_map_reclamation(directory);
+        if (reclaimed) return reclaimed;
+    }
+    return close_fd(directory) ? 64 : 0;
 }
 
 static int check_permissions(long parent) {
@@ -388,6 +509,7 @@ void _start(void) {
         if (!status && phase == '1') status = write_profile(parent);
         if (!status) status = verify_profile(parent);
         if (!status) status = check_deep_path(parent, phase == '1');
+        if (!status) status = check_profile_mmap(parent, phase == '1');
         if (!status) status = check_profile_locks(parent, phase == '1');
         if (!status && close_fd(parent)) status = 3;
         if (!status) {

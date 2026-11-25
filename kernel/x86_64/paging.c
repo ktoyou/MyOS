@@ -11,6 +11,7 @@
 #define MMAP_PENDING  (1ull << 10)
 #define FILE_BACKED   (1ull << 11)
 /* Эти биты доступны ПО в листе x86-64 и не входят в физический адрес. */
+#define CACHED_FILE   (1ull << 53)
 #define DATA_MAPPING  (1ull << 54)
 #define LIVE_ELF      (1ull << 55)
 #define ZERO_LAZY     (1ull << 56)
@@ -28,6 +29,11 @@
 extern const u8 _start[], __text_end[], __rodata_end[], __kernel_end[];
 static uptr live_first, live_end;
 static uptr framebuffer_first, framebuffer_end;
+static void (*cached_file_release)(uptr);
+
+void paging64_set_cached_file_release(void (*release)(uptr)) {
+    cached_file_release = release;
+}
 
 static bool nx_supported(void) {
     u32 eax = 0x80000000u, ebx, ecx, edx;
@@ -310,6 +316,7 @@ static void release_mapping(uptr root, u64 value) {
     if (!(value & MMAP_SHARED_FRAME) && !pmm64_has_aliases(physical))
         set_alias_write(root, physical, true);
     pmm64_free(physical);
+    if ((value & CACHED_FILE) && cached_file_release) cached_file_release(physical);
 }
 
 static void copy_page(uptr target, uptr source) {
@@ -596,7 +603,8 @@ bool paging64_map_mmap(uptr start, uptr end, const struct paging64_mmap_file *fi
     uptr retained = 0;
     const u64 owner = MMAP_OWNED | (no_write ? MMAP_NO_WRITE : 0) |
                       (shared ? 0 : DATA_MAPPING) |
-                      (shared_frames ? MMAP_SHARED_FRAME : 0);
+                      (shared_frames ? MMAP_SHARED_FRAME : 0) |
+                      (shared_frames && file->cached ? CACHED_FILE : 0);
     for (uptr address = start; address < end; address += PMM_PAGE_SIZE) {
         const u64 *leaf = find_leaf(root, address);
         if (leaf && *leaf && !(*leaf & MMAP_OWNED)) return false;
