@@ -8,7 +8,7 @@ import struct
 import subprocess
 import tempfile
 
-from kernel_x64_smoke import image
+from kernel_x64_smoke import check_gop_pixels, image
 from uefi_x64_smoke import boot_x64
 
 
@@ -49,6 +49,19 @@ def program_headers(elf):
     phentsize, phnum = struct.unpack_from('<HH', elf, 54)
     for i in range(phnum):
         yield phoff + i * phentsize
+
+
+def check_framebuffer(build):
+    payload, kernel_end = image('kernel-linux')
+    root = linux_root((build / 'linux-fb.elf').read_bytes(), {})
+    with tempfile.TemporaryDirectory(prefix='myos-linux-fb-') as temp:
+        directory = pathlib.Path(temp)
+        shot = directory / 'fb.ppm'
+        serial = boot_x64(directory, 'x64-linux-fb', payload, kernel_end, ['Linux x86-64 exit status=0x00'],
+                          live_root_header=root, screenshot=shot)
+        assert 'x86-64 exception' not in serial, serial
+        check_gop_pixels(shot)
+    print('OVMF: ring-3 /dev/fb0 scanout, framebuffer ABI and I/O bounds: PASS', flush=True)
 
 
 def check_shared_elf(build):
@@ -410,6 +423,7 @@ def main():
     print('OVMF: lazy stack growth, guard, PROT_NONE and NX: PASS', flush=True)
     check_interpreter(build)
     check_files(build)
+    check_framebuffer(build)
     check_mmap(build)
     check_socket(build)
     check_pipe(build)

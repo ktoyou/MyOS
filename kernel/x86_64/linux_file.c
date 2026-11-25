@@ -1,4 +1,5 @@
 #include "linux_task.h"
+#include "linux_fb.h"
 #include "paging.h"
 
 #define NS_PER_SECOND 1000000000ul
@@ -6,7 +7,7 @@
 enum {
     EPERM = 1, ENOENT = 2, EIO = 5, EBADF = 9, EAGAIN = 11, ENOMEM = 12, EACCES = 13, EFAULT = 14,
     EBUSY = 16, EEXIST = 17, ENOTDIR = 20, EISDIR = 21, EINVAL = 22, ENFILE = 23, EMFILE = 24,
-    EFBIG = 27, EROFS = 30,
+    ENOTTY = 25, EFBIG = 27, EROFS = 30,
     ENODEV = 19, ENXIO = 6, ESPIPE = 29, ENAMETOOLONG = 36, ENOSYS = 38, ELOOP = 40, ENOTSOCK = 88,
     EOPNOTSUPP = 95, EADDRINUSE = 98, ECONNREFUSED = 111, AF_UNIX = 1, MSG_DONTWAIT = 0x40,
     SOCK_TYPE_MASK = 0xf,
@@ -32,7 +33,7 @@ enum {
 enum file_kind {
     FILE_REGULAR, FILE_SOCKET, FILE_PIPE, FILE_PROC_DIR, FILE_PROC_MAP, FILE_NULL, FILE_SERIAL,
     FILE_NAMESPACE, FILE_PROC_LINK, FILE_DIRECTORY, FILE_SYMLINK, FILE_NAMED_SOCKET, FILE_URANDOM,
-    FILE_EVENTFD, FILE_EPOLL,
+    FILE_EVENTFD, FILE_EPOLL, FILE_FRAMEBUFFER,
 };
 #define EVENTFD_MAX ((u64)-2)
 static const struct linux64_file null_file = {.inode = 1};
@@ -646,6 +647,10 @@ static enum file_kind device_node(const char *path, struct linux64_file *file) {
     if (path_equal(path, "/dev/urandom", false)) {
         *file = urandom_file;
         return FILE_URANDOM;
+    }
+    if (path_equal(path, "/dev/fb0", false) && linux64_fb_size()) {
+        *file = (struct linux64_file){.inode = 3, .mode = 0020600, .uid = LINUX64_UID, .gid = LINUX64_GID};
+        return FILE_FRAMEBUFFER;
     }
     return FILE_REGULAR;
 }
@@ -1293,6 +1298,11 @@ static long linux_open(i32 dirfd, uptr address, u32 flags) {
         if (exclusive) return -EEXIST;
         if (flags & ~(O_ACCMODE | O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC | O_APPEND |
                       O_NONBLOCK | O_LARGEFILE | O_NOFOLLOW | O_CLOEXEC)) return -EINVAL;
+        if (device == FILE_FRAMEBUFFER) {
+            u32 access = flags & O_ACCMODE;
+            u32 needed = access == O_RDWR ? 6u : access == O_WRONLY ? 2u : 4u;
+            if (needed & ~linux64_file_permissions(&file)) return -EACCES;
+        }
         u32 status = flags & ~(O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC);
         result = new_handle(&file, NULL, status | O_LARGEFILE);
         if (result >= 0) file_at((i32)result)->device = device;
@@ -1467,10 +1477,21 @@ static long serial_write(uptr address, uptr size) {
     return (long)written;
 }
 
+static long framebuffer_io(struct file_handle *handle, bool write, uptr buffer, uptr count,
+                           uptr offset, bool positioned) {
+    u32 access = handle->flags & O_ACCMODE;
+    if (write ? access == 0 : access == O_WRONLY) return -EBADF;
+    long copied = linux64_fb_io(write, buffer, count, positioned ? offset : handle->offset);
+    if (!positioned && copied > 0) handle->offset += (uptr)copied;
+    return copied;
+}
+
 static long linux_read(i32 fd, uptr buffer, uptr count, uptr offset, bool positioned) {
     if (!open_file(fd)) return -EBADF;
     struct file_handle *handle = file_at(fd);
     if (handle->directory_path) return -EISDIR;
+    if (handle->device == FILE_FRAMEBUFFER)
+        return framebuffer_io(handle, false, buffer, count, offset, positioned);
     if (positioned && (handle->device == FILE_EVENTFD || handle->device == FILE_EPOLL)) return -ESPIPE;
     if (handle->device) return device_io(handle, false, buffer, count);
     if (handle->serial) return positioned ? -ESPIPE : -EBADF;
@@ -1546,6 +1567,10 @@ static long file_stat(const struct linux64_file *file, const struct memfd *memfd
         mode = 0020666;
         device = 5;
         rdev = kind == FILE_NULL ? 0x103 : 0x109;
+    } else if (kind == FILE_FRAMEBUFFER) {
+        mode = file->mode;
+        device = 5;
+        rdev = 29u << 8;
     } else if (kind == FILE_SERIAL) {
         mode = 0020600;
         device = 6;
@@ -1569,7 +1594,8 @@ static long file_stat(const struct linux64_file *file, const struct memfd *memfd
     const struct linux64_userns *ns = linux64_current->process->userns;
     bool owned = kind == FILE_SOCKET || kind == FILE_PIPE || kind == FILE_PROC_MAP ||
                  kind == FILE_PROC_LINK || memfd;
-    bool named = kind == FILE_DIRECTORY || kind == FILE_SYMLINK || kind == FILE_NAMED_SOCKET;
+    bool named = kind == FILE_DIRECTORY || kind == FILE_SYMLINK || kind == FILE_NAMED_SOCKET ||
+                 kind == FILE_FRAMEBUFFER;
     const struct linux_stat stat = {
         .dev = device, .ino = file->inode, .nlink = links, .mode = mode,
         .uid = linux64_visible_id(ns, false, named ? file->uid : owned ? LINUX64_UID : 0),
@@ -1650,6 +1676,8 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
     case 1: /* write */
         if (!open_file(fd)) return -EBADF;
         if (file_at(fd)->serial) return serial_write(arg1, arg2);
+        if (file_at(fd)->device == FILE_FRAMEBUFFER)
+            return framebuffer_io(file_at(fd), true, arg1, arg2, 0, false);
         if (file_at(fd)->device) return device_io(file_at(fd), true, arg1, arg2);
         if (file_at(fd)->proc_node) {
             struct file_handle *handle = file_at(fd);
@@ -1681,6 +1709,14 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
         return file_stat(&file, memfd, kind_of(file_at(fd)), arg1);
     case 8: /* lseek */
         if (!open_file(fd)) return -EBADF;
+        if (file_at(fd)->device == FILE_FRAMEBUFFER) {
+            long offset = (long)arg1;
+            u32 whence = (u32)arg2;
+            if (whence > 2 || (whence == 1 && __builtin_add_overflow((long)file_at(fd)->offset, offset, &offset)) ||
+                offset < 0) return -EINVAL;
+            file_at(fd)->offset = (uptr)offset;
+            return offset;
+        }
         if (file_at(fd)->device == FILE_EPOLL) return -ESPIPE;
         if (file_at(fd)->device) return (u32)arg2 <= 4 ? 0 : -EINVAL;
         if (file_at(fd)->proc_node == PROC_FDS) {
@@ -1693,12 +1729,17 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
             return offset;
         }
         return kind_of(file_at(fd)) != FILE_REGULAR ? -ESPIPE : -ENOSYS;
+    case 16: /* ioctl */
+        if (!open_file(fd)) return -EBADF;
+        return file_at(fd)->device == FILE_FRAMEBUFFER ? linux64_fb_ioctl((u32)arg1, arg2) : -ENOTTY;
     case 17: /* pread64 */
         if ((long)arg3 < 0) return -EINVAL;
         return linux_read(fd, arg1, arg2, arg3, true);
     case 18: /* pwrite64 */
         if ((long)arg3 < 0) return -EINVAL;
         if (!open_file(fd)) return -EBADF;
+        if (file_at(fd)->device == FILE_FRAMEBUFFER)
+            return framebuffer_io(file_at(fd), true, arg1, arg2, arg3, true);
         if (file_at(fd)->serial || file_at(fd)->socket ||
             file_at(fd)->device == FILE_EVENTFD || file_at(fd)->device == FILE_EPOLL) return -ESPIPE;
         return file_at(fd)->device ? device_io(file_at(fd), true, arg1, arg2) : -ENOSYS;
@@ -1707,6 +1748,7 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
         result = lookup(AT_FDCWD, arg0, 0, &file, &memfd, &kind);
         if (result) return result;
         if (kind == FILE_NULL || kind == FILE_URANDOM) return (arg1 & 1u) ? -EACCES : 0;
+        if (kind == FILE_FRAMEBUFFER) return (arg1 & ~linux64_file_permissions(&file)) ? -EACCES : 0;
         if (kind == FILE_NAMESPACE) {
             if (arg1 & 1u) return -EACCES;
             return (arg1 & 2u) ? -EPERM : 0;
