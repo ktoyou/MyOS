@@ -152,6 +152,7 @@ long linux64_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2,
     if (number == 14) return linux64_rt_sigprocmask((i32)arg0, arg1, arg2, arg3);
     if (number == 39) return linux_getpid();
     if (number == 44) return linux64_sendto((i32)arg0, arg1, arg2, (u32)arg3, arg4, (i32)arg5);
+    if (number == 45) return linux64_recvfrom((i32)arg0, arg1, arg2, (u32)arg3, arg4, arg5);
     if (number == 186) return linux64_current->visible_tid; /* gettid */
     if (number == 54 || number == 55)
         return linux64_sockopt(number == 55, (i32)arg0, (i32)arg1, (i32)arg2, arg3, arg4);

@@ -698,6 +698,7 @@ static struct linux64_task *pick_task(const struct linux64_task *current) {
                 (candidate->state == TASK_EVENTFD_WAIT && linux64_eventfd_ready(&candidate->eventfd_wait)) ||
                 (candidate->state == TASK_FLOCK_WAIT && linux64_flock_ready(&candidate->flock_wait)))
                 return candidate;
+            if (candidate->state == TASK_SOCKET_WAIT && linux64_socket_waits_for_network(candidate)) timed = true;
             if (candidate->state == TASK_POLL_WAIT) {
                 if (linux64_poll_ready(candidate)) return candidate;
                 if (candidate->poll.deadline || candidate->poll.input) timed = true;

@@ -10,7 +10,7 @@ struct dhcp64_lease {
 };
 
 bool dhcp64_start(u32 seed);
-bool dhcp64_poll(u64 now);
+bool dhcp64_poll(u64 now, net64_receiver receive);
 bool dhcp64_get_lease(struct dhcp64_lease *result);
 
 #endif
