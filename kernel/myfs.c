@@ -2,14 +2,14 @@
 #include "myfs.h"
 #include "block.h"
 #include "string.h"
-#include "task.h"
-#ifndef HOST_TEST
-#include "ipc.h"
-#endif
 #ifdef HOST_TEST
 void *malloc(unsigned long); void free(void *);
 #define bitmap_alloc(n) malloc(n)
 #define bitmap_free(p) free(p)
+#elif defined(MYOS_STORAGE_X64)
+#include "x86_64/storage_alloc.h"
+#define bitmap_alloc(n) storage64_alloc(n)
+#define bitmap_free(p) storage64_free(p)
 #else
 #include "heap.h"
 #define bitmap_alloc(n) kmalloc(n)

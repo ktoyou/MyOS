@@ -1,4 +1,10 @@
 #include "block.h"
+#include "string.h"
+#ifdef MYOS_STORAGE_X64
+#include "nvme.h"
+#include "x86_64/pmm.h"
+#include "x86_64/storage_alloc.h"
+#else
 #include "ata.h"
 #ifndef HOST_TEST
 #include "ahci.h"
@@ -8,8 +14,8 @@
 #include "heap.h"
 #include "vga.h"
 #endif
-#include "string.h"
 #include "task.h"
+#endif
 #ifdef HOST_TEST
 static unsigned io_reads, io_writes;
 void block_io_reset(void) { io_reads = io_writes = 0; }
@@ -29,11 +35,28 @@ void *calloc(unsigned long, unsigned long);
  * pressure, or an explicit flush. Power loss drops whatever is still dirty. */
 static struct block_device devices[BLOCK_MAX];
 static bool tables[BLOCK_UNITS];
+#ifdef MYOS_STORAGE_X64
+/* Ввод-вывод синхронный; reclaim может только попытаться взять занятый кэш. */
+static bool block_locked;
+static bool cache_trylock(void) {
+    return !__atomic_test_and_set(&block_locked, __ATOMIC_ACQUIRE);
+}
+static void cache_lock(void) {
+    while (!cache_trylock()) __asm__ volatile ("pause");
+}
+static void cache_unlock(void) {
+    __atomic_clear(&block_locked, __ATOMIC_RELEASE);
+}
+#else
 static struct mutex block_lock;
+#define cache_lock() mutex_lock(&block_lock)
+#define cache_unlock() mutex_unlock(&block_lock)
+#define cache_trylock() mutex_trylock(&block_lock)
+#endif
 #define CACHE_RUN 32
 /* Пачка сброса и опережающего чтения. ATA PIO не берёт больше CACHE_RUN,
  * AHCI умеет AHCI_MAX_SECTORS и буфер рассчитан на этот потолок. */
-#ifdef HOST_TEST
+#if defined(HOST_TEST) || defined(MYOS_STORAGE_X64)
 #define RUN_MAX CACHE_RUN
 #else
 #define RUN_MAX AHCI_MAX_SECTORS
@@ -58,7 +81,20 @@ static u32 *hash;
 static u8 *run_buf, *flush_buf;
 #ifndef HOST_TEST
 static u32 *pages;
+#ifndef MYOS_STORAGE_X64
 static bool cache_announced;
+#endif
+#ifdef MYOS_STORAGE_X64
+#define cache_page_pointer(phys) pmm64_pointer(phys)
+#define cache_page_alloc() ((u32)pmm64_alloc())
+#define cache_page_free(phys) pmm64_free(phys)
+#define CACHE_PAGE_LIMIT BOOT_MEMORY_LIMIT
+#else
+#define cache_page_pointer(phys) ((void *)(uptr)(phys))
+#define cache_page_alloc() pmm_alloc()
+#define cache_page_free(phys) pmm_free(phys)
+#define CACHE_PAGE_LIMIT IDENTITY_MAX
+#endif
 #else
 static u8 *data_blob;
 #endif
@@ -75,7 +111,7 @@ static u8 *slot_data(u32 i) {
     return data_blob ? data_blob + i * 512 : NULL;
 #else
     u32 phys = pages ? pages[i / SECTORS_PER_PAGE] : 0;
-    return phys ? (u8 *)phys + (i % SECTORS_PER_PAGE) * 512 : NULL;
+    return phys ? (u8 *)cache_page_pointer(phys) + (i % SECTORS_PER_PAGE) * 512 : NULL;
 #endif
 }
 static void hash_unlink(u32 i) {
@@ -119,6 +155,12 @@ static void dirty_add(u32 i) {
  * хватает на заголовки и не теснит гостя на 256 МиБ. Чистые страницы
  * возвращаются через block_reclaim, когда выделение кадра не удалось. */
 static u32 choose_slots(void) {
+#ifdef MYOS_STORAGE_X64
+    /* Страницы данных выделяются по мере обращений. Потолок кэша — 2 МиБ. */
+    u32 total, free;
+    pmm64_page_counts(&total, &free);
+    return free > 2048 ? 4096 : 512;
+#else
     struct pmm_stats st;
     pmm_stats(&st);
     u32 total = st.total_frames, used = st.used_frames;
@@ -137,6 +179,7 @@ static u32 choose_slots(void) {
     if (slots > 524288) slots = 524288;
     slots &= ~(SECTORS_PER_PAGE - 1);
     return slots ? slots : SECTORS_PER_PAGE;
+#endif
 }
 /* Caller holds block_lock. Drops clean groups only: dirty file data is not
  * discarded to satisfy an allocation. */
@@ -157,7 +200,7 @@ static u32 reclaim_clean_locked(u32 frames) {
             if (cache[i].flags & F_VALID) hash_unlink(i);
             cache[i].flags = 0;
         }
-        pmm_free(pages[g]);
+        cache_page_free(pages[g]);
         pages[g] = 0;
         freed++;
         live--;
@@ -167,20 +210,20 @@ static u32 reclaim_clean_locked(u32 frames) {
 static int ensure_page(u32 i) {
     u32 g = i / SECTORS_PER_PAGE;
     if (pages[g]) return 0;
-    u32 frame = pmm_alloc();
-    if (!frame || frame >= IDENTITY_MAX) {
-        if (frame) pmm_free(frame);
+    u32 frame = cache_page_alloc();
+    if (!frame || frame >= CACHE_PAGE_LIMIT) {
+        if (frame) cache_page_free(frame);
         if (!reclaim_clean_locked(1)) return -1;
-        frame = pmm_alloc();
-        if (!frame || frame >= IDENTITY_MAX) { if (frame) pmm_free(frame); return -1; }
+        frame = cache_page_alloc();
+        if (!frame || frame >= CACHE_PAGE_LIMIT) { if (frame) cache_page_free(frame); return -1; }
     }
     pages[g] = frame;
     return 0;
 }
 u32 block_reclaim(u32 frames) {
-    if (!cache || !frames || !mutex_trylock(&block_lock)) return 0;
+    if (!cache || !frames || !cache_trylock()) return 0;
     u32 freed = reclaim_clean_locked(frames);
-    mutex_unlock(&block_lock);
+    cache_unlock();
     return freed;
 }
 #else
@@ -192,6 +235,8 @@ static u32 sectors(int u) {
 #ifdef HOST_TEST
     extern u32 ata_unit_sectors(int) __attribute__((weak));
     return ata_unit_sectors?ata_unit_sectors(u):(u==0?ata_sectors():0);
+#elif defined(MYOS_STORAGE_X64)
+    return nvme_sectors(u);
 #else
     if (nvme_present(u)) return nvme_sectors(u);
     if (ahci_present(u)) return ahci_sectors(u);
@@ -199,7 +244,7 @@ static u32 sectors(int u) {
 #endif
 }
 static u32 run_limit(int unit) {
-#ifdef HOST_TEST
+#if defined(HOST_TEST) || defined(MYOS_STORAGE_X64)
     (void)unit;
     return CACHE_RUN;
 #else
@@ -208,7 +253,7 @@ static u32 run_limit(int unit) {
 }
 static int device_read_run(int u, u32 lba, void *buf, u32 n) {
     if (!n || n > RUN_MAX) return -1;
-#ifndef HOST_TEST
+#if !defined(HOST_TEST) && !defined(MYOS_STORAGE_X64)
     if (!ahci_present(u) && n > CACHE_RUN) return -1;
 #endif
 #ifdef HOST_TEST
@@ -223,14 +268,18 @@ static int device_read_run(int u, u32 lba, void *buf, u32 n) {
         for (u32 i=0;i<n;i++) if (nvme_read(u,lba+i,(u8 *)buf+i*512)) return -1;
         return 0;
     }
+#ifdef MYOS_STORAGE_X64
+    return -1;
+#else
     if (ahci_present(u)) return ahci_read_sectors(u, lba, buf, n);
     return ata_unit_read_sectors(u, lba, buf, n);
+#endif
 #endif
 }
 static int device_write_run(int u, u32 lba, const void *buf, u32 n) {
     if (u >= 0 && u < BLOCK_UNITS) device_dirty[u] = true;
     if (!n || n > RUN_MAX) return -1;
-#ifndef HOST_TEST
+#if !defined(HOST_TEST) && !defined(MYOS_STORAGE_X64)
     if (!ahci_present(u) && n > CACHE_RUN) return -1;
 #endif
 #ifdef HOST_TEST
@@ -242,8 +291,12 @@ static int device_write_run(int u, u32 lba, const void *buf, u32 n) {
     return 0;
 #else
     if (nvme_present(u)) return nvme_write(u,lba,buf,n);
+#ifdef MYOS_STORAGE_X64
+    return -1;
+#else
     if (ahci_present(u)) return ahci_write(u, lba, buf, n);
     return ata_unit_write_sectors(u, lba, (void *)buf, n);
+#endif
 #endif
 }
 static int cache_find(int unit, u32 lba) {
@@ -309,14 +362,25 @@ static int claim_slot(void) {
 static void *cache_alloc(unsigned long n, unsigned long size) {
 #ifdef HOST_TEST
     return calloc(n, size);
+#elif defined(MYOS_STORAGE_X64)
+    if (!size || n > BOOT_MEMORY_LIMIT / size) return NULL;
+    return storage64_alloc(n * size);
 #else
     return kcalloc(n, size);
 #endif
 }
+static bool cache_ready(void) {
+    if (!cache || !run_buf || !flush_buf || !hash || !cache_slots) return false;
+#ifdef HOST_TEST
+    return data_blob != NULL;
+#else
+    return pages != NULL;
+#endif
+}
 static int ensure_cache(void) {
-    if (cache && run_buf && flush_buf && hash) return 0;
-    mutex_lock(&block_lock);
-    if (!cache || !run_buf || !flush_buf || !hash) {
+    if (cache_ready()) return 0;
+    cache_lock();
+    if (!cache_ready()) {
 #ifdef HOST_TEST
         cache_slots = 128;
 #else
@@ -342,28 +406,20 @@ static int ensure_cache(void) {
             if (hash) hash_mask = size - 1;
         }
     }
-    int rc = (cache && run_buf && flush_buf && hash && cache_slots) ? 0 : -1;
-#ifdef HOST_TEST
-    if (!data_blob) rc = -1;
-#else
-    if (!pages || !cache_slots) rc = -1;
-#endif
-    bool announce = false;
-#ifndef HOST_TEST
-    announce = !cache_announced && !rc;
+    int rc = cache_ready() ? 0 : -1;
+#if !defined(HOST_TEST) && !defined(MYOS_STORAGE_X64)
+    bool announce = !cache_announced && !rc;
     if (announce) cache_announced = true;
 #endif
-    mutex_unlock(&block_lock);
-#ifndef HOST_TEST
+    cache_unlock();
+#if !defined(HOST_TEST) && !defined(MYOS_STORAGE_X64)
     if (announce) kprintf("block cache: up to %u KiB\n", cache_slots / 2);
-#else
-    (void)announce;
 #endif
     return rc;
 }
 static int cache_store(int unit, u32 lba, const void *buf, bool through) {
     if (ensure_cache()) return -1;
-    mutex_lock(&block_lock);
+    cache_lock();
     int i = cache_find(unit, lba);
     if (i < 0) i = claim_slot();
     int rc = -1;
@@ -387,7 +443,7 @@ static int cache_store(int unit, u32 lba, const void *buf, bool through) {
             } else if (through) dirty_unlink((u32)i);
         }
     }
-    mutex_unlock(&block_lock);
+    cache_unlock();
     return rc;
 }
 static int install_slot(int unit, u32 lba, const u8 *src) {
@@ -414,7 +470,7 @@ static int install_slot(int unit, u32 lba, const u8 *src) {
 }
 static int cache_load(int unit, u32 lba, void *buf) {
     if (ensure_cache()) return -1;
-    mutex_lock(&block_lock);
+    cache_lock();
     int i = cache_find(unit, lba);
     int rc = 0;
     if (i >= 0) {
@@ -443,7 +499,7 @@ static int cache_load(int unit, u32 lba, void *buf) {
         }
     }
     if (!rc) { seq_unit = unit; seq_lba = lba + 1; seq_valid = true; }
-    mutex_unlock(&block_lock);
+    cache_unlock();
     return rc;
 }
 static int flush_locked(void) {
@@ -462,6 +518,8 @@ static int barrier_locked(int unit) {
     /* Host fixtures may override this to model a volatile drive cache. */
     extern int ata_unit_flush(int) __attribute__((weak));
     int r = ata_unit_flush ? ata_unit_flush(unit) : 0;
+#elif defined(MYOS_STORAGE_X64)
+    int r = nvme_flush(unit);
 #else
     int r = nvme_present(unit) ? nvme_flush(unit) : ahci_present(unit) ? ahci_flush(unit) : ata_unit_flush(unit);
 #endif
@@ -470,17 +528,17 @@ static int barrier_locked(int unit) {
 }
 int block_flush_device(int id) {
     if (!block_get(id)) return -1;
-    mutex_lock(&block_lock);
+    cache_lock();
     int r = flush_locked();
     if (!r) r = barrier_locked(id / 5);
-    mutex_unlock(&block_lock);
+    cache_unlock();
     return r;
 }
 int block_flush(void) {
-    mutex_lock(&block_lock);
+    cache_lock();
     int rc = flush_locked();
     for (int u = 0; u < BLOCK_UNITS; u++) if (barrier_locked(u)) rc = -1;
-    mutex_unlock(&block_lock);
+    cache_unlock();
     return rc;
 }
 void block_flush_idle(void) {
@@ -488,9 +546,9 @@ void block_flush_idle(void) {
      * asleep inside an ATA command, waiting for the timer, and a waiter
      * here would run with interrupts cleared. */
 #ifndef HOST_TEST
-    if (!mutex_trylock(&block_lock)) return;
+    if (!cache_trylock()) return;
     flush_locked();
-    mutex_unlock(&block_lock);
+    cache_unlock();
 #else
     block_flush();
 #endif
@@ -500,38 +558,38 @@ void block_epoch_begin(void) {
 }
 void block_epoch_rollback(void) {
     if (!cache || !epoch) return;
-    mutex_lock(&block_lock);
+    cache_lock();
     for (u32 i = 0; i < cache_slots; i++) {
         if (!(cache[i].flags & F_DIRTY) || cache[i].stamp != epoch) continue;
         dirty_unlink(i);
         if (cache[i].flags & F_VALID) hash_unlink(i);
         cache[i].flags = 0;
     }
-    mutex_unlock(&block_lock);
+    cache_unlock();
 }
 void block_cache_invalidate(void) {
-    mutex_lock(&block_lock);
+    cache_lock();
     if (cache)
         for (u32 i = 0; i < cache_slots; i++) cache[i].flags = 0;
     dirty_head = 0;
     if (hash)
         for (u32 i = 0; i <= hash_mask; i++) hash[i] = 0;
     seq_valid = false;
-    mutex_unlock(&block_lock);
+    cache_unlock();
 }
 /* Пересканирование установщика не должно терять ещё не сброшенные записи. */
 int block_cache_invalidate_disk(int disk) {
     if (disk<0 || disk>=BLOCK_UNITS) return -1;
-    mutex_lock(&block_lock);
+    cache_lock();
     for (u32 i=0;cache && i<cache_slots;i++)
         if ((cache[i].flags&(F_VALID|F_DIRTY))==(F_VALID|F_DIRTY) && cache[i].unit==disk) {
-            mutex_unlock(&block_lock);return -1;
+            cache_unlock();return -1;
         }
     for (u32 i=0;cache && i<cache_slots;i++) if ((cache[i].flags&F_VALID) && cache[i].unit==disk) {
         dirty_unlink(i);hash_unlink(i);cache[i].flags=0;
     }
     if (seq_unit==disk) seq_valid=false;
-    mutex_unlock(&block_lock);return 0;
+    cache_unlock();return 0;
 }
 static u32 le32(const u8 *p) { return p[0]|(u32)p[1]<<8|(u32)p[2]<<16|(u32)p[3]<<24; }
 const struct block_device *block_get(int id) { return id>=0 && id<BLOCK_MAX && devices[id].sectors ? &devices[id] : NULL; }
@@ -553,7 +611,11 @@ int block_rescan(int disk) {
 #ifndef HOST_TEST
     if(disk>=3 && nvme_present(disk)){strcpy(whole->name,"nvme0");whole->name[4]='0'+disk-3;}
 #endif
-    u8 buf[512]; if(cache_load(disk,0,buf)) return -1;
+    u8 buf[512];
+    if(cache_load(disk,0,buf)) {
+        *whole=(struct block_device){0};
+        return -1;
+    }
     if(buf[510]!=0x55 || buf[511]!=0xaa) return 0;
     tables[disk]=true;
     for(int i=0;i<4;i++) {

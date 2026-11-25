@@ -138,7 +138,17 @@ static int times_block(u32 ino,bool alloc,u32 *out) {
 }
 #ifdef HOST_TEST
 static u32 kern_now(void) { return 1; }
+#elif defined(MYOS_STORAGE_X64)
+#include "x86_64/linux.h"
+static u32 kern_now(void) {
+    long seconds;
+    u64 nanos;
+    if (!linux64_clock_sample(true, &seconds, &nanos) || seconds < 0 || (u64)seconds > (u32)-1)
+        return 0;
+    return (u32)seconds;
+}
 #else
+#include "ipc.h"
 #include "timer.h"
 static u32 kern_now(void) {
     /* UIP у CMOS держится миллисекунды, а touch зовётся на каждую запись.
