@@ -120,13 +120,13 @@ static void *page(void) {
 #endif
 }
 static bool wait_reg(u32 offset,u32 mask,u32 value,unsigned ms) {
-    u32 start=timer_ticks();
-    do {
+    u32 start=timer_ticks(), ticks=(ms*TIMER_HZ+999)/1000;
+    for (;;) {
         if ((rd(offset)&mask)==value) return true;
-        if(running) pump();
+        if (timer_ticks()-start>=ticks || poisoned) return false;
+        if (running) pump();
         sleep_ms(10);
-    } while (timer_ticks()-start<(ms*TIMER_HZ+999)/1000);
-    return false;
+    }
 }
 static bool ring_init(struct ring *r) {
     r->base=page(); r->next=0; r->cycle=1;
@@ -253,7 +253,7 @@ static void pump(void) {
         BARRIER();
         struct trb e={v->lo,v->hi,v->status,ctl};
         unsigned type=(ctl>>10)&63,code=e.status>>24;
-        if (((type==33 && !waiting_slot && e.lo==waiting) ||
+        if (!wait_code && ((type==33 && !waiting_slot && e.lo==waiting) ||
              (type==32 && waiting_slot==(ctl>>24) && waiting_dci==((ctl>>16)&31) &&
               (e.lo==waiting || (code!=1 && code!=13)))) && waiting && !e.hi) {
             wait_code=code; wait_slot=ctl>>24;wait_left=e.status&0xffffff;
@@ -293,12 +293,16 @@ static void pump(void) {
 }
 static unsigned completion(u32 pointer,unsigned ms,bool fatal) {
     waiting=pointer; wait_code=0; wait_slot=0;wait_left=0;
-    u32 start=timer_ticks();
-    do {
+    u32 start=timer_ticks(), ticks=(ms*TIMER_HZ+999)/1000;
+#ifdef MYOS_XHCI_X64
+    /* До переключения стека ожидаемый TRB уже виден быстрому опросу. */
+    xhci64_checkpoint();
+#endif
+    for (;;) {
         pump();
-        if (wait_code || poisoned) break;
+        if (wait_code || poisoned || timer_ticks()-start>=ticks) break;
         sleep_ms(10);
-    } while (timer_ticks()-start<(ms*TIMER_HZ+999)/1000);
+    }
     waiting=0;
     if (!wait_code) {
         /* Never reuse a ring after an uncompleted TD/command. */
@@ -308,6 +312,8 @@ static unsigned completion(u32 pointer,unsigned ms,bool fatal) {
     return wait_code;
 }
 static bool command(u32 lo,u32 ctl) {
+    /* Disable Slot принимает только код завершения собственной команды. */
+    wait_code=0;
 #ifdef HOST_TEST
     extern bool xhci_test_command(u32,u32);
     return xhci_test_command(lo,ctl);
@@ -479,7 +485,10 @@ static bool configure(struct usbdev *d) {
                     h->mouse.id,h->mouse.wheel.size?"yes":"no",h->mouse.x.size,h->mouse.y.size);
         } else if (!control(d,0x21,11,0,h->interface,0)) continue; /* Boot fallback */
         /* SET_IDLE is optional; some devices stall it. No dependence on it. */
-        h->active=true; arm(h);
+        h->active=true;
+#ifndef MYOS_XHCI_X64
+        arm(h);
+#endif
         kprintf("USB HID %s: port %u, slot %u, endpoint %u\n",h->protocol==1?"keyboard":"mouse",d->port,d->slot,h->dci);
     }
     return true;
@@ -559,6 +568,14 @@ static bool address_device(int parent,unsigned port,unsigned speed) {
         detach(d); return false;
     }
     d->published=true;
+#ifdef MYOS_XHCI_X64
+    for (unsigned i=0;i<NHID;i++) {
+        struct hid *h=&hids[i];
+        if (!h->active || h->dev!=d) continue;
+        linux64_input_usb_attached(h->protocol,h->report_protocol && h->mouse.wheel.size);
+        arm(h);
+    }
+#endif
     if(parent<0) inventory[d->port-1]=d->info;
     kprintf("USB attached: root %u route %x slot %u, %x:%x\n",d->port,d->route,d->slot,
             d->info.vendor_id,d->info.product_id);
@@ -604,14 +621,19 @@ static bool attach_hub_port(struct usbdev *hub,unsigned port) {
 }
 static void topology_poll(void) {
     for(unsigned port=1;port<=ports && !poisoned;port++) {
+#ifdef MYOS_XHCI_X64
+        if ((port&15)==0) xhci64_checkpoint();
+#endif
         u32 status=rd(op+0x400+(port-1)*16); bool connected=(status&1)!=0;
         struct usbdev *d=child(-1,port);
+        /* Изменения во время остановки старого слота должны остаться видимыми. */
+        ack_root(port,status);
         if((status&(1u<<17)) || connected!=root_seen[port-1] || (d && d->failed)) {
             if(d && !detach(d)) return;
             memset(&inventory[port-1],0,sizeof(inventory[0]));
-            root_seen[port-1]=connected; ack_root(port,status);
+            root_seen[port-1]=connected;
             if(connected) attach_root(port);
-        } else ack_root(port,status);
+        }
     }
     for(unsigned i=0;i<NDEV && !poisoned;i++) {
         struct usbdev *hub=&devices[i];
@@ -623,10 +645,10 @@ static void topology_poll(void) {
             bool connected=(status&1)!=0,seen=(hub->seen_ports&(1u<<port))!=0;
             struct usbdev *d=child(i,port);
             bool change=(status&(1u<<16)) || connected!=seen || (d && d->failed);
-            if(change && d && !detach(d)) return;
-            if(connected) hub->seen_ports|=1u<<port; else hub->seen_ports&=~(1u<<port);
             for(unsigned bit=0;bit<5;bit++) if(status&(1u<<(16+bit)))
                 if(!control(hub,0x23,1,16+bit,port,0)) { hub->failed=true; break; }
+            if(change && d && !detach(d)) return;
+            if(connected) hub->seen_ports|=1u<<port; else hub->seen_ports&=~(1u<<port);
             if(change && connected && !hub->failed) attach_hub_port(hub,port);
         }
     }
@@ -809,6 +831,15 @@ static void release_controller_dma(const struct controller_dma *dma) {
     dcbaa=NULL;
 }
 
+static void hotplug_worker(void) {
+    for (;;) {
+        pump();
+        if (!poisoned) topology_poll();
+        if (poisoned) stop_controller();
+        sleep_ms(50);
+    }
+}
+
 bool xhci64_init(const struct boot_info *boot) {
     u64 nanos;
     if (!linux64_monotonic_ns(&nanos) || !xhci64_map(boot,&resources)) return false;
@@ -835,50 +866,20 @@ bool xhci64_init(const struct boot_info *boot) {
         xhci64_unmap(&resources,true);
         return false;
     }
+    xhci64_worker_start(hotplug_worker);
     return true;
 }
 
-static void check_root_disconnects(void) {
-    static u32 last;
-    u32 now=timer_ticks();
-    if (now-last<10) return;
-    last=now;
-    for (unsigned port=1;port<=ports;port++) {
-        if (!root_seen[port-1]) continue;
-        u32 status=rd(op+0x400+(port-1)*16);
-        if ((status&1) && !(status&(1u<<17))) continue;
-        root_seen[port-1]=false;
-        ack_root(port,status);
-        /* Сброс нажатий не должен ждать остановки слотов или перечисления USB. */
-        for (unsigned i=0;i<NDEV;i++) {
-            struct usbdev *d=&devices[i];
-            if (!d->used || d->port!=port) continue;
-            d->failed=true;
-            release_device_hids(d);
-        }
-    }
+bool xhci64_service(void) {
+    if (!running) return false;
+    xhci64_worker_step();
+    return running;
 }
 
 void xhci64_poll(void) {
-    if (!running) return;
-    check_root_disconnects();
-    pump();
-    if (poisoned) stop_controller();
+    if (running && !poisoned) pump();
 }
 
-struct xhci64_hid xhci64_hid_status(void) {
-    struct xhci64_hid result={0};
-    for (unsigned i=0;i<NHID;i++) {
-        const struct hid *h=&hids[i];
-        if (!h->active || h->dev->failed) continue;
-        if (h->protocol==1) result.keyboard=true;
-        if (h->protocol==2) {
-            result.mouse=true;
-            result.wheel|=h->report_protocol && h->mouse.wheel.size;
-        }
-    }
-    return result;
-}
 #else
 bool xhci_init(void) {
     struct pci_dev controller={0}; bool found=false;

@@ -127,6 +127,7 @@ enum { LINUX64_TIMER_VECTOR = 0x40, LINUX64_SPURIOUS_VECTOR = 0xff };
 bool linux64_timer_probe_ioapic(const struct boot_info *boot);
 bool linux64_timer_init(void);
 void linux64_timer_ack(void);
+bool linux64_timer_idle(void);
 bool linux64_enable_syscall(void);
 void linux64_task_exception(u64 vector);
 void kernel64_serial_char(char ch);

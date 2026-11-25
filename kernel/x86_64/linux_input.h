@@ -13,6 +13,7 @@ struct linux64_input_cursor {
 };
 
 void linux64_input_init(const struct boot_info *boot);
+void linux64_input_usb_attached(unsigned protocol, bool wheel);
 void linux64_input_usb_key(u16 scancode, bool down);
 void linux64_input_usb_mouse(u32 buttons, i32 dx, i32 dy, i32 wheel);
 bool linux64_input_available(enum linux64_input_device device);

@@ -70,7 +70,44 @@ u32 xhci64_ticks(void) {
     return linux64_monotonic_ns(&nanos) ? (u32)(nanos / NS_PER_MS) : 0;
 }
 
+/* Служба сохраняет кадры перечисления между проходами планировщика. */
+static u8 worker_stack[4 * PMM_PAGE_SIZE] __attribute__((aligned(16)));
+static uptr worker_rsp, scheduler_rsp;
+static u32 worker_deadline;
+static bool on_worker_stack;
+
+extern void xhci64_switch_stack(uptr *saved, uptr next);
+
+void xhci64_worker_start(void (*entry)(void)) {
+    uptr *top = (void *)(worker_stack + sizeof(worker_stack));
+    /* Шесть регистров, адрес входа и фиктивный адрес возврата SysV. */
+    top -= 8;
+    top[6] = (uptr)entry;
+    worker_rsp = (uptr)top;
+    worker_deadline = xhci64_ticks();
+}
+
+void xhci64_worker_step(void) {
+    if ((i32)(xhci64_ticks() - worker_deadline) < 0) return;
+    on_worker_stack = true;
+    xhci64_switch_stack(&scheduler_rsp, worker_rsp);
+    on_worker_stack = false;
+}
+
+static void worker_wait(unsigned ms) {
+    worker_deadline = xhci64_ticks() + ms;
+    xhci64_switch_stack(&worker_rsp, scheduler_rsp);
+}
+
+void xhci64_checkpoint(void) {
+    if (on_worker_stack) worker_wait(0);
+}
+
 void xhci64_sleep_ms(unsigned ms) {
+    if (on_worker_stack) {
+        worker_wait(ms);
+        return;
+    }
     u32 start = xhci64_ticks();
     while (xhci64_ticks() - start < ms) __asm__ volatile("pause");
 }

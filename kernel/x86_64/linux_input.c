@@ -28,7 +28,7 @@ static struct input_device {
     bool available, usb, wheel;
 } devices[LINUX64_INPUT_COUNT];
 
-static bool initialized, usb_active, probing_usb, ps2_active, extended;
+static bool initialized, usb_active, ps2_active, extended;
 static unsigned pause_byte;
 static u8 mouse_id, mouse_packet[4];
 static unsigned mouse_byte;
@@ -133,28 +133,27 @@ static void ps2_init(void) {
     ps2_active = (keyboard->available && !keyboard->usb) || (mouse->available && !mouse->usb);
 }
 
-static void select_device(struct input_device *device, bool usb) {
-    device->available = device->usb = usb;
-    if (usb) return;
-    device->head = 0;
-    for (unsigned i = 0; i < sizeof(device->pressed); ++i) device->pressed[i] = 0;
+void linux64_input_usb_attached(unsigned protocol, bool wheel) {
+    struct input_device *device = &devices[protocol == 1 ? LINUX64_INPUT_KEYBOARD : LINUX64_INPUT_MOUSE];
+    /* Уже открытые узлы PS/2 сохраняют источник и идентификатор шины. */
+    if (device->available && !device->usb) return;
+    device->available = device->usb = true;
+    device->wheel |= protocol == 2 && wheel;
 }
 
 void linux64_input_init(const struct boot_info *boot) {
     if (initialized) return;
     initialized = true;
-    /* Первый HID-отчёт может прийти во время перечисления устройств. */
-    probing_usb = true;
     usb_active = xhci64_init(boot);
-    probing_usb = false;
-
-    struct xhci64_hid hid = {0};
-    if (usb_active) hid = xhci64_hid_status();
-    struct input_device *keyboard = &devices[LINUX64_INPUT_KEYBOARD];
-    struct input_device *mouse = &devices[LINUX64_INPUT_MOUSE];
-    select_device(keyboard, hid.keyboard);
-    select_device(mouse, hid.mouse);
-    mouse->wheel = hid.mouse && hid.wheel;
+    if (!usb_active) {
+        /* Перечисление могло завершиться ошибкой после регистрации части HID. */
+        for (unsigned i = 0; i < LINUX64_INPUT_COUNT; ++i) {
+            struct input_device *device = &devices[i];
+            device->available = device->usb = device->wheel = false;
+            device->head = 0;
+            for (unsigned j = 0; j < sizeof(device->pressed); ++j) device->pressed[j] = 0;
+        }
+    }
     ps2_init();
 }
 
@@ -199,7 +198,7 @@ static u8 base_key(u8 scan) {
 }
 
 void linux64_input_usb_key(u16 scancode, bool down) {
-    if (!probing_usb && !devices[LINUX64_INPUT_KEYBOARD].usb) return;
+    if (!devices[LINUX64_INPUT_KEYBOARD].usb) return;
     u8 code = (u8)scancode;
     if (code & 0x80) return;
     if (scancode >> 8 == 0xe0) key_event(extended_keys[code], down);
@@ -251,8 +250,7 @@ static void mouse_event(u32 buttons, i32 x, i32 y, i32 wheel) {
 
 void linux64_input_usb_mouse(u32 buttons, i32 dx, i32 dy, i32 wheel) {
     const struct input_device *mouse = &devices[LINUX64_INPUT_MOUSE];
-    if (probing_usb || mouse->usb)
-        mouse_event(buttons, dx, dy, probing_usb || mouse->wheel ? wheel : 0);
+    if (mouse->usb) mouse_event(buttons, dx, dy, mouse->wheel ? wheel : 0);
 }
 
 static void handle_mouse(u8 byte, bool bad) {
