@@ -562,6 +562,60 @@ static long check_record_locks(long dir) {
     return 0;
 }
 
+static long check_rename(long dir, const char *directory) {
+    static const char old[] = "CURRENT.tmp", target[] = "CURRENT", alias[] = "profile-link";
+    long nested = call(257, dir, (word)"child", 0x10000, 0);
+    long original = call(257, dir, (word)old, 0xc2, 0600);
+    long replaced = call(257, nested, (word)target, 0xc2, 0600);
+    word old_stat[18], replaced_stat[18], info[18];
+    if (nested < 3 || original < 3 || replaced < 3 ||
+        call(1, original, (word)"src", 3, 0) != 3 || call(1, replaced, (word)"dst", 3, 0) != 3 ||
+        call(5, original, (word)old_stat, 0, 0) || call(5, replaced, (word)replaced_stat, 0, 0) ||
+        call(73, original, 2, 0, 0) || set_record(original, RECORD_WRITE, 0, 0, 0) ||
+        set_record(replaced, RECORD_WRITE, 0, 0, 0)) return 184;
+
+    if (call(264, -1, (word)old, nested, (word)target) != -9 ||
+        call(264, dir, (word)old, original, (word)target) != -20 ||
+        call(264, dir, (word)old, dir, (word)"child") != -21 ||
+        call(264, dir, (word)old, nested, (word)"missing/") != -20 ||
+        call(264, dir, (word)old, nested, (word)"missing/CURRENT") != -2 ||
+        call(264, dir, (word)old, dir, (word)"./CURRENT.tmp") ||
+        call(262, nested, (word)target, (word)info, 0) || info[1] != replaced_stat[1]) return 185;
+
+    if (call(264, dir, (word)old, nested, (word)target) ||
+        call(262, dir, (word)old, (word)info, 0) != -2 ||
+        call(262, nested, (word)target, (word)info, 0) || info[1] != old_stat[1] || info[2] != 1 ||
+        call(5, replaced, (word)info, 0, 0) || info[1] != replaced_stat[1] || info[2] ||
+        call(17, replaced, (word)buffer, 3, 0) != 3 || buffer[0] != 'd' || buffer[2] != 't' ||
+        call(8, original, 0, 1, 0) != 3) return 186;
+
+    long child = call(57, 0, 0, 0, 0);
+    if (!child) {
+        long current = call(257, nested, (word)target, 2, 0);
+        unsigned fail = current < 3 || call(0, current, (word)buffer, 3, 0) != 3 ||
+            buffer[0] != 's' || buffer[2] != 'c' || call(73, current, 6, 0, 0) != -11 ||
+            set_record(current, RECORD_WRITE, 0, 0, 0) != -11 ||
+            set_record(replaced, RECORD_WRITE, 0, 0, 0) != -11;
+        call(60, fail, 0, 0, 0);
+        __builtin_trap();
+    }
+    int status;
+    if (child < 0 || call(61, child, (word)&status, 0, 0) != child || status) return 187;
+
+    char from[64], to[64];
+    unsigned length = 0;
+    while (directory[length]) { from[length] = to[length] = directory[length]; ++length; }
+    static const char from_suffix[] = "/child/CURRENT", to_suffix[] = "/profile-link";
+    for (unsigned i = 0; i < sizeof(from_suffix); ++i) from[length + i] = from_suffix[i];
+    for (unsigned i = 0; i < sizeof(to_suffix); ++i) to[length + i] = to_suffix[i];
+    if (call(266, (word)"child/CURRENT", dir, (word)alias, 0) || call(82, (word)from, (word)to, 0, 0) ||
+        call(262, nested, (word)target, (word)info, 0) != -2 ||
+        call(262, dir, (word)alias, (word)info, 0x100) || info[1] != old_stat[1] ||
+        call(263, dir, (word)alias, 0, 0) || call(3, original, 0, 0, 0) ||
+        call(3, replaced, 0, 0, 0) || call(3, nested, 0, 0, 0)) return 188;
+    return 0;
+}
+
 static long check_directories(void) {
     static char path[] = "/tmp/myos-dir-0000000000";
     unsigned pid = (unsigned)call(39, 0, 0, 0, 0);
@@ -615,6 +669,8 @@ static long check_directories(void) {
     if (locks) return locks;
     long records = check_record_locks(dir);
     if (records) return records;
+    long rename = check_rename(dir, path);
+    if (rename) return rename;
     if (call(3, dir, 0, 0, 0)) return 51;
     if (call(63, (word)buffer, 0, 0, 0)) return 52;
     if (buffer[0] == 'M') {

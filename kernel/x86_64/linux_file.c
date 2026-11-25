@@ -1742,6 +1742,23 @@ static long linux_unlink(i32 dirfd, uptr address, u32 flags) {
     return result ? result : linux64_vfs_unlink(&base, path);
 }
 
+static long linux_rename(i32 old_fd, uptr old_address, i32 new_fd, uptr new_address) {
+    /* Разрешение обоих путей не уступает CPU, а две строки не помещаются вместе с обходом на стеке. */
+    static char new_path[LINUX64_PATH_LIMIT];
+    char old_path[LINUX64_PATH_LIMIT];
+    struct linux64_directory old_base, new_base;
+    long result = user_path(old_address, old_path);
+    if (result) return result;
+    result = user_path(new_address, new_path);
+    if (result) return result;
+    if (!old_path[0] || !new_path[0]) return -ENOENT;
+    result = directory_base(old_fd, old_path, &old_base);
+    if (result) return result;
+    result = directory_base(new_fd, new_path, &new_base);
+    if (result) return result;
+    return linux64_vfs_rename(&old_base, old_path, &new_base, new_path);
+}
+
 static long device_io(struct file_handle *file, bool write, uptr buffer, uptr count) {
     if ((file->flags & O_ACCMODE) == (write ? 0u : O_WRONLY)) return -EBADF;
     /* VFS проверяет диапазон даже у устройства, которое не обращается к буферу. */
@@ -2206,6 +2223,8 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
     case 80: /* chdir */
     case 161: /* chroot */
         return change_directory(arg0, number == 161);
+    case 82: /* rename */
+        return linux_rename(AT_FDCWD, arg0, AT_FDCWD, arg1);
     case 83: /* mkdir */
         return linux_mkdir(AT_FDCWD, arg0, (u32)arg1);
     case 87: /* unlink */
@@ -2227,6 +2246,8 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
         return result ? result : file_stat(&file, memfd, kind, arg2);
     case 263: /* unlinkat */
         return linux_unlink(fd, arg1, (u32)arg2);
+    case 264: /* renameat */
+        return linux_rename(fd, arg1, (i32)arg2, arg3);
     case 266: /* symlinkat */
         return linux_symlink((i32)arg1, arg2, arg0);
     case 267: /* readlinkat */

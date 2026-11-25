@@ -2,17 +2,23 @@
 #include "pmm.h"
 
 enum {
-    EPERM = 1, ENOENT = 2, EACCES = 13, EEXIST = 17, ENOTDIR = 20, EISDIR = 21,
-    ENOSPC = 28, EROFS = 30, ENAMETOOLONG = 36, ELOOP = 40,
+    EPERM = 1, ENOENT = 2, EACCES = 13, EBUSY = 16, EEXIST = 17, ENOTDIR = 20, EISDIR = 21,
+    ENOSPC = 28, EROFS = 30, ENAMETOOLONG = 36, ELOOP = 40, EOPNOTSUPP = 95,
     NAME_LIMIT = 255, LINK_LIMIT = 40, TEMP_NODES = 256,
 };
 
-enum walk_action { WALK_FOLLOW, WALK_NOFOLLOW, WALK_CREATE, WALK_CREATE_FOLLOW, WALK_UNLINK };
+enum walk_action { WALK_FOLLOW, WALK_NOFOLLOW, WALK_CREATE, WALK_CREATE_FOLLOW, WALK_UNLINK, WALK_RENAME };
 
 struct temporary_node {
     const char *path;
     struct linux64_file file;
     uptr name_page, target_page;
+};
+
+struct rename_entry {
+    struct linux64_file parent, child;
+    struct temporary_node *node;
+    bool found, trailing;
 };
 
 static struct temporary_node temporary[TEMP_NODES];
@@ -225,19 +231,29 @@ static long create_node(const char *path, uptr length, struct linux64_file file,
     return 0;
 }
 
-static long unlink_node(const struct linux64_file *parent, const struct linux64_file *child,
-                        const char *path, bool trailing) {
-    if ((child->mode & LINUX64_S_IFMT) == LINUX64_S_IFDIR) return -EISDIR;
-    if (trailing) return -ENOTDIR;
+static long may_remove(const struct linux64_file *parent, const struct linux64_file *child) {
     if (!(linux64_file_permissions(parent) & 2u)) return -EACCES;
     if ((parent->mode & 01000u) && parent->uid != LINUX64_UID && child->uid != LINUX64_UID)
         return -EPERM;
-    struct temporary_node *node = temporary_node(path);
-    if (!node) return -EROFS;
+    return 0;
+}
+
+static void remove_temporary_node(struct temporary_node *node) {
     if (node->file.backing) linux64_tmp_unlink(node->file.backing);
     if (node->target_page) pmm64_free(node->target_page);
     pmm64_free(node->name_page);
     *node = (struct temporary_node){0};
+}
+
+static long unlink_node(const struct linux64_file *parent, const struct linux64_file *child,
+                        const char *path, bool trailing) {
+    if ((child->mode & LINUX64_S_IFMT) == LINUX64_S_IFDIR) return -EISDIR;
+    if (trailing) return -ENOTDIR;
+    long result = may_remove(parent, child);
+    if (result) return result;
+    struct temporary_node *node = temporary_node(path);
+    if (!node) return -EROFS;
+    remove_temporary_node(node);
     return 0;
 }
 
@@ -250,7 +266,7 @@ static uptr start_at(char *path, const struct linux64_directory *anchor, struct 
 
 static long walk(const struct linux64_directory *base, const char *input,
                  struct linux64_file *file, char *resolved, enum walk_action action,
-                 const struct linux64_file *create) {
+                 const struct linux64_file *create, struct rename_entry *entry) {
     const struct linux64_fs *fs = linux64_current->process->fs;
     const struct linux64_directory *root = &fs->root;
     const struct linux64_file_source *source = linux64_file_source();
@@ -281,8 +297,12 @@ static long walk(const struct linux64_directory *base, const char *input,
         }
         bool final = !*absolute;
         if (count > NAME_LIMIT) return -ENAMETOOLONG;
-        if (count == 1 && start[0] == '.') continue;
+        if (count == 1 && start[0] == '.') {
+            if (entry && final) return -EBUSY;
+            continue;
+        }
         if (count == 2 && start[0] == '.' && start[1] == '.') {
+            if (entry && final) return -EBUSY;
             if (length == 1 || same_path(path, root->path)) continue;
             if (file->proc_fd_owner && file->proc_fd_owner != linux64_current->process->pid)
                 return -EACCES;
@@ -306,6 +326,15 @@ static long walk(const struct linux64_directory *base, const char *input,
             found = !result;
         } else {
             found = !file->private_directory && find_node(source, path, &child);
+        }
+        if (entry && final) {
+            entry->found = found;
+            entry->trailing = trailing;
+            entry->node = found && !file->proc_fd_owner ? temporary_node(path) : NULL;
+            if (found) entry->child = child;
+            if (resolved)
+                for (uptr i = 0; i <= length; ++i) resolved[i] = path[i];
+            return 0;
         }
         if (!found) {
             if (!final || !creating ||
@@ -342,6 +371,7 @@ static long walk(const struct linux64_directory *base, const char *input,
         if (trailing && type != LINUX64_S_IFDIR) return -ENOTDIR;
         *file = child;
     }
+    if (entry) return -EBUSY;
     if (creating) return -EEXIST;
     if (action == WALK_UNLINK) return -EISDIR;
     if (resolved)
@@ -351,19 +381,19 @@ static long walk(const struct linux64_directory *base, const char *input,
 
 long linux64_vfs_walk(const struct linux64_directory *base, const char *path,
                       struct linux64_file *file, char *resolved, bool follow_final) {
-    return walk(base, path, file, resolved, follow_final ? WALK_FOLLOW : WALK_NOFOLLOW, NULL);
+    return walk(base, path, file, resolved, follow_final ? WALK_FOLLOW : WALK_NOFOLLOW, NULL, NULL);
 }
 
 long linux64_vfs_mkdir(const struct linux64_directory *base, const char *path, u32 mode) {
     const struct linux64_file node = {.mode = mode, .writable_directory = true};
     struct linux64_file file;
-    return walk(base, path, &file, NULL, WALK_CREATE, &node);
+    return walk(base, path, &file, NULL, WALK_CREATE, &node, NULL);
 }
 
 long linux64_vfs_create_file(const struct linux64_directory *base, const char *path,
                              u32 mode, bool follow_final, struct linux64_file *file) {
     const struct linux64_file node = {.mode = LINUX64_S_IFREG | mode};
-    return walk(base, path, file, NULL, follow_final ? WALK_CREATE_FOLLOW : WALK_CREATE, &node);
+    return walk(base, path, file, NULL, follow_final ? WALK_CREATE_FOLLOW : WALK_CREATE, &node, NULL);
 }
 
 long linux64_vfs_symlink(const struct linux64_directory *base, const char *path,
@@ -372,19 +402,51 @@ long linux64_vfs_symlink(const struct linux64_directory *base, const char *path,
         .bytes = (const u8 *)target, .size = length, .mode = LINUX64_S_IFLNK | 0777,
     };
     struct linux64_file file;
-    return walk(base, path, &file, NULL, WALK_CREATE, &node);
+    return walk(base, path, &file, NULL, WALK_CREATE, &node, NULL);
 }
 
 long linux64_vfs_socket(const struct linux64_directory *base, const char *path, u32 mode,
                         u64 *inode) {
     const struct linux64_file node = {.mode = LINUX64_S_IFSOCK | mode};
     struct linux64_file file;
-    long result = walk(base, path, &file, NULL, WALK_CREATE, &node);
+    long result = walk(base, path, &file, NULL, WALK_CREATE, &node, NULL);
     if (!result) *inode = file.inode;
     return result;
 }
 
 long linux64_vfs_unlink(const struct linux64_directory *base, const char *path) {
     struct linux64_file file;
-    return walk(base, path, &file, NULL, WALK_UNLINK, NULL);
+    return walk(base, path, &file, NULL, WALK_UNLINK, NULL, NULL);
+}
+
+long linux64_vfs_rename(const struct linux64_directory *old_base, const char *old_path,
+                        const struct linux64_directory *new_base, char *new_path) {
+    struct rename_entry old, new;
+    long result = walk(old_base, old_path, &old.parent, NULL, WALK_RENAME, NULL, &old);
+    if (result) return result;
+    if (!old.found) return -ENOENT;
+    if (!old.parent.writable_directory || !old.node) return -EROFS;
+    if ((old.child.mode & LINUX64_S_IFMT) == LINUX64_S_IFDIR) return -EOPNOTSUPP;
+    if (old.trailing) return -ENOTDIR;
+
+    result = walk(new_base, new_path, &new.parent, new_path, WALK_RENAME, NULL, &new);
+    if (result) return result;
+    if (new.trailing) return -ENOTDIR;
+    if (!new.parent.writable_directory || (new.found && !new.node)) return -EROFS;
+    if (old.node == new.node) return 0;
+    if (new.found && (new.child.mode & LINUX64_S_IFMT) == LINUX64_S_IFDIR) return -EISDIR;
+    result = may_remove(&old.parent, &old.child);
+    if (result) return result;
+    if (new.found) {
+        result = may_remove(&new.parent, &new.child);
+        if (result) return result;
+    } else if (!(linux64_file_permissions(&new.parent) & 2u)) {
+        return -EACCES;
+    }
+
+    /* После проверок меняются только имена. Открытые описания удерживают данные. */
+    if (new.node) remove_temporary_node(new.node);
+    char *name = pmm64_pointer(old.node->name_page);
+    while ((*name++ = *new_path++)) {}
+    return 0;
 }

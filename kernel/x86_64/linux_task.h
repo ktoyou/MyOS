@@ -278,6 +278,8 @@ long linux64_vfs_symlink(const struct linux64_directory *base, const char *path,
 long linux64_vfs_socket(const struct linux64_directory *base, const char *path, u32 mode,
                         u64 *inode);
 long linux64_vfs_unlink(const struct linux64_directory *base, const char *path);
+long linux64_vfs_rename(const struct linux64_directory *old_base, const char *old_path,
+                        const struct linux64_directory *new_base, char *new_path);
 long linux64_vfs_create_file(const struct linux64_directory *base, const char *path,
                              u32 mode, bool follow_final, struct linux64_file *file);
 struct memfd *linux64_tmp_alloc(void);
