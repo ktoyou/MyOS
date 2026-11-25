@@ -1921,16 +1921,19 @@ CHROME_LIVE_ARGS = --kernel "$(X64BUILD)/kernel-linux" --compositor "$(WAYLAND_B
 $(WAYLAND_BUILD)/chrome-launch: user/wayland/chrome_launch.c | $(WAYLAND_BUILD)
 	$(CC) -m64 -O2 -Wall -Wextra $< -o $@
 
-.PHONY: kernel-x64-chrome-image kernel-x64-chrome-run kernel-x64-chrome-smoke
-kernel-x64-chrome-image kernel-x64-chrome-run kernel-x64-chrome-smoke: export MYOS_CHROME_BIN := $(value CHROME_BIN)
+.PHONY: kernel-x64-chrome-image kernel-x64-chrome-run kernel-x64-chrome-smoke kernel-x64-chrome-profile-smoke
+kernel-x64-chrome-image kernel-x64-chrome-run kernel-x64-chrome-smoke kernel-x64-chrome-profile-smoke: export MYOS_CHROME_BIN := $(value CHROME_BIN)
 kernel-x64-chrome-image kernel-x64-chrome-run: export MYOS_CHROME_IMAGE := $(value CHROME_IMAGE)
 kernel-x64-chrome-image kernel-x64-chrome-run: export MYOS_CHROME_URL := $(value CHROME_URL)
+kernel-x64-chrome-image kernel-x64-chrome-run: export MYOS_CHROME_PROFILE := $(value CHROME_PROFILE)
 kernel-x64-chrome-smoke: export MYOS_CHROME_CERTUTIL := $(value CERTUTIL)
 kernel-x64-chrome-smoke: export MYOS_CHROME_HOSTCC := $(HOSTCC)
-kernel-x64-chrome-image kernel-x64-chrome-run: $(CHROME_LIVE_DEPS)
-	python3 tools/chrome_x64_live.py $(CHROME_LIVE_ARGS) --output "$${MYOS_CHROME_IMAGE}" --url "$${MYOS_CHROME_URL}" $(if $(filter kernel-x64-chrome-run,$@),--run)
+kernel-x64-chrome-image kernel-x64-chrome-run: $(CHROME_LIVE_DEPS) $(if $(value CHROME_PROFILE),$(BUILD)/myfs)
+	python3 tools/chrome_x64_live.py $(CHROME_LIVE_ARGS) --output "$${MYOS_CHROME_IMAGE}" --url "$${MYOS_CHROME_URL}" --profile="$${MYOS_CHROME_PROFILE}" --myfs "$(BUILD)/myfs" $(if $(filter kernel-x64-chrome-run,$@),--run)
 kernel-x64-chrome-smoke: $(CHROME_LIVE_DEPS)
 	python3 tests/kernel_x64_chrome_smoke.py $(CHROME_LIVE_ARGS) --certutil "$${MYOS_CHROME_CERTUTIL}" --cc "$${MYOS_CHROME_HOSTCC}" --artifacts "$(X64BUILD)/chrome-smoke"
+kernel-x64-chrome-profile-smoke: $(CHROME_LIVE_DEPS) $(BUILD)/myfs
+	python3 tests/kernel_x64_chrome_profile_smoke.py $(CHROME_LIVE_ARGS) --myfs "$(BUILD)/myfs" --artifacts "$(X64BUILD)/chrome-profile-smoke"
 
 uefi-smoke: $(HWBUILD)/kernel.bin $(BUILD)/myfs $(BUILD)/ld.so $(BUILD)/user/libc.so $(addprefix $(BUILD)/user/,sh cat stat poweroff sync)
 	python3 tests/uefi_smoke.py
