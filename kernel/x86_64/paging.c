@@ -609,7 +609,7 @@ bool paging64_map_mmap(uptr start, uptr end, const struct paging64_mmap_file *fi
         const u64 *leaf = find_leaf(root, address);
         if (leaf && *leaf && !(*leaf & MMAP_OWNED)) return false;
     }
-    uptr backed = file ? file->length : end - start;
+    uptr backed = file ? file->length : 0;
     for (uptr offset = 0; offset < backed; offset += PMM_PAGE_SIZE) {
         if (shared_frames) {
             if (!pmm64_retain(file->frame(file->object, file->offset + offset))) goto fail;
@@ -629,6 +629,13 @@ bool paging64_map_mmap(uptr start, uptr end, const struct paging64_mmap_file *fi
     for (uptr address = start; address < end; address += PMM_PAGE_SIZE) {
         u64 *leaf = find_leaf(root, address);
         u64 old = *leaf;
+        if (!file) {
+            *leaf = owner | ZERO_LAZY | (accessible ? USER : 0) |
+                    (writable ? WRITE : 0) | (executable ? 0 : NO_EXECUTE);
+            invalidate(address);
+            release_mapping(root, old);
+            continue;
+        }
         *leaf = owner | (writable ? WRITE : 0);
         invalidate(address);
         release_mapping(root, old);
@@ -643,17 +650,15 @@ bool paging64_map_mmap(uptr start, uptr end, const struct paging64_mmap_file *fi
             u8 *target = pmm64_pointer(physical);
             physical_list = *(uptr *)target;
             *(uptr *)target = 0;
-            if (file) {
-                const u8 *source = file->frame
-                    ? pmm64_pointer(file->frame(file->object, file->offset + offset))
-                    : file->bytes + offset;
-                uptr count = backed - offset;
-                if (count > PMM_PAGE_SIZE) count = PMM_PAGE_SIZE;
-                for (uptr i = 0; i < count; ++i) target[i] = source[i];
-            }
+            const u8 *source = file->frame
+                ? pmm64_pointer(file->frame(file->object, file->offset + offset))
+                : file->bytes + offset;
+            uptr count = backed - offset;
+            if (count > PMM_PAGE_SIZE) count = PMM_PAGE_SIZE;
+            for (uptr i = 0; i < count; ++i) target[i] = source[i];
             if (!writable) set_alias_write(root, physical, false);
         }
-        *leaf = physical | owner | USER | (file ? FILE_BACKED : 0) |
+        *leaf = physical | owner | USER | FILE_BACKED |
                 (accessible ? PRESENT : 0) |
                 (writable ? WRITE : 0) | (executable ? 0 : NO_EXECUTE);
         invalidate(address);
