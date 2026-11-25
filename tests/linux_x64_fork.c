@@ -207,10 +207,11 @@ static long probe(void) {
 }
 
 __attribute__((noreturn)) void fork_oom(void) {
-    const word size = 0x9000000;
+    const word size = 0x9000000, page = 4096;
     long address = call(9, 0, size, 3, 0x22, -1, 0);
     if (address < 0) finish(28);
     volatile char *bytes = (void *)address;
+    for (word offset = 0; offset < size; offset += page) bytes[offset] = 0;
     bytes[0] = 0x22;
     bytes[size - 1] = 0x33;
     if (call(57, 0, 0, 0, 0, 0, 0) != -12 || wait_child(-1, 0, 1) != -10 ||
@@ -219,6 +220,8 @@ __attribute__((noreturn)) void fork_oom(void) {
     address = call(9, 0, size, 1, 0x22, -1, 0);
     if (address < 0) finish(30);
     bytes = (void *)address;
+    for (word offset = 0; offset < size; offset += page)
+        if (bytes[offset]) finish(30);
     long child = call(57, 0, 0, 0, 0, 0, 0);
     if (!child) {
         if (call(10, address, size, 3, 0, 0, 0) != -12 || bytes[0] || bytes[size - 1] ||
