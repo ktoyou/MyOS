@@ -1,6 +1,7 @@
 #include "linux_input.h"
 #include "linux_task.h"
 #include "paging.h"
+#include "xhci64.h"
 
 enum {
     PS2_DATA = 0x60, PS2_STATUS = 0x64, PS2_COMMAND = 0x64,
@@ -8,7 +9,8 @@ enum {
     PORT_LIMIT = 100000, POLL_LIMIT = 32, EVENT_COUNT = 128,
     EV_SYN = 0, EV_KEY = 1, EV_REL = 2, SYN_REPORT = 0, SYN_DROPPED = 3,
     REL_X = 0, REL_Y = 1, REL_WHEEL = 8, BTN_LEFT = 0x110,
-    KEY_PAUSE = 119, KEY_BITMAP_SIZE = 96, EAGAIN = 11, EFAULT = 14, EINVAL = 22, ENOTTY = 25,
+    KEY_PAUSE = 119, KEY_BITMAP_SIZE = 96, BUS_USB = 3, BUS_I8042 = 0x11,
+    EAGAIN = 11, EFAULT = 14, EINVAL = 22, ENOTTY = 25,
 };
 
 struct input_event {
@@ -23,10 +25,10 @@ static struct input_device {
     struct input_event queue[EVENT_COUNT];
     uptr head;
     u8 pressed[KEY_BITMAP_SIZE];
-    bool available;
+    bool available, usb, wheel;
 } devices[LINUX64_INPUT_COUNT];
 
-static bool initialized, extended;
+static bool initialized, usb_active, probing_usb, ps2_active, extended;
 static unsigned pause_byte;
 static u8 mouse_id, mouse_packet[4];
 static unsigned mouse_byte;
@@ -68,7 +70,8 @@ static bool read_reply(bool auxiliary, u8 *reply) {
             *reply = byte;
             return true;
         }
-        if (!(status & AUX_DATA) && devices[LINUX64_INPUT_KEYBOARD].available) {
+        const struct input_device *keyboard = &devices[LINUX64_INPUT_KEYBOARD];
+        if (!(status & AUX_DATA) && keyboard->available && !keyboard->usb) {
             if (status & BAD_DATA) reset_scan();
             else handle_scan(byte);
         }
@@ -103,7 +106,10 @@ static bool mouse_init(void) {
     return device_command(true, 0xf4);
 }
 
-static void input_init(void) {
+static void ps2_init(void) {
+    struct input_device *keyboard = &devices[LINUX64_INPUT_KEYBOARD];
+    struct input_device *mouse = &devices[LINUX64_INPUT_MOUSE];
+    if (keyboard->usb && mouse->usb) return;
     if (!write_port(PS2_COMMAND, 0xad) || !write_port(PS2_COMMAND, 0xa7)) return;
     for (unsigned i = 0; i < POLL_LIMIT && (inb(PS2_STATUS) & OUTPUT_FULL); ++i) inb(PS2_DATA);
     if (inb(PS2_STATUS) & OUTPUT_FULL) return;
@@ -113,18 +119,46 @@ static void input_init(void) {
     /* Прерывания i8042 отключены. Контроллер переводит набор 2 в скан-коды набора 1. */
     config = (config & ~3u) | 0x40u;
     if (!write_port(PS2_COMMAND, 0x60) || !write_port(PS2_DATA, config)) return;
-    devices[LINUX64_INPUT_KEYBOARD].available =
-        write_port(PS2_COMMAND, 0xae) && device_command(false, 0xf5) && device_command(false, 0xf0) &&
-        device_command(false, 0x02) && device_command(false, 0xf4);
-    devices[LINUX64_INPUT_MOUSE].available = mouse_init();
-    if (!devices[LINUX64_INPUT_MOUSE].available) write_port(PS2_COMMAND, 0xa7);
+    if (!keyboard->usb) {
+        keyboard->available =
+            write_port(PS2_COMMAND, 0xae) && device_command(false, 0xf5) && device_command(false, 0xf0) &&
+            device_command(false, 0x02) && device_command(false, 0xf4);
+        if (!keyboard->available) write_port(PS2_COMMAND, 0xad);
+    }
+    if (!mouse->usb) {
+        mouse->available = mouse_init();
+        mouse->wheel = mouse->available && mouse_id;
+        if (!mouse->available) write_port(PS2_COMMAND, 0xa7);
+    }
+    ps2_active = (keyboard->available && !keyboard->usb) || (mouse->available && !mouse->usb);
+}
+
+static void select_device(struct input_device *device, bool usb) {
+    device->available = device->usb = usb;
+    if (usb) return;
+    device->head = 0;
+    for (unsigned i = 0; i < sizeof(device->pressed); ++i) device->pressed[i] = 0;
+}
+
+void linux64_input_init(const struct boot_info *boot) {
+    if (initialized) return;
+    initialized = true;
+    /* Первый HID-отчёт может прийти во время перечисления устройств. */
+    probing_usb = true;
+    usb_active = xhci64_init(boot);
+    probing_usb = false;
+
+    struct xhci64_hid hid = {0};
+    if (usb_active) hid = xhci64_hid_status();
+    struct input_device *keyboard = &devices[LINUX64_INPUT_KEYBOARD];
+    struct input_device *mouse = &devices[LINUX64_INPUT_MOUSE];
+    select_device(keyboard, hid.keyboard);
+    select_device(mouse, hid.mouse);
+    mouse->wheel = hid.mouse && hid.wheel;
+    ps2_init();
 }
 
 bool linux64_input_available(enum linux64_input_device device) {
-    if (!initialized) {
-        initialized = true;
-        input_init();
-    }
     return devices[device].available;
 }
 
@@ -164,6 +198,14 @@ static u8 base_key(u8 scan) {
     return scan == 0x54 ? 99 : 0;
 }
 
+void linux64_input_usb_key(u16 scancode, bool down) {
+    if (!probing_usb && !devices[LINUX64_INPUT_KEYBOARD].usb) return;
+    u8 code = (u8)scancode;
+    if (code & 0x80) return;
+    if (scancode >> 8 == 0xe0) key_event(extended_keys[code], down);
+    else if (scancode <= 0x7f) key_event(base_key(code), down);
+}
+
 static void handle_scan(u8 scan) {
     static const u8 pause[] = {0xe1, 0x1d, 0x45, 0xe1, 0x9d, 0xc5};
     if (pause_byte) {
@@ -192,6 +234,27 @@ static void handle_scan(u8 scan) {
     key_event(key, !(scan & 0x80));
 }
 
+static void mouse_event(u32 buttons, i32 x, i32 y, i32 wheel) {
+    struct input_device *device = &devices[LINUX64_INPUT_MOUSE];
+    uptr before = device->head;
+    struct input_event time = make_event(EV_SYN, SYN_REPORT, 0);
+    for (u16 button = 0; button < 3; ++button) {
+        bool down = (buttons & (1u << button)) != 0;
+        u16 key = BTN_LEFT + button;
+        if (set_pressed(device, key, down) != down) append_event(device, time, EV_KEY, key, down);
+    }
+    if (x) append_event(device, time, EV_REL, REL_X, x);
+    if (y) append_event(device, time, EV_REL, REL_Y, y);
+    if (wheel) append_event(device, time, EV_REL, REL_WHEEL, wheel);
+    if (device->head != before) append_event(device, time, EV_SYN, SYN_REPORT, 0);
+}
+
+void linux64_input_usb_mouse(u32 buttons, i32 dx, i32 dy, i32 wheel) {
+    const struct input_device *mouse = &devices[LINUX64_INPUT_MOUSE];
+    if (probing_usb || mouse->usb)
+        mouse_event(buttons, dx, dy, probing_usb || mouse->wheel ? wheel : 0);
+}
+
 static void handle_mouse(u8 byte, bool bad) {
     if (!mouse_byte && !bad && !(byte & 8)) return;
     mouse_packet_bad |= bad;
@@ -203,39 +266,32 @@ static void handle_mouse(u8 byte, bool bad) {
         return;
     }
 
-    struct input_device *device = &devices[LINUX64_INPUT_MOUSE];
-    uptr before = device->head;
-    struct input_event time = make_event(EV_SYN, SYN_REPORT, 0);
     u8 flags = mouse_packet[0];
-    for (u16 button = 0; button < 3; ++button) {
-        bool down = (flags & (1u << button)) != 0;
-        u16 key = BTN_LEFT + button;
-        if (set_pressed(device, key, down) != down) append_event(device, time, EV_KEY, key, down);
-    }
     /* Переполнение портит только соответствующую ось. В evdev Y направлен вниз. */
     i32 x = (i32)mouse_packet[1] - ((flags << 4) & 0x100);
     i32 y = (i32)mouse_packet[2] - ((flags << 3) & 0x100);
-    if (x && !(flags & 0x40)) append_event(device, time, EV_REL, REL_X, x);
-    if (y && !(flags & 0x80)) append_event(device, time, EV_REL, REL_Y, -y);
+    i32 wheel = 0;
     if (mouse_id) {
-        i32 wheel = mouse_id == 3 ? (i8)mouse_packet[3] : mouse_packet[3] & 15;
+        wheel = mouse_id == 3 ? (i8)mouse_packet[3] : mouse_packet[3] & 15;
         if (mouse_id == 4 && (wheel & 8)) wheel -= 16;
-        if (wheel) append_event(device, time, EV_REL, REL_WHEEL, -wheel);
     }
-    if (device->head != before) append_event(device, time, EV_SYN, SYN_REPORT, 0);
+    mouse_event(flags, flags & 0x40 ? 0 : x, flags & 0x80 ? 0 : -y, -wheel);
 }
 
 static void poll_input(void) {
+    if (usb_active) xhci64_poll();
+    if (!ps2_active) return;
+    const struct input_device *keyboard = &devices[LINUX64_INPUT_KEYBOARD];
+    const struct input_device *mouse = &devices[LINUX64_INPUT_MOUSE];
     for (unsigned i = 0; i < POLL_LIMIT; ++i) {
         u8 status = inb(PS2_STATUS);
         if (!(status & OUTPUT_FULL) || status == 0xff) break;
         u8 byte = inb(PS2_DATA);
         if (status & AUX_DATA) {
-            if (devices[LINUX64_INPUT_MOUSE].available) handle_mouse(byte, (status & BAD_DATA) != 0);
-        } else if (status & BAD_DATA) {
-            reset_scan();
-        } else if (devices[LINUX64_INPUT_KEYBOARD].available) {
-            handle_scan(byte);
+            if (mouse->available && !mouse->usb) handle_mouse(byte, (status & BAD_DATA) != 0);
+        } else if (keyboard->available && !keyboard->usb) {
+            if (status & BAD_DATA) reset_scan();
+            else handle_scan(byte);
         }
     }
 }
@@ -293,17 +349,22 @@ static long copy_ioctl(uptr address, u32 requested, const void *data, uptr size)
 long linux64_input_ioctl(enum linux64_input_device index, struct linux64_input_cursor *cursor,
                          u32 request, uptr address) {
     static const u32 version = 0x010001;
-    static const u16 id[] = {0x11, 1, 1, 1}; /* BUS_I8042 */
-    static const char keyboard_name[] = "MyOS PS/2 keyboard", mouse_name[] = "MyOS PS/2 mouse";
+    static const char ps2_keyboard[] = "MyOS PS/2 keyboard", ps2_mouse[] = "MyOS PS/2 mouse";
+    static const char usb_keyboard[] = "MyOS USB HID keyboard", usb_mouse[] = "MyOS USB HID mouse";
     bool mouse = index == LINUX64_INPUT_MOUSE;
     const struct input_device *device = &devices[index];
+    const u16 id[] = {device->usb ? BUS_USB : BUS_I8042, 1, 1, 1};
     u32 size = (request >> 16) & 0x3fff;
     if (request == 0x80044501u) return copy_ioctl(address, size, &version, sizeof(version)) < 0 ? -EFAULT : 0;
     if (request == 0x80084502u) return copy_ioctl(address, size, id, sizeof(id)) < 0 ? -EFAULT : 0;
     if ((request & 0xc000ff00u) != 0x80004500u) return -ENOTTY;
     switch (request & 0xffu) {
-    case 0x06: return mouse ? copy_ioctl(address, size, mouse_name, sizeof(mouse_name))
-                            : copy_ioctl(address, size, keyboard_name, sizeof(keyboard_name));
+    case 0x06:
+        if (device->usb)
+            return mouse ? copy_ioctl(address, size, usb_mouse, sizeof(usb_mouse))
+                         : copy_ioctl(address, size, usb_keyboard, sizeof(usb_keyboard));
+        return mouse ? copy_ioctl(address, size, ps2_mouse, sizeof(ps2_mouse))
+                     : copy_ioctl(address, size, ps2_keyboard, sizeof(ps2_keyboard));
     case 0x18: {
         poll_input();
         long result = copy_ioctl(address, size, device->pressed, sizeof(device->pressed));
@@ -338,7 +399,7 @@ long linux64_input_ioctl(enum linux64_input_device index, struct linux64_input_c
     }
     case 0x22: {
         if (!mouse) return -ENOTTY;
-        u8 axes[8] = {(1u << REL_X) | (1u << REL_Y), mouse_id ? 1 : 0};
+        u8 axes[8] = {(1u << REL_X) | (1u << REL_Y), device->wheel ? 1 : 0};
         return copy_ioctl(address, size, axes, sizeof(axes));
     }
     default: return -ENOTTY;

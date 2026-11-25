@@ -8,6 +8,7 @@ struct pci64_device {
 };
 
 bool pci64_find(u16 vendor, u16 device, u16 class_code, struct pci64_device *result);
+u32 pci64_class(struct pci64_device device);
 uptr pci64_mmio_bar0(struct pci64_device device);
 u16 pci64_command(struct pci64_device device);
 void pci64_set_command(struct pci64_device device, u16 command);

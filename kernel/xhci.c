@@ -5,18 +5,28 @@
  */
 #include "xhci.h"
 #include "bootinfo.h"
+#ifdef MYOS_XHCI_X64
+#include "x86_64/xhci64.h"
+#include "x86_64/linux_input.h"
+#define TIMER_HZ 1000u
+#define timer_ticks xhci64_ticks
+#define sleep_ms xhci64_sleep_ms
+#define kprintf xhci64_log
+#define mouse_usb_report linux64_input_usb_mouse
+#else
 #include "pci.h"
 #include "pmm.h"
 #include "paging.h"
-#include "string.h"
 #include "timer.h"
 #include "task.h"
 #include "vga.h"
 #include "keyboard.h"
 #include "mouse.h"
+#endif
+#include "string.h"
 #include "hid_mouse.h"
 
-#ifdef MYOS_HARDWARE
+#if defined(MYOS_HARDWARE) || defined(MYOS_XHCI_X64)
 
 #define MMIO 0xe4000000u
 #define WINDOW 0x40000u
@@ -68,8 +78,12 @@ static u8 root_seen[256],key_refs[256],mod_refs[8];
 static unsigned generation;
 static u32 waiting,wait_code,wait_slot,waiting_slot,waiting_dci,wait_left;
 static bool running,poisoned;
+#ifdef MYOS_XHCI_X64
+static struct xhci64_resources resources;
+#else
 static bool inventory_ready;
 static struct pci_dev inventory_controller;
+#endif
 static struct hw_usb_info inventory[256];
 
 #ifdef HOST_TEST
@@ -88,6 +102,8 @@ static void pump(void);
 static u32 dma_address(const volatile void *pointer) {
 #ifdef HOST_TEST
     return xhci_test_dma_address(pointer);
+#elif defined(MYOS_XHCI_X64)
+    return xhci64_dma_address(pointer);
 #else
     return (u32)(uptr)pointer;
 #endif
@@ -95,9 +111,13 @@ static u32 dma_address(const volatile void *pointer) {
 
 static void wr64(u32 o,u32 low) { wr(o,low); wr(o+4,0); }
 static void *page(void) {
+#ifdef MYOS_XHCI_X64
+    return xhci64_dma_alloc();
+#else
     u32 p=pmm_alloc();
     if (p) memset((void *)p,0,4096);
     return (void *)p;
+#endif
 }
 static bool wait_reg(u32 offset,u32 mask,u32 value,unsigned ms) {
     u32 start=timer_ticks();
@@ -160,11 +180,17 @@ static u16 scancode(u8 usage) {
     default:return 0;
     }
 }
+static void emit_scan(u16 sc,bool pressed) {
+#ifdef MYOS_XHCI_X64
+    linux64_input_usb_key(sc,pressed);
+#else
+    if (sc&0xff00) kb_scancode(0xe0);
+    kb_scancode((sc&255)|(pressed?0:0x80));
+#endif
+}
 static void key(u8 usage,bool release) {
     u16 sc=scancode(usage);
-    if (!sc) return;
-    if (sc&0xff00) kb_scancode(0xe0);
-    kb_scancode((sc&255)|(release?0x80:0));
+    if (sc) emit_scan(sc,!release);
 }
 /* Aggregate USB keyboards: removing one must release only its own keys. */
 static bool earlier_key(const u8 *r,int at) {
@@ -179,10 +205,7 @@ static void keyboard_apply(struct hid *h,const u8 *r) {
         bool pressed=(r[0]&(1<<i))!=0,emit=false;
         if(pressed) emit=mod_refs[i]++==0;
         else if(mod_refs[i]) emit=--mod_refs[i]==0;
-        if(emit) {
-            if(mods[i]&0xff00) kb_scancode(0xe0);
-            kb_scancode((mods[i]&255)|(pressed?0:0x80));
-        }
+        if(emit) emit_scan(mods[i],pressed);
     }
     for(int i=2;i<8;i++) if(h->previous[i] && !earlier_key(h->previous,i) && !contains(r,h->previous[i])) {
         u8 usage=h->previous[i];
@@ -204,6 +227,10 @@ static void release_hid(struct hid *h) {
     h->active=false; h->repeat_key=0;
     if(h->protocol==1) { const u8 empty[8]={0}; keyboard_apply(h,empty); }
     else if(h->protocol==2) { h->buttons=0; mouse_usb_report(mouse_buttons(),0,0,0); }
+}
+static void release_device_hids(struct usbdev *device) {
+    for (unsigned i=0;i<NHID;i++)
+        if (hids[i].dev==device && hids[i].active) release_hid(&hids[i]);
 }
 static void repeat_keys(void) {
     for(unsigned i=0;i<NHID;i++) {
@@ -235,7 +262,8 @@ static void pump(void) {
                 struct hid *h=&hids[i];
                 if (h->active && h->pending==e.lo && !e.hi &&
                     h->dev->slot==(ctl>>24) && h->dci==((ctl>>16)&31)) {
-                    unsigned transferred=h->packet-(e.status&0xffffff);
+                    unsigned residual=e.status&0xffffff;
+                    unsigned transferred=residual<=h->packet?h->packet-residual:0;
                     if ((code==1 || code==13) && transferred>=(h->protocol==1?8u:3u)) {
                         if (h->protocol==1) keyboard_apply(h,h->report);
                         else if(h->report_protocol) {
@@ -245,7 +273,11 @@ static void pump(void) {
                         } else { h->buttons=h->report[0]&7; mouse_usb_report(mouse_buttons(),(i8)h->report[1],(i8)h->report[2],0); }
                     }
                     if (code==1 || code==13) arm(h);
-                    else { release_hid(h); h->dev->failed=true; kprintf("USB HID slot %u stopped: completion %u\n",h->dev->slot,code); }
+                    else {
+                        h->dev->failed=true;
+                        release_device_hids(h->dev);
+                        kprintf("USB HID slot %u stopped: completion %u\n",h->dev->slot,code);
+                    }
                     break;
                 }
             }
@@ -351,7 +383,9 @@ static bool configure_hub(struct usbdev *d,unsigned config) {
     kprintf("USB hub: root %u route %x, slot %u, %u ports (single TT)\n",d->port,d->route,d->slot,count);
     return true;
 }
+#ifndef MYOS_XHCI_X64
 #include "xhci-storage.inc"
+#endif
 
 static bool configure(struct usbdev *d) {
     if (!control(d,0x80,6,0x100,0,8)) return false;
@@ -384,12 +418,14 @@ static bool configure(struct usbdev *d) {
     if (total<9 || total>512 || !control(d,0x80,6,0x200,0,total)) return false;
     if(info->device_class==9) return configure_hub(d,config);
     u8 descriptors[512]; memcpy(descriptors,d->buffer,total);
+#ifndef MYOS_XHCI_X64
     for(unsigned pos=0;pos+2<=total;) {
         const u8 *p=descriptors+pos;unsigned len=p[0];if(len<2 || pos+len>total)break;
         if(p[1]==4 && len>=9 && p[3]==0 && p[5]==8 && p[6]==6 && p[7]==0x50)
             return configure_storage(d,descriptors,total,config);
         pos+=len;
     }
+#endif
     unsigned found=0,protocol=0,iface=0,maxdci=1,report_bytes=0;
     copy_slot(d); d->input[1]=1;
     for (unsigned pos=0;pos+2<=total;) {
@@ -448,13 +484,21 @@ static bool configure(struct usbdev *d) {
     }
     return true;
 }
-static void free_page(void *p) { if(p) pmm_free((u32)p); }
+static void free_page(void *p) {
+#ifdef MYOS_XHCI_X64
+    xhci64_dma_free(p);
+#else
+    if(p) pmm_free((u32)p);
+#endif
+}
 static bool detach(struct usbdev *d) {
     if(!d->used || d->removing) return !d->quarantined;
     d->removing=true; d->published=false;
+#ifndef MYOS_XHCI_X64
     if(root_storage==d)root_ambiguous=true; /* never rebind a mounted device after unplug */
+#endif
     if(d->parent<0) memset(&inventory[d->port-1],0,sizeof(inventory[0]));
-    for(unsigned i=0;i<NHID;i++) if(hids[i].dev==d) release_hid(&hids[i]);
+    release_device_hids(d);
     for(unsigned i=0;i<NDEV;i++) if(devices[i].used && devices[i].parent==(int)(d-devices))
         if(!detach(&devices[i])) { d->quarantined=true; return false; }
     /* Disable Slot is the DMA ownership barrier. Never recycle a page if
@@ -592,9 +636,14 @@ static void stop_controller(void) {
     running=false;
     wr(op,rd(op)&~1u);
     /* Keep quarantined pages allocated even after disabling bus mastering. */
+#ifdef MYOS_XHCI_X64
+    (void)xhci64_bus_master(&resources,false);
+#else
     u32 cmd=pci_read(inventory_controller.bus,inventory_controller.dev,inventory_controller.func,4);
     pci_write(inventory_controller.bus,inventory_controller.dev,inventory_controller.func,4,cmd&0xfffbu);
+#endif
 }
+#ifndef MYOS_XHCI_X64
 static void worker(void *unused) {
     (void)unused; u32 next=0;
     while(running && !poisoned) {
@@ -644,6 +693,193 @@ int xhci_device_info(unsigned index,struct hw_usb_device_info *out) {
     }
     return 0;
 }
+#endif
+
+static bool controller_layout(u32 window) {
+    u32 version=rd(0);
+    op=version&255; db=rd(0x14)&~3u; rt=rd(0x18)&~31u;
+    maxslots=rd(4)&255; ports=rd(4)>>24; context_bytes=(rd(0x10)&4)?64:32;
+    kprintf("xHCI: version=%x slots=%u\n",version>>16,maxslots);
+    return op>=0x20 && maxslots &&
+           (u64)db+1024<=window && (u64)rt+0x40<=window &&
+           op+0x400+ports*16<=window;
+}
+
+static bool controller_handoff(u32 window) {
+    /* BIOS ownership handoff before touching operational registers. */
+    unsigned ext=rd(0x10)>>16;
+    for (unsigned n=0;ext && n<64;n++) {
+        unsigned offset=ext*4;
+        if (offset+8>window) return false;
+        u32 cap=rd(offset);
+        if ((cap&255)==1) {
+            wr(offset,cap|(1u<<24));
+            if (!wait_reg(offset,1u<<16,0,2000)) {
+                kprintf("xHCI: BIOS did not release ownership\n"); return false;
+            }
+            /* Disable USB legacy SMI enables; clear only defined RW1C status. */
+            wr(offset+4,rd(offset+4)&0xe0000000u);
+        }
+        unsigned next=(cap>>8)&255;
+        if (!next) break;
+        ext+=next;
+    }
+    return true;
+}
+
+static bool controller_halt(void) {
+    wr(op,rd(op)&~1u);
+    return wait_reg(op+4,1,1,1000);
+}
+
+static bool controller_reset(void) {
+    wr(op,rd(op)|2);
+    if (!wait_reg(op,2,0,1000) || !wait_reg(op+4,1u<<11,0,1000)) return false;
+    if (!(rd(op+8)&1)) { kprintf("xHCI: 4 KiB pages unsupported\n"); return false; }
+    return true;
+}
+
+#define MAX_SCRATCHPADS 64
+struct controller_dma {
+    u32 *erst;
+    u64 *scratch_array;
+    void *scratch[MAX_SCRATCHPADS];
+    unsigned count;
+};
+
+static bool allocate_controller_rings(struct controller_dma *dma) {
+    dcbaa=page(); events=page(); dma->erst=page();
+    if (!dcbaa || !events || !dma->erst || !ring_init(&commands)) return false;
+    unsigned scratch=((rd(8)>>27)&31)|(((rd(8)>>21)&31)<<5);
+    if (scratch>MAX_SCRATCHPADS) return false;
+    if (scratch) {
+        dma->scratch_array=page();
+        if (!dma->scratch_array) return false;
+        for (unsigned i=0;i<scratch;i++) {
+            void *p=page();
+            if (!p) return false;
+            dma->scratch[dma->count++]=p;
+            dma->scratch_array[i]=dma_address(p);
+        }
+        dcbaa[0]=dma_address(dma->scratch_array);
+    }
+    dma->erst[0]=dma_address(events); dma->erst[2]=NCYCLE;
+    return true;
+}
+
+static void program_controller_rings(const struct controller_dma *dma) {
+    event_index=0; event_cycle=1;
+    wr64(op+0x30,dma_address(dcbaa));
+    wr64(op+0x18,dma_address(commands.base)|1);
+    wr(op+0x38,maxslots);
+    wr(rt+0x20,0); /* IMAN: poll instead of enabling interrupt delivery */
+    wr(rt+0x28,1); wr64(rt+0x30,dma_address(dma->erst)); wr64(rt+0x38,dma_address(events));
+    wr(op+4,0x1c); /* clear HSE/EINT/PCD */
+}
+
+static bool controller_start(unsigned scratch) {
+    wr(op,1);
+    if (!wait_reg(op+4,1,0,1000)) return false;
+    running=true;
+    kprintf("xHCI: %u ports, %u-byte contexts, polling\n",ports,context_bytes);
+    kprintf("xHCI: scratchpads=%u, port power control=%u\n",scratch,(rd(0x10)>>3)&1);
+    /* Real controllers may leave switchable port power off after reset.
+     * Preserve only power when writing PORTSC, not its RW1C change bits. */
+    if (rd(0x10)&8) {
+        for (unsigned port=1;port<=ports;port++) {
+            u32 reg=op+0x400+(port-1)*16;
+            if (!(rd(reg)&(1u<<9))) wr(reg,1u<<9);
+        }
+    }
+    sleep_ms(100); /* power-good / connection debounce before enumeration */
+    topology_poll();
+    return !poisoned;
+}
+
+#ifdef MYOS_XHCI_X64
+static void release_controller_dma(const struct controller_dma *dma) {
+    for (unsigned i=0;i<dma->count;i++) free_page(dma->scratch[i]);
+    free_page(dma->scratch_array);
+    free_page(dma->erst);
+    free_page(commands.base);
+    free_page((void *)events);
+    free_page(dcbaa);
+    commands.base=NULL;
+    events=NULL;
+    dcbaa=NULL;
+}
+
+bool xhci64_init(const struct boot_info *boot) {
+    u64 nanos;
+    if (!linux64_monotonic_ns(&nanos) || !xhci64_map(boot,&resources)) return false;
+    mmio=resources.mmio;
+    if (!controller_layout(resources.bytes) || !controller_handoff(resources.bytes)) {
+        xhci64_unmap(&resources,false);
+        return false;
+    }
+
+    struct controller_dma dma={0};
+    if (!controller_halt() || !xhci64_bus_master(&resources,false) ||
+        !controller_reset() || !allocate_controller_rings(&dma) ||
+        !xhci64_bus_master(&resources,true)) {
+        /* Адреса выделенных страниц ещё не записаны в регистры xHC. */
+        release_controller_dma(&dma);
+        xhci64_unmap(&resources,true);
+        return false;
+    }
+    /* xHC может прочитать ERST при записи ERSTBA, ещё до установки RS. */
+    program_controller_rings(&dma);
+    if (!controller_start(dma.count)) {
+        stop_controller();
+        /* После запуска сохраняем DMA-страницы при неопределённом состоянии xHC. */
+        xhci64_unmap(&resources,true);
+        return false;
+    }
+    return true;
+}
+
+static void check_root_disconnects(void) {
+    static u32 last;
+    u32 now=timer_ticks();
+    if (now-last<10) return;
+    last=now;
+    for (unsigned port=1;port<=ports;port++) {
+        if (!root_seen[port-1]) continue;
+        u32 status=rd(op+0x400+(port-1)*16);
+        if ((status&1) && !(status&(1u<<17))) continue;
+        root_seen[port-1]=false;
+        ack_root(port,status);
+        /* Сброс нажатий не должен ждать остановки слотов или перечисления USB. */
+        for (unsigned i=0;i<NDEV;i++) {
+            struct usbdev *d=&devices[i];
+            if (!d->used || d->port!=port) continue;
+            d->failed=true;
+            release_device_hids(d);
+        }
+    }
+}
+
+void xhci64_poll(void) {
+    if (!running) return;
+    check_root_disconnects();
+    pump();
+    if (poisoned) stop_controller();
+}
+
+struct xhci64_hid xhci64_hid_status(void) {
+    struct xhci64_hid result={0};
+    for (unsigned i=0;i<NHID;i++) {
+        const struct hid *h=&hids[i];
+        if (!h->active || h->dev->failed) continue;
+        if (h->protocol==1) result.keyboard=true;
+        if (h->protocol==2) {
+            result.mouse=true;
+            result.wheel|=h->report_protocol && h->mouse.wheel.size;
+        }
+    }
+    return result;
+}
+#else
 bool xhci_init(void) {
     struct pci_dev controller={0}; bool found=false;
     /* PCH xHCI is often function 0 at bus 0/device 20. Search every function
@@ -672,73 +908,25 @@ bool xhci_init(void) {
     mmio=(volatile u8 *)MMIO;
     u32 pci_command=pci_read(controller.bus,controller.dev,controller.func,4);
     pci_write(controller.bus,controller.dev,controller.func,4,(pci_command&0xffff)|6|(1<<10));
-    op=rd(0)&255; db=rd(0x14)&~3u; rt=rd(0x18)&~31u;
-    maxslots=rd(4)&255; ports=rd(4)>>24; context_bytes=(rd(0x10)&4)?64:32;
-    kprintf("xHCI: MMIO=%x version=%x slots=%u\n",phys,rd(0)>>16,maxslots);
-    if (op<0x20 || db+1024>WINDOW || rt+0x40>WINDOW || op+0x400+ports*16>WINDOW || !maxslots) return false;
+    kprintf("xHCI: MMIO=%x\n",phys);
+    if (!controller_layout(WINDOW)) return false;
     inventory_controller=controller;
     inventory_ready=ports!=0;
-    /* BIOS ownership handoff before touching operational registers. */
-    unsigned ext=rd(0x10)>>16;
-    for (unsigned n=0;ext && n<64;n++) {
-        unsigned offset=ext*4;
-        if (offset+8>WINDOW) return false;
-        u32 cap=rd(offset);
-        if ((cap&255)==1) {
-            wr(offset,cap|(1u<<24));
-            if (!wait_reg(offset,1u<<16,0,2000)) {
-                kprintf("xHCI: BIOS did not release ownership\n"); return false;
-            }
-            /* Disable USB legacy SMI enables; clear only defined RW1C status. */
-            wr(offset+4,rd(offset+4)&0xe0000000u);
-        }
-        unsigned next=(cap>>8)&255;
-        if (!next) break;
-        ext+=next;
+    struct controller_dma dma={0};
+    if (!controller_handoff(WINDOW) || !controller_halt() || !controller_reset() ||
+        !allocate_controller_rings(&dma)) return false;
+    program_controller_rings(&dma);
+    if (!controller_start(dma.count)) {
+        if (running) stop_controller();
+        return false;
     }
-    wr(op,rd(op)&~1u);
-    if (!wait_reg(op+4,1,1,1000)) return false;
-    wr(op,rd(op)|2);
-    if (!wait_reg(op,2,0,1000) || !wait_reg(op+4,1u<<11,0,1000)) return false;
-    if (!(rd(op+8)&1)) { kprintf("xHCI: 4 KiB pages unsupported\n"); return false; }
-    dcbaa=page(); events=page(); u32 *erst=page();
-    if (!dcbaa || !events || !erst || !ring_init(&commands)) return false;
-    unsigned scratch=((rd(8)>>27)&31)|(((rd(8)>>21)&31)<<5);
-    if (scratch>64) return false;
-    if (scratch) {
-        u64 *array=page(); if (!array) return false;
-        for (unsigned i=0;i<scratch;i++) { void *p=page(); if (!p) return false; array[i]=dma_address(p); }
-        dcbaa[0]=dma_address(array);
-    }
-    erst[0]=dma_address(events); erst[2]=NCYCLE;
-    event_index=0; event_cycle=1;
-    wr64(op+0x30,dma_address(dcbaa));
-    wr64(op+0x18,dma_address(commands.base)|1);
-    wr(op+0x38,maxslots);
-    wr(rt+0x20,0); /* IMAN: poll instead of enabling interrupt delivery */
-    wr(rt+0x28,1); wr64(rt+0x30,dma_address(erst)); wr64(rt+0x38,dma_address(events));
-    wr(op+4,0x1c); /* clear HSE/EINT/PCD */
-    wr(op,1);
-    if (!wait_reg(op+4,1,0,1000)) return false;
-    running=true;
-    kprintf("xHCI: %u ports, %u-byte contexts, polling\n",ports,context_bytes);
-    kprintf("xHCI: scratchpads=%u, port power control=%u\n",scratch,(rd(0x10)>>3)&1);
-    /* Real controllers may leave switchable port power off after reset.
-     * Preserve only power when writing PORTSC, not its RW1C change bits. */
-    if (rd(0x10)&8) {
-        for (unsigned port=1;port<=ports;port++) {
-            u32 reg=op+0x400+(port-1)*16;
-            if (!(rd(reg)&(1u<<9))) wr(reg,1u<<9);
-        }
-    }
-    sleep_ms(100); /* power-good / connection debounce before enumeration */
-    topology_poll();
-    if(poisoned || task_create("usb-hid",worker,NULL)<0) {
+    if(task_create("usb-hid",worker,NULL)<0) {
         stop_controller(); return false;
     }
     kprintf("USB hotplug ready: up to %u devices, USB2 hubs, HID input\n",NDEV);
     return true;
 }
+#endif
 #else
 u32 xhci_root_sectors(void){return 0;}
 int xhci_root_io(u32 lba,void *p,u32 count,bool write){(void)lba;(void)p;(void)count;(void)write;return -1;}

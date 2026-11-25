@@ -4,6 +4,7 @@
  */
 #include <efi.h>
 #include <efilib.h>
+#include <efipciio.h>
 #include <string.h>
 #include "uefi_trampoline.h"
 
@@ -14,13 +15,18 @@ struct boot_info {
     u32 bios_snapshot_magic,root_lba,root_disk_id,storage_flags,root_sectors;
     u32 firmware,rsdp,map_phys,map_count,arena_phys,arena_bytes,ap_safe;
     u32 pixel_order,native_w,native_h;
+    u32 xhci_bdf,xhci_bar_lo,xhci_bar_hi,xhci_bar_bytes;
 };
 struct config {
     char magic[8];u32 version,mode,disk_id,root_lba,root_sectors;
     u32 kernel_bytes,kernel_crc,kernel_end,width,height,kernel_abi;
 };
 struct region {UINT64 base,length;u32 type,attributes;} __attribute__((packed));
-_Static_assert(sizeof(struct boot_info)==100,"boot ABI v5");
+_Static_assert(__builtin_offsetof(struct boot_info,xhci_bdf)==100,"boot ABI v5 prefix");
+_Static_assert(__builtin_offsetof(struct boot_info,xhci_bar_lo)==104 &&
+               __builtin_offsetof(struct boot_info,xhci_bar_hi)==108,"boot ABI v6 BAR address");
+_Static_assert(__builtin_offsetof(struct boot_info,xhci_bar_bytes)==112,"boot ABI v6 aperture");
+_Static_assert(sizeof(struct boot_info)==116,"boot ABI v6");
 _Static_assert(sizeof(struct region)==24,"memory map ABI");
 static EFI_SYSTEM_TABLE *system;
 static EFI_BOOT_SERVICES *services;
@@ -44,6 +50,7 @@ static void message(const char *s) {
     wide[n]=0;if(system && system->ConOut)system->ConOut->OutputString(system->ConOut,wide);
 }
 static u32 get32(const void *p){const u8 *b=p;return b[0]|(u32)b[1]<<8|(u32)b[2]<<16|(u32)b[3]<<24;}
+static UINT64 get64(const u8 *p){return (UINT64)get32(p)|(UINT64)get32(p+4)<<32;}
 static u32 crc32(const void *p,UINTN n){const u8 *b=p;u32 c=~0u;while(n--){c^=*b++;for(int i=0;i<8;i++)c=(c>>1)^(0xedb88320u&(0u-(c&1)));}return ~c;}
 static EFI_STATUS allocate(UINTN pages,EFI_PHYSICAL_ADDRESS *address,BOOLEAN fixed) {
     if(owned_count==8)return EFI_OUT_OF_RESOURCES;
@@ -95,6 +102,61 @@ static EFI_BLOCK_IO *boot_disk(EFI_HANDLE esp,const struct config *cfg,void *scr
     }
     services->FreePool(handles);return found;
 }
+
+static u32 xhci_bar_bytes(EFI_PCI_IO_PROTOCOL *pci, UINT64 base, BOOLEAN wide) {
+    void *resources = NULL;
+    if (EFI_ERROR(pci->GetBarAttributes(pci, 0, NULL, &resources)) || !resources) return 0;
+    const u8 *descriptor = resources;
+    UINT64 bytes = 0;
+    /* Принимаем один диапазон без трансляции host/device, описанный прошивкой. */
+    if (descriptor[0] == 0x8a && descriptor[1] == 0x2b && !descriptor[2] &&
+        !descriptor[3] && descriptor[46] == 0x79 && get64(descriptor + 6) == (wide ? 64u : 32u) &&
+        get64(descriptor + 14) == base && !get64(descriptor + 30))
+        bytes = get64(descriptor + 38);
+    services->FreePool(resources);
+    if (bytes > 0xffffffffu || (bytes & 4095u) || bytes > (1ull << 52) - base) return 0;
+    return (u32)bytes;
+}
+
+static void find_xhci_bar(struct boot_info *boot) {
+    EFI_GUID guid = EFI_PCI_IO_PROTOCOL_GUID;
+    EFI_HANDLE *handles = NULL;
+    UINTN count = 0;
+    if (EFI_ERROR(services->LocateHandleBuffer(ByProtocol, &guid, NULL, &count, &handles))) return;
+    BOOLEAN enabled = FALSE;
+    for (UINTN i = 0; i < count; ++i) {
+        EFI_PCI_IO_PROTOCOL *pci;
+        UINTN segment, bus, slot, function;
+        u32 config[6];
+        if (EFI_ERROR(services->HandleProtocol(handles[i], &guid, (void **)&pci)) ||
+            EFI_ERROR(pci->GetLocation(pci, &segment, &bus, &slot, &function)) ||
+            segment || bus > 255 || slot > 31 || function > 7 ||
+            EFI_ERROR(pci->Pci.Read(pci, EfiPciIoWidthUint32, 0, 6, config)) ||
+            (config[0] & 0xffffu) == 0xffffu || config[2] >> 8 != 0x0c0330 ||
+            ((config[3] >> 16) & 0x7f)) continue;
+
+        u32 bdf = (u32)(bus << 8 | slot << 3 | function);
+        BOOLEAN decoding = (config[1] & 2u) != 0;
+        if (boot->xhci_bar_bytes && (enabled > decoding || (enabled == decoding && boot->xhci_bdf <= bdf)))
+            continue;
+        u32 type = config[4] & 7u;
+        if (type != 0 && type != 4) continue;
+        UINT64 base = config[4] & ~15u;
+        if (type == 4) base |= (UINT64)config[5] << 32;
+        if (!base || (base & 4095u) || base >= (1ull << 52)) continue;
+        u32 bytes = xhci_bar_bytes(pci, base, type == 4);
+        UINT64 framebuffer_end = (UINT64)boot->fb_phys + (UINT64)boot->pitch * boot->height;
+        if (!bytes || (base < framebuffer_end && boot->fb_phys < base + bytes)) continue;
+
+        boot->xhci_bdf = bdf;
+        boot->xhci_bar_lo = (u32)base;
+        boot->xhci_bar_hi = (u32)(base >> 32);
+        boot->xhci_bar_bytes = bytes;
+        enabled = decoding;
+    }
+    services->FreePool(handles);
+}
+
 #include "uefi-video.h"
 static u32 memory_type(u32 t) {
     if(t==EfiConventionalMemory || t==EfiLoaderCode || t==EfiLoaderData || t==EfiBootServicesCode || t==EfiBootServicesData)return 1;
@@ -103,10 +165,16 @@ static u32 memory_type(u32 t) {
 static BOOLEAN convert_map(void *map,UINTN bytes,UINTN stride,struct boot_info *boot,BOOLEAN kernel64) {
     struct region *out=(void *)(UINTN)boot->map_phys;unsigned count=0;
     if(stride<sizeof(EFI_MEMORY_DESCRIPTOR) || bytes%stride)return FALSE;
+    UINT64 xhci_base = (UINT64)boot->xhci_bar_hi << 32 | boot->xhci_bar_lo;
+    UINT64 xhci_end = xhci_base + boot->xhci_bar_bytes;
     for(UINTN off=0;off<bytes;off+=stride) {
         EFI_MEMORY_DESCRIPTOR *m=(void *)((u8 *)map+off);
         UINT64 base=m->PhysicalStart;
         u32 type=memory_type(m->Type);
+        /* RAM и ACPI имеют собственные отображения, в них не может находиться BAR. */
+        if (boot->xhci_bar_bytes && type != 2 && m->NumberOfPages && base < xhci_end &&
+            (base >= xhci_base || m->NumberOfPages > (xhci_base - base) / 4096))
+            boot->xhci_bdf = boot->xhci_bar_lo = boot->xhci_bar_hi = boot->xhci_bar_bytes = 0;
         /* Таблицы ACPI доступны в начальном отображении x86-64 выше предела аллокатора. */
         UINT64 limit=(kernel64 && (type==3 || type==4))?0x100000000ULL:0x40000000ULL;
         if(base>=limit || !m->NumberOfPages)continue;
@@ -141,7 +209,7 @@ EFI_STATUS efi_main(EFI_HANDLE image,EFI_SYSTEM_TABLE *st) {
     if(EFI_ERROR(allocate(32,&arena,FALSE)))return fail(EFI_OUT_OF_RESOURCES,"UEFI: no bootstrap memory\r\n");
     memset((void *)(UINTN)arena,0,32*4096);
     struct boot_info *boot=(void *)(UINTN)arena;
-    *boot=(struct boot_info){.magic=0x534f594d,.version=5,.font_phys=arena+4096,
+    *boot=(struct boot_info){.magic=0x534f594d,.version=kernel64?6:5,.font_phys=arena+4096,
         .root_lba=cfg->root_lba,.root_disk_id=cfg->disk_id,.firmware=1,
         .map_phys=arena+8192,.arena_phys=arena,.arena_bytes=32*4096};
     EFI_PHYSICAL_ADDRESS ap=0x7000;
@@ -171,6 +239,7 @@ EFI_STATUS efi_main(EFI_HANDLE image,EFI_SYSTEM_TABLE *st) {
     } else {boot->storage_flags=1;boot->root_sectors=cfg->root_sectors;}
     if(EFI_ERROR(graphics(boot,cfg)))return fail(EFI_UNSUPPORTED,"UEFI: supported 32-bit GOP mode unavailable\r\n");
     root->Close(root);boot_root=NULL;
+    if (kernel64) find_xhci_bar(boot);
     /* ACPI comes from the UEFI configuration table, never a BIOS RAM scan. */
     EFI_CONFIGURATION_TABLE *table=st->ConfigurationTable;void *rsdp=NULL;
     for(UINTN i=0;i<st->NumberOfTableEntries;i++)if(equal(&table[i].VendorGuid,&acpi2,16))rsdp=table[i].VendorTable;

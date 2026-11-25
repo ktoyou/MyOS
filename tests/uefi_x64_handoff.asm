@@ -28,7 +28,7 @@
     jne fail
     cmp dword [rbx],0x534f594d
     jne fail
-    cmp dword [rbx+4],5
+    cmp dword [rbx+4],6
     jne fail
     cmp dword [rbx+60],1        ; boot_info.firmware
     jne fail
