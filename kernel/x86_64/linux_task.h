@@ -269,6 +269,8 @@ long linux64_vfs_symlink(const struct linux64_directory *base, const char *path,
 long linux64_vfs_socket(const struct linux64_directory *base, const char *path, u32 mode,
                         u64 *inode);
 long linux64_vfs_unlink(const struct linux64_directory *base, const char *path);
+bool linux64_vfs_next_entry(const struct linux64_directory *dir, uptr *position,
+                            char name[256], struct linux64_file *file);
 u32 linux64_file_permissions(const struct linux64_file *file);
 bool linux64_special_node(const char *path, struct linux64_file *file);
 long linux64_proc_fd_entry(i32 owner, const char *name, uptr length, struct linux64_file *file);

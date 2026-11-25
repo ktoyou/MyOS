@@ -135,10 +135,16 @@ def check_files(build):
     assert host_uname == 'Linux uname: Linux' and host_marker == 'Linux ELF64 files probe', host
     assert int(host_time.removeprefix('Linux UTC seconds: ')) > 0, host
     rtc_date = datetime.datetime(2040, 2, 29, 12, 34, 56, tzinfo=datetime.timezone.utc)
+    directory = '/myos/live-directory'
     serial = check_guest('files', probe.read_bytes(), 'Linux x86-64 exit status=0x00',
-                         files={data: data.read_bytes()},
+                         files={data: data.read_bytes(), directory + '/nested/first': b'1',
+                                directory + '/bad-entry/': b'',
+                                directory + '/scan-this-font-name.ttf': b'F',
+                                directory + '/nested/second': b'2',
+                                directory + '-outside/hidden': b'H'},
                          rtc=f'base={rtc_date.replace(tzinfo=None).isoformat()},clock=vm')
     assert 'Linux uname: MyOS' in serial and 'Linux ELF64 files probe' in serial, serial
+    assert 'Linux ELF64 Live directory listing' in serial, serial
     timestamp = int(serial.split('Linux UTC seconds: ', 1)[1].splitlines()[0])
     assert rtc_date.timestamp() <= timestamp <= rtc_date.timestamp() + 30, serial
     print('OVMF: Linux ELF64 files, directories, symlinks, descriptors, signals, IDs and UTC clocks: PASS', flush=True)

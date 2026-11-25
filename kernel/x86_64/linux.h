@@ -39,6 +39,7 @@ struct linux64_file_source {
     bool (*lookup)(const void *context, const char *path, struct linux64_file *file);
     const void *context;
     u64 (*directory)(const void *context, const char *path);
+    const char *(*entry_path)(const void *context, uptr index);
 };
 
 bool linux64_run(const struct linux64_file *file, const char *path, uptr path_length,
