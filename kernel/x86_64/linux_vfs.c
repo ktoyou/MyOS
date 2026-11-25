@@ -5,7 +5,8 @@
 enum {
     EPERM = 1, ENOENT = 2, EIO = 5, ENOMEM = 12, EACCES = 13, EBUSY = 16, EEXIST = 17, EXDEV = 18, ENOTDIR = 20, EISDIR = 21,
     ENOSPC = 28, EROFS = 30, ENAMETOOLONG = 36, ELOOP = 40, EOPNOTSUPP = 95,
-    NAME_LIMIT = 255, LINK_LIMIT = 40, TEMP_NODES = 256, PROFILE_ENTRY_OFFSET = TEMP_NODES + 3, LIVE_ENTRY_OFFSET = TEMP_NODES + 4,
+    NAME_LIMIT = 255, LINK_LIMIT = 40,
+    SYNTHETIC_ENTRY_OFFSET = 1u << 30, PROFILE_ENTRY_OFFSET, LIVE_ENTRY_OFFSET,
 };
 
 enum walk_action { WALK_FOLLOW, WALK_NOFOLLOW, WALK_CREATE, WALK_CREATE_FOLLOW, WALK_UNLINK, WALK_RENAME };
@@ -23,7 +24,20 @@ struct rename_entry {
     bool found, trailing;
 };
 
-static struct temporary_node temporary[TEMP_NODES];
+#define TEMP_NODES_PER_PAGE ((PMM_PAGE_SIZE - sizeof(void *)) / sizeof(struct temporary_node))
+
+struct temporary_page {
+    struct temporary_page *next;
+    struct temporary_node nodes[TEMP_NODES_PER_PAGE];
+};
+
+_Static_assert(sizeof(struct temporary_page) <= PMM_PAGE_SIZE &&
+               SYNTHETIC_ENTRY_OFFSET > BOOT_MEMORY_LIMIT / PMM_PAGE_SIZE + 2,
+               "Temporary VFS page and directory offsets");
+
+/* Свободные ячейки переиспользуются без сдвига каталожных смещений. */
+static struct temporary_page *temporary;
+static u32 temporary_slots, temporary_used;
 static u64 next_inode = 1ull << 32;
 static const u64 etc_inode = 1ull << 36;
 static const u64 shm_inode = 1ull << 37;
@@ -77,15 +91,38 @@ static bool same_path(const char *left, const char *right) {
 }
 
 void linux64_vfs_temporary_counts(u32 *total, u32 *free) {
-    *total = *free = TEMP_NODES;
-    for (unsigned i = 0; i < TEMP_NODES; ++i)
-        if (temporary[i].path) --*free;
+    u32 pages, available;
+    pmm64_page_counts(&pages, &available);
+    /* На имя узла нужна одна страница, плюс страница метаданных на каждую новую группу. */
+    u32 spare = temporary_slots - temporary_used;
+    u32 names = available;
+    if (available > spare) {
+        u32 unallocated = available - spare;
+        names = spare + unallocated - (unallocated + TEMP_NODES_PER_PAGE) / (TEMP_NODES_PER_PAGE + 1);
+    }
+    *free = names;
+    *total = pages - (pages + TEMP_NODES_PER_PAGE) / (TEMP_NODES_PER_PAGE + 1);
 }
 
 static struct temporary_node *temporary_node(const char *path) {
-    for (unsigned i = 0; i < TEMP_NODES; ++i)
-        if (temporary[i].path && same_path(path, temporary[i].path)) return &temporary[i];
+    for (struct temporary_page *page = temporary; page; page = page->next)
+        for (unsigned i = 0; i < TEMP_NODES_PER_PAGE; ++i) {
+            struct temporary_node *node = &page->nodes[i];
+            if (node->path && same_path(path, node->path)) return node;
+        }
     return NULL;
+}
+
+static struct temporary_node *vacant_node(void) {
+    struct temporary_page **link = &temporary;
+    for (; *link; link = &(*link)->next)
+        for (unsigned i = 0; i < TEMP_NODES_PER_PAGE; ++i)
+            if (!(*link)->nodes[i].path) return &(*link)->nodes[i];
+    uptr physical = pmm64_alloc();
+    if (!physical) return NULL;
+    *link = pmm64_pointer(physical);
+    temporary_slots += TEMP_NODES_PER_PAGE;
+    return &(*link)->nodes[0];
 }
 
 static bool find_node(const struct linux64_file_source *source, const char *path,
@@ -222,17 +259,29 @@ long linux64_vfs_next_entry(const struct linux64_directory *dir, uptr *position,
     const char *child = NULL;
     uptr size;
     /* Смещения временных узлов остаются неизменными при добавлении соседей. */
-    while (*position < TEMP_NODES + 2) {
-        const struct temporary_node *node = &temporary[(*position)++ - 2];
-        if (!node->path) continue;
-        child = child_name(node->path, dir->path, &size);
-        if (child && !child[size]) {
-            *file = node->file;
-            break;
+    if (*position < SYNTHETIC_ENTRY_OFFSET) {
+        uptr index = *position - 2;
+        const struct temporary_page *page = temporary;
+        while (page && index >= TEMP_NODES_PER_PAGE) {
+            index -= TEMP_NODES_PER_PAGE;
+            page = page->next;
         }
-        child = NULL;
+        for (; page && !child; page = page->next, index = 0) {
+            for (; index < TEMP_NODES_PER_PAGE; ++index) {
+                const struct temporary_node *node = &page->nodes[index];
+                ++*position;
+                if (!node->path) continue;
+                child = child_name(node->path, dir->path, &size);
+                if (child && !child[size]) {
+                    *file = node->file;
+                    break;
+                }
+                child = NULL;
+            }
+        }
+        if (!child) *position = SYNTHETIC_ENTRY_OFFSET;
     }
-    if (!child && *position == PROFILE_ENTRY_OFFSET - 1) {
+    if (!child && *position == SYNTHETIC_ENTRY_OFFSET) {
         ++*position;
         if (same_path(dir->path, "/") && find_node(source, "/etc", file) && file->inode == etc_inode) {
             child = "etc";
@@ -282,9 +331,6 @@ u32 linux64_file_permissions(const struct linux64_file *file) {
 
 static long create_node(const char *path, uptr length, struct linux64_file file,
                         struct linux64_file *created) {
-    unsigned slot = 0;
-    while (slot < TEMP_NODES && temporary[slot].path) ++slot;
-    if (slot == TEMP_NODES) return -ENOSPC;
     uptr name_page = pmm64_alloc(), target_page = 0;
     if (!name_page) return -ENOSPC;
     if (file.bytes) {
@@ -305,14 +351,22 @@ static long create_node(const char *path, uptr length, struct linux64_file file,
             return -ENOSPC;
         }
     }
+    struct temporary_node *node = vacant_node();
+    if (!node) {
+        if (file.backing) linux64_tmp_unlink(file.backing);
+        if (target_page) pmm64_free(target_page);
+        pmm64_free(name_page);
+        return -ENOSPC;
+    }
     char *name = pmm64_pointer(name_page);
     for (uptr i = 0; i <= length; ++i) name[i] = path[i];
     file.inode = next_inode++;
     file.uid = LINUX64_UID;
     file.gid = LINUX64_GID;
-    temporary[slot] = (struct temporary_node){
+    *node = (struct temporary_node){
         .path = name, .file = file, .name_page = name_page, .target_page = target_page,
     };
+    ++temporary_used;
     *created = file;
     return 0;
 }
@@ -329,6 +383,7 @@ static void remove_temporary_node(struct temporary_node *node) {
     if (node->target_page) pmm64_free(node->target_page);
     pmm64_free(node->name_page);
     *node = (struct temporary_node){0};
+    --temporary_used;
 }
 
 static long unlink_node(const struct linux64_file *parent, const struct linux64_file *child,

@@ -904,6 +904,53 @@ static long check_proc_fds(void) {
     return 0;
 }
 
+static long check_many_temporary_files(void) {
+    enum { FILES = 320 };
+    char directory[] = "/tmp/myos-many-files-0000000000";
+    unsigned pid = (unsigned)call(39, 0, 0, 0, 0);
+    for (unsigned i = sizeof(directory) - 2; pid; --i, pid /= 10)
+        directory[i] = (char)('0' + pid % 10);
+    if (call(83, (word)directory, 0700, 0, 0)) return 189;
+    long dir = call(2, (word)directory, 0x10000, 0, 0);
+    if (dir < 0) return 189;
+    char name[] = "file-000";
+    for (unsigned i = 0; i < FILES; ++i) {
+        name[5] = '0' + i / 100;
+        name[6] = '0' + i / 10 % 10;
+        name[7] = '0' + i % 10;
+        long fd = call(257, dir, (word)name, 0xc2, 0600);
+        if (fd < 0 || call(3, fd, 0, 0, 0)) return 189;
+    }
+    unsigned count = 0;
+    unsigned char seen[FILES] = {0};
+    for (;;) {
+        long size = call(217, dir, (word)buffer, 1024, 0);
+        if (size < 0) return 190;
+        if (!size) break;
+        for (long offset = 0; offset < size;) {
+            const struct proc_dirent *entry = (const void *)(buffer + offset);
+            if (size - offset < 24 || entry->length < 24 || entry->length > size - offset) return 190;
+            offset += entry->length;
+            const char *entry_name = (const char *)entry + __builtin_offsetof(struct proc_dirent, name);
+            if (entry_name[0] == '.') continue;
+            if (entry->length < 32 || entry_name[0] != 'f' || entry_name[4] != '-' ||
+                entry_name[8] || entry->type != 8) return 190;
+            unsigned i = (entry_name[5] - '0') * 100u + (entry_name[6] - '0') * 10u +
+                         (entry_name[7] - '0');
+            if (i >= FILES || seen[i]++) return 190;
+            ++count;
+        }
+    }
+    if (count != FILES) return 190;
+    for (unsigned i = 0; i < FILES; ++i) {
+        name[5] = '0' + i / 100;
+        name[6] = '0' + i / 10 % 10;
+        name[7] = '0' + i % 10;
+        if (call(263, dir, (word)name, 0, 0)) return 191;
+    }
+    return call(3, dir, 0, 0, 0) ? 191 : 0;
+}
+
 static long check_high_proc_fd(void) {
     const long high = 255;
     long dir = call(2, (word)"/proc/self/fd", 0x10000, 0, 0);
@@ -1003,6 +1050,7 @@ __attribute__((noreturn)) void _start(void) {
     if (!status) status = check_live_directory();
     if (!status) status = check_proc_fds();
     if (!status) status = check_high_proc_fd();
+    if (!status) status = check_many_temporary_files();
     if (!status) status = check_limits();
     if (!status) status = check_realtime();
     if (!status) {
