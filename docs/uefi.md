@@ -84,7 +84,7 @@ make kernel-x64-chrome-run CHROME_BIN=/path/to/chrome/opt/google/chrome/chrome
 ```
 
 Результат сборки — `build/x86_64/myos-chrome.img`. Цель запуска загружает
-его в QEMU и открывает Chrome на Wayland. Начальную страницу можно выбрать
+его в QEMU с 1280 МиБ RAM и открывает Chrome на Wayland. Начальную страницу можно выбрать
 через `CHROME_URL`, например `CHROME_URL=about:blank`. Для пользовательской
 прошивки задайте переменные окружения `OVMF_CODE` и `OVMF_VARS` из одной
 поставки OVMF.
@@ -105,7 +105,9 @@ make kernel-x64-chrome-run CHROME_BIN=/path/to/chrome/opt/google/chrome/chrome \
 
 `make kernel-x64-chrome-smoke CHROME_BIN=...` проверяет в QEMU загрузку
 HTTPS-страницы с доверенным тестовым CA и отказ для того же сертификата
-без доверия к CA. Для теста нужны OpenSSL и `certutil` из NSS.
+без доверия к CA. Если дистрибутив включает ChromeML, тест загружает
+его библиотеку из Live-образа в госте. Для проверки HTTPS нужны OpenSSL
+и `certutil` из NSS.
 `make kernel-x64-chrome-profile-smoke CHROME_BIN=...` проверяет штатный
 лаунчер и штатное завершение Chrome. После холодной загрузки браузер
 открывает сохранённую закладку, восстанавливает данные сайта и записывает

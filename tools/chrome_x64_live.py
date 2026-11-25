@@ -19,6 +19,9 @@ else:
 
 REPO = Path(__file__).resolve().parents[1]
 CHROME_GUEST = '/opt/google/chrome'
+CHROME_ML_LIBRARY = 'liboptimization_guide_internal.so'
+CHROME_ML_ASSETS = (CHROME_ML_LIBRARY, 'libLiteRtWebGpuAccelerator.so')
+CHROME_VM_MEMORY = '1280M'
 LAUNCHER_GUEST = '/myos/chrome-launch'
 URL_GUEST = '/myos/chrome-url'
 PROFILE_TOKEN_GUEST = '/myos/myfs-volume'
@@ -78,7 +81,9 @@ def chrome_files(chrome: Path, compositor: Path, launcher: Path) -> dict[str, by
     directory = chrome.parent
     crashpad = directory / 'chrome_crashpad_handler'
     libs = {}
-    for executable in (chrome, crashpad, compositor, launcher):
+    # Вспомогательные процессы загружают эти модули через dlopen.
+    modules = tuple(directory / name for name in CHROME_ML_ASSETS if (directory / name).is_file())
+    for executable in (chrome, crashpad, compositor, launcher, *modules):
         merge_dependencies(libs, dependencies(executable))
 
     if 'libc.so.6' not in libs or 'libnss3.so' not in libs:
@@ -102,7 +107,8 @@ def chrome_files(chrome: Path, compositor: Path, launcher: Path) -> dict[str, by
     files[f'{CHROME_GUEST}/chrome'] = chrome.read_bytes()
     required = ('chrome_crashpad_handler', 'icudtl.dat', 'resources.pak', 'chrome_100_percent.pak',
                 'chrome_200_percent.pak', 'v8_context_snapshot.bin')
-    optional = ('CHROME_VERSION_EXTRA', 'libvk_swiftshader.so', 'libvulkan.so.1', 'vk_swiftshader_icd.json')
+    optional = ('CHROME_VERSION_EXTRA', 'libvk_swiftshader.so', 'libvulkan.so.1', 'vk_swiftshader_icd.json',
+                *CHROME_ML_ASSETS)
     for name in required:
         files[f'{CHROME_GUEST}/{name}'] = (directory / name).read_bytes()
     for name in optional:
@@ -271,7 +277,7 @@ def run_image(image: Path, headless: bool, profile: Path | None = None) -> None:
         copy = Path(directory) / 'vars.fd'
         shutil.copyfile(variables, copy)
         subprocess.run((
-            'qemu-system-x86_64', '-machine', 'q35', '-cpu', 'max', '-m', '1024M', '-no-reboot',
+            'qemu-system-x86_64', '-machine', 'q35', '-cpu', 'max', '-m', CHROME_VM_MEMORY, '-no-reboot',
             '-display', 'none' if headless else 'gtk', '-serial', 'stdio', '-monitor', 'none',
             '-fw_cfg', 'name=opt/ovmf/X-PciMmio64Mb,string=0',
             '-drive', f'if=pflash,format=raw,unit=0,readonly=on,file={qemu_path(code)}',
@@ -321,7 +327,7 @@ def main() -> None:
 
     try:
         inputs = (args.chrome, args.compositor, args.launcher, args.kernel.with_suffix('.bin'),
-                  args.kernel.with_suffix('.elf'))
+                  args.kernel.with_suffix('.elf'), *(args.chrome.with_name(name) for name in CHROME_ML_ASSETS))
         profile = Path(args.profile) if args.profile else None
         if profile is not None:
             inputs = (*inputs, args.myfs)

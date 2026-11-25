@@ -21,7 +21,10 @@ from uefi_x64_smoke import VM, clean
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / 'tools'))
 import make_uefi
-from chrome_x64_live import PROFILE_TOKEN_GUEST, URL_GUEST, chrome_files, make_image, prepare_profile, profile_drive_args, qemu_path
+from chrome_x64_live import (
+    CHROME_VM_MEMORY, PROFILE_TOKEN_GUEST, URL_GUEST, chrome_files, make_image,
+    prepare_profile, profile_drive_args, qemu_path,
+)
 
 
 ORIGIN = '10.44.0.81:18080'
@@ -238,7 +241,7 @@ def browser_vm(directory, name, disk, server, volume=None):
         '-drive', f'if=none,id=root,format=raw,snapshot=on,file={qemu_path(disk)}',
         '-device', 'nvme,drive=root,serial=MYOSCHROME,bootindex=1',
         *profile, '-netdev', network, '-device', 'e1000,netdev=wire',
-    ], memory='1024M', binary='qemu-system-x86_64', cpu='max')
+    ], memory=CHROME_VM_MEMORY, binary='qemu-system-x86_64', cpu='max')
 
 
 def run_browser(directory, artifacts, disk, volume, server, phase, title, color, timeout, bookmark_folder=None):

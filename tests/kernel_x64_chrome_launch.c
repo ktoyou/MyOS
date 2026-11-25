@@ -1,3 +1,4 @@
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <sys/stat.h>
@@ -32,6 +33,14 @@ static int copy_database(const char *name) {
 }
 
 int main(void) {
+    if (!access("/myos/chrome-test-ml", F_OK)) {
+        /* Chrome загружает эту библиотеку по абсолютному пути до включения seccomp. */
+        void *library = dlopen("/opt/google/chrome/liboptimization_guide_internal.so", RTLD_NOW | RTLD_LOCAL);
+        if (!library) { fprintf(stderr, "ChromeML: %s\n", dlerror()); return 1; }
+        if (dlclose(library)) { fprintf(stderr, "ChromeML: %s\n", dlerror()); return 1; }
+        fputs("ChromeML library loaded\n", stderr);
+    }
+
     /* SQLite открывает NSS с записью. Копируем базу из Live в /tmp до старта штатного загрузчика. */
     static const char *directories[] = {"/tmp/.local", "/tmp/.local/share", "/tmp/.local/share/pki", NSS_PATH};
     for (unsigned i = 0; i < sizeof(directories) / sizeof(*directories); ++i)
