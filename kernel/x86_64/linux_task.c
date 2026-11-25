@@ -10,7 +10,7 @@ enum {
     SIGCHLD = 17, CLONE_VM = 0x100, CLONE_FS = 0x200, CLONE_FILES = 0x400,
     CLONE_SIGHAND = 0x800, CLONE_VFORK = 0x4000, CLONE_PARENT = 0x8000, CLONE_THREAD = 0x10000,
     CLONE_SYSVSEM = 0x40000, CLONE_SETTLS = 0x80000, CLONE_PARENT_SETTID = 0x100000,
-    CLONE_NEWUSER = 0x10000000, CLONE_NEWPID = 0x20000000,
+    CLONE_NEWUSER = 0x10000000, CLONE_NEWPID = 0x20000000, CLONE_NEWNET = 0x40000000,
     CHILD_CLEARTID = 0x200000, CHILD_SETTID = 0x1000000,
     PTHREAD_FLAGS = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD |
                     CLONE_SYSVSEM | CLONE_SETTLS | CLONE_PARENT_SETTID | CHILD_CLEARTID,
@@ -106,7 +106,7 @@ bool linux64_task_init(uptr data_bytes) {
     address_spaces = tables->address_spaces;
     processes[0] = (struct linux64_process){
         .pid = LINUX64_PID, .sid = LINUX64_PID, .pgid = LINUX64_PID, .threads = 1,
-        .pid_ns = linux64_pidns_init(), .pid_identity = linux64_pid_init(),
+        .net_ns = linux64_netns_init(), .pid_ns = linux64_pidns_init(), .pid_identity = linux64_pid_init(),
         .group_identity = linux64_pid_init(), .fs = linux64_initial_fs(),
         .data_limit = {(u64)-1, (u64)-1},
     };
@@ -267,6 +267,7 @@ const struct linux64_process *linux64_process_by_pid(i32 pid) {
 static void reap_process(struct linux64_process *process) {
     linux64_pid_release(process->group_identity);
     linux64_pid_release(process->pid_identity);
+    linux64_netns_release(process->net_ns);
     process->pid = 0;
 }
 
@@ -278,11 +279,13 @@ static long clone_task(struct linux64_frame *frame, uptr flags, uptr stack, uptr
     bool shared_fs = fs_vfork || flags == (CLONE_FS | SIGCHLD);
     bool new_user = (flags & CLONE_NEWUSER) != 0;
     bool new_pid = (flags & CLONE_NEWPID) != 0;
+    bool new_net = (flags & CLONE_NEWNET) != 0;
     bool shared = thread || vfork;
     if (new_pid && (flags & (CLONE_THREAD | CLONE_PARENT))) return -EINVAL;
     if (new_user && (flags & CLONE_FS)) return -EINVAL;
-    if (!shared && !shared_fs && ((stack && !new_user && !new_pid) ||
-        (flags & ~(CHILD_CLEARTID | CHILD_SETTID | CLONE_NEWUSER | CLONE_NEWPID)) != SIGCHLD))
+    const uptr namespace_flags = CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET;
+    if (!shared && !shared_fs && ((stack && !(flags & namespace_flags)) ||
+        (flags & ~(CHILD_CLEARTID | CHILD_SETTID | namespace_flags)) != SIGCHLD))
         return -ENOSYS;
     if (stack >= X64_USER_TOP || ((thread || fs_vfork) && (!stack || tls >= X64_USER_TOP - PMM_PAGE_SIZE)))
         return -EINVAL;
@@ -292,7 +295,8 @@ static long clone_task(struct linux64_frame *frame, uptr flags, uptr stack, uptr
     struct linux64_task *child = &tasks[slot];
     struct linux64_task *parent = linux64_current;
     if (new_user && parent->process->fs->root.path[1]) return -EPERM;
-    if (new_pid && !new_user && !(parent->caps.effective & LINUX64_CAP_SYS_ADMIN)) return -EPERM;
+    if ((new_pid || new_net) && !new_user &&
+        !(parent->caps.effective & LINUX64_CAP_SYS_ADMIN)) return -EPERM;
     struct linux64_process *process = thread ? parent->process : unused_process();
     if (!process) return -EAGAIN;
     struct linux64_userns *ns = parent->process->userns;
@@ -335,12 +339,26 @@ static long clone_task(struct linux64_frame *frame, uptr flags, uptr stack, uptr
             return -ENOMEM;
         }
     }
+    struct linux64_netns *net_ns = parent->process->net_ns;
+    if (new_net) {
+        long result = linux64_netns_create(ns, &net_ns);
+        if (result) {
+            release_memory(child);
+            linux64_pid_release(identity);
+            linux64_userns_release(ns);
+            linux64_fs_release(fs);
+            return result;
+        }
+    } else if (!thread) {
+        linux64_netns_retain(net_ns);
+    }
     long local = allocate_xstate(child) ? linux64_pid_allocate(pid_ns, next_pid, identity) : -ENOMEM;
     if (local < 0) {
         release_xstate(child);
         release_memory(child);
         linux64_pid_release(identity);
         if (!thread) {
+            linux64_netns_release(net_ns);
             linux64_userns_release(ns);
             linux64_fs_release(fs);
         }
@@ -370,11 +388,13 @@ static long clone_task(struct linux64_frame *frame, uptr flags, uptr stack, uptr
         process->threads = 0;
         process->exit_status = 0;
         process->pid_ns_link_inode = 0;
+        process->net_ns_link_inode = 0;
         process->fdinfo_inode = 0;
         process->proc_fd_inode = 0;
         process->userns = ns;
         process->fs = fs;
         process->pid_ns = pid_ns;
+        process->net_ns = net_ns;
         process->pid_identity = identity;
         linux64_pid_retain(process->group_identity);
         if (new_pid) linux64_pidns_set_reaper(pid_ns, process->pid);
@@ -756,25 +776,46 @@ static long new_session(void) {
 
 static long unshare(uptr flags) {
     if (!flags) return 0;
-    if (flags != CLONE_NEWUSER) return -ENOSYS;
+    if (flags & ~(CLONE_NEWUSER | CLONE_NEWNET)) return -ENOSYS;
+    bool new_user = (flags & CLONE_NEWUSER) != 0;
+    bool new_net = (flags & CLONE_NEWNET) != 0;
     struct linux64_process *process = linux64_current->process;
     if (process->threads != 1) return -EINVAL;
-    if (process->fs->root.path[1]) return -EPERM;
-    struct linux64_userns *ns;
-    long result = linux64_userns_create(process->userns, &ns);
-    if (result) return result;
-    if (process->fs->references > 1) {
+    if (new_user && process->fs->root.path[1]) return -EPERM;
+    if (new_net && !new_user &&
+        !(linux64_current->caps.effective & LINUX64_CAP_SYS_ADMIN)) return -EPERM;
+    struct linux64_userns *ns = process->userns;
+    if (new_user) {
+        long result = linux64_userns_create(ns, &ns);
+        if (result) return result;
+    }
+    struct linux64_netns *net_ns = NULL;
+    if (new_net) {
+        long result = linux64_netns_create(ns, &net_ns);
+        if (result) {
+            if (new_user) linux64_userns_release(ns);
+            return result;
+        }
+    }
+    if (new_user && process->fs->references > 1) {
         struct linux64_fs *fs = linux64_fs_copy(process->fs);
         if (!fs) {
+            linux64_netns_release(net_ns);
             linux64_userns_release(ns);
             return -ENOMEM;
         }
         linux64_fs_release(process->fs);
         process->fs = fs;
     }
-    linux64_userns_release(process->userns);
-    process->userns = ns;
-    linux64_userns_caps(linux64_current);
+    if (new_user) {
+        linux64_userns_release(process->userns);
+        process->userns = ns;
+        linux64_userns_caps(linux64_current);
+    }
+    if (new_net) {
+        linux64_netns_release(process->net_ns);
+        process->net_ns = net_ns;
+    }
     return 0;
 }
 

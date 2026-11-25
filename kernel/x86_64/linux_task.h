@@ -46,7 +46,7 @@ struct linux64_pid;
 
 enum linux64_proc_node {
     USERNS_NONE, USERNS_UID_MAP, USERNS_GID_MAP, USERNS_SETGROUPS,
-    PROC_USER_NS, PROC_PID_NS, PROC_EXE, PROC_ROOT, PROC_TASKS, PROC_FDS,
+    PROC_USER_NS, PROC_PID_NS, PROC_NET_NS, PROC_EXE, PROC_ROOT, PROC_TASKS, PROC_FDS,
 };
 
 struct linux64_caps {
@@ -138,12 +138,13 @@ struct linux64_process {
     struct linux64_rlimit data_limit;
     char executable_path[LINUX64_PATH_LIMIT];
     uptr executable_path_length;
-    u64 pid_ns_link_inode, fdinfo_inode, proc_fd_inode;
+    u64 pid_ns_link_inode, net_ns_link_inode, fdinfo_inode, proc_fd_inode;
     i32 pid, ppid, sid, pgid, exit_status;
     unsigned threads;
     struct linux64_fs *fs;
     struct linux64_userns *userns;
     struct linux64_pidns *pid_ns;
+    struct linux64_netns *net_ns;
     struct linux64_pid *pid_identity, *group_identity;
 };
 
@@ -204,6 +205,14 @@ struct linux64_task {
 };
 
 extern struct linux64_task *linux64_current;
+
+struct linux64_netns *linux64_netns_init(void);
+long linux64_netns_create(struct linux64_userns *owner, struct linux64_netns **result);
+bool linux64_netns_is_initial(const struct linux64_netns *ns);
+void linux64_netns_retain(struct linux64_netns *ns);
+void linux64_netns_release(struct linux64_netns *ns);
+u64 linux64_netns_inode(const struct linux64_netns *ns);
+long linux64_netns_readlink(const struct linux64_netns *ns, uptr destination, uptr size);
 
 struct linux64_pidns *linux64_pidns_init(void);
 long linux64_pidns_create(struct linux64_pidns *parent, struct linux64_userns *owner,

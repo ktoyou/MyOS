@@ -101,6 +101,7 @@ enum { RECORD_LOCK_COUNT = sizeof(record_locks) / sizeof(*record_locks) };
 static u64 next_memfd_inode = 1;
 static u64 next_special_inode = 1;
 static u64 next_pid_ns_link_inode = 1ull << 33;
+static u64 next_net_ns_link_inode = 1ull << 37;
 static u64 next_fdinfo_inode = 1ull << 34;
 static u64 next_proc_fd_inode = 1ull << 35;
 
@@ -128,6 +129,7 @@ static struct file_handle {
     struct linux64_pipe *pipe;
     struct linux64_userns *proc_ns;
     struct linux64_pidns *proc_pid_ns;
+    struct linux64_netns *proc_net_ns;
     enum linux64_proc_node proc_node;
     bool proc_admin;
     enum file_kind device;
@@ -316,7 +318,13 @@ long linux64_ppoll(uptr address, u32 count, uptr timeout, uptr sigmask, uptr sig
 }
 
 static bool namespace_node(enum linux64_proc_node proc) {
-    return proc == PROC_USER_NS || proc == PROC_PID_NS;
+    return proc == PROC_USER_NS || proc == PROC_PID_NS || proc == PROC_NET_NS;
+}
+
+static u64 namespace_inode(const struct linux64_process *process, enum linux64_proc_node proc) {
+    if (proc == PROC_PID_NS) return linux64_pidns_inode(process->pid_ns);
+    if (proc == PROC_NET_NS) return linux64_netns_inode(process->net_ns);
+    return linux64_userns_inode(process->userns);
 }
 
 static enum file_kind kind_of(const struct file_handle *file) {
@@ -418,6 +426,7 @@ static void destroy_file(struct file_handle *file) {
     if (file->pipe) linux64_pipe_close(file->pipe, (file->flags & O_ACCMODE) == O_WRONLY);
     linux64_userns_release(file->proc_ns);
     linux64_pidns_release(file->proc_pid_ns);
+    linux64_netns_release(file->proc_net_ns);
     if (file->flock_mode) flock_release(file, file_locks(file));
     if (file->file.myfs_ino) linux64_myfs_release(file->file.myfs_ino);
     if (file->directory_path) pmm64_free(file->directory_path);
@@ -876,6 +885,7 @@ static enum linux64_proc_node proc_path(const char *path) {
     if (path_equal(path, "self/setgroups", false)) return USERNS_SETGROUPS;
     if (path_equal(path, "self/ns/user", false)) return PROC_USER_NS;
     if (path_equal(path, "self/ns/pid", false)) return PROC_PID_NS;
+    if (path_equal(path, "self/ns/net", false)) return PROC_NET_NS;
     if (path_equal(path, "self/exe", false)) return PROC_EXE;
     return USERNS_NONE;
 }
@@ -1592,6 +1602,9 @@ static long lookup(i32 dirfd, uptr address, u32 flags, struct linux64_file *file
         if (proc == PROC_PID_NS) {
             if (!process->pid_ns_link_inode) process->pid_ns_link_inode = next_pid_ns_link_inode++;
             inode = process->pid_ns_link_inode;
+        } else if (proc == PROC_NET_NS) {
+            if (!process->net_ns_link_inode) process->net_ns_link_inode = next_net_ns_link_inode++;
+            inode = process->net_ns_link_inode;
         }
         *file = (struct linux64_file){.inode = inode};
         *kind = FILE_PROC_LINK;
@@ -1600,8 +1613,7 @@ static long lookup(i32 dirfd, uptr address, u32 flags, struct linux64_file *file
     if (namespace_node(proc)) {
         const struct linux64_process *process = linux64_current->process;
         *file = (struct linux64_file){
-            .inode = proc == PROC_PID_NS ? linux64_pidns_inode(process->pid_ns) :
-                                         linux64_userns_inode(process->userns),
+            .inode = namespace_inode(process, proc),
         };
         *kind = FILE_NAMESPACE;
         return 0;
@@ -1670,6 +1682,8 @@ static long linux_readlink(i32 dirfd, uptr path_address, uptr destination, i32 s
         return linux64_userns_readlink(linux64_current->process->userns, destination, (uptr)size);
     if (proc == PROC_PID_NS)
         return linux64_pidns_readlink(linux64_current->process->pid_ns, destination, (uptr)size);
+    if (proc == PROC_NET_NS)
+        return linux64_netns_readlink(linux64_current->process->net_ns, destination, (uptr)size);
     const u8 *target = file.bytes;
     uptr length = file.size;
     if (proc == PROC_EXE) {
@@ -1801,8 +1815,7 @@ static long linux_open(i32 dirfd, uptr address, u32 flags, u32 mode) {
         if (flags & ~(O_CLOEXEC | O_LARGEFILE | O_NONBLOCK | O_NOCTTY)) return -EINVAL;
         struct linux64_process *process = linux64_current->process;
         const struct linux64_file file = {
-            .inode = proc == PROC_PID_NS ? linux64_pidns_inode(process->pid_ns) :
-                                         linux64_userns_inode(process->userns),
+            .inode = namespace_inode(process, proc),
         };
         result = new_handle(&file, NULL, (flags & ~O_NOCTTY) | O_LARGEFILE);
         if (result < 0) return result;
@@ -1811,6 +1824,9 @@ static long linux_open(i32 dirfd, uptr address, u32 flags, u32 mode) {
         if (proc == PROC_PID_NS) {
             handle->proc_pid_ns = process->pid_ns;
             linux64_pidns_retain(handle->proc_pid_ns);
+        } else if (proc == PROC_NET_NS) {
+            handle->proc_net_ns = process->net_ns;
+            linux64_netns_retain(handle->proc_net_ns);
         } else {
             handle->proc_ns = process->userns;
             linux64_userns_retain(handle->proc_ns);

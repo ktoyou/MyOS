@@ -1598,7 +1598,7 @@ X64_LINUX_RUNTIME := $(X64BUILD)/linux_elf.o \
     $(X64BUILD)/linux_syscall.o $(X64BUILD)/linux_file.o $(X64BUILD)/linux_fb.o \
     $(X64BUILD)/linux_input.o $(X64BUILD)/linux_mmap.o $(X64BUILD)/linux_random.o \
     $(X64BUILD)/linux_time.o $(X64BUILD)/linux_signal.o $(X64BUILD)/linux_socket.o \
-    $(X64BUILD)/linux_pipe.o $(X64BUILD)/linux_userns.o $(X64BUILD)/linux_pidns.o \
+    $(X64BUILD)/linux_pipe.o $(X64BUILD)/linux_userns.o $(X64BUILD)/linux_pidns.o $(X64BUILD)/linux_netns.o \
     $(X64BUILD)/linux_vfs.o $(X64BUILD)/linux_seccomp.o $(X64BUILD)/linux_seccomp_bpf.o \
     $(X64BUILD)/linux_task.o $(X64BUILD)/linux-entry.o $(X64BUILD)/linux_myfs.o $(X64BUILD)/linux-myfs-mmap.o
 X64_PAGING_TESTS := $(addprefix $(X64BUILD)/kernel-paging-,$(addsuffix .bin,0 1 2 3))
@@ -1700,7 +1700,7 @@ $(X64BUILD)/storage-string.o: kernel/string.c kernel/string.h kernel/types.h | $
 	$(CC) $(X64CFLAGS) -c $< -o $@
 $(X64BUILD)/nvme-check.o: tests/kernel_x64_nvme_check.c kernel/nvme.h $(X64_HEADERS) | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
-$(X64BUILD)/linux_elf.o $(X64BUILD)/linux_syscall.o $(X64BUILD)/linux_file.o $(X64BUILD)/linux_fb.o $(X64BUILD)/linux_mmap.o $(X64BUILD)/linux_random.o $(X64BUILD)/linux_time.o $(X64BUILD)/linux_signal.o $(X64BUILD)/linux_socket.o $(X64BUILD)/linux_pipe.o $(X64BUILD)/linux_userns.o $(X64BUILD)/linux_pidns.o $(X64BUILD)/linux_vfs.o $(X64BUILD)/linux_seccomp.o $(X64BUILD)/linux_seccomp_bpf.o $(X64BUILD)/linux_task.o: $(X64BUILD)/%.o: kernel/x86_64/%.c kernel/x86_64/linux.h kernel/x86_64/linux_task.h $(X64_HEADERS) | $(X64BUILD)
+$(X64BUILD)/linux_elf.o $(X64BUILD)/linux_syscall.o $(X64BUILD)/linux_file.o $(X64BUILD)/linux_fb.o $(X64BUILD)/linux_mmap.o $(X64BUILD)/linux_random.o $(X64BUILD)/linux_time.o $(X64BUILD)/linux_signal.o $(X64BUILD)/linux_socket.o $(X64BUILD)/linux_pipe.o $(X64BUILD)/linux_userns.o $(X64BUILD)/linux_pidns.o $(X64BUILD)/linux_netns.o $(X64BUILD)/linux_vfs.o $(X64BUILD)/linux_seccomp.o $(X64BUILD)/linux_seccomp_bpf.o $(X64BUILD)/linux_task.o: $(X64BUILD)/%.o: kernel/x86_64/%.c kernel/x86_64/linux.h kernel/x86_64/linux_task.h $(X64_HEADERS) | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
 $(X64BUILD)/linux_myfs.o: kernel/x86_64/linux_myfs.c kernel/x86_64/linux_myfs.h kernel/x86_64/linux_task.h kernel/x86_64/linux.h kernel/myfs.h kernel/fs.h kernel/block.h kernel/nvme.h $(X64_HEADERS) | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
@@ -1810,6 +1810,10 @@ $(X64BUILD)/linux-pidns.o: tests/linux_x64_pidns.c | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
 $(X64BUILD)/linux-pidns.elf: $(X64BUILD)/linux-pidns.o
 	$(LD) -m elf_x86_64 -static -no-pie $< -o $@
+$(X64BUILD)/linux-netns.o: tests/linux_x64_netns.c | $(X64BUILD)
+	$(CC) $(X64CFLAGS) -c $< -o $@
+$(X64BUILD)/linux-netns.elf: $(X64BUILD)/linux-netns.o
+	$(LD) -m elf_x86_64 -static -no-pie $< -o $@
 $(X64BUILD)/linux-shared-fs.o: tests/linux_x64_shared_fs.c | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
 $(X64BUILD)/linux-shared-fs.elf: $(X64BUILD)/linux-shared-fs.o
@@ -1875,7 +1879,7 @@ kernel-x64-ring3-smoke: $(X64_RING3_TESTS)
 	python3 tests/kernel_x64_smoke.py --ring3
 .PHONY: kernel-x64-linux-smoke
 kernel-x64-linux-smoke: $(X64BUILD)/linux-fb.elf $(X64BUILD)/linux-input.elf
-kernel-x64-linux-smoke: $(X64BUILD)/kernel-linux.bin $(X64BUILD)/linux-probe.elf $(X64BUILD)/linux-bad-stack.elf $(X64BUILD)/linux-pie.elf $(X64BUILD)/linux-files.elf $(X64BUILD)/linux-mmap.elf $(X64BUILD)/linux-socket.elf $(X64BUILD)/linux-pipe.elf $(X64BUILD)/linux-poll.elf $(X64BUILD)/linux-fork.elf $(X64BUILD)/linux-pthread.elf $(X64BUILD)/linux-userns.elf $(X64BUILD)/linux-pidns.elf $(X64BUILD)/linux-shared-fs.elf $(X64BUILD)/linux-vfork.elf $(X64BUILD)/linux-exec.elf $(X64BUILD)/linux-exec-target.elf
+kernel-x64-linux-smoke: $(X64BUILD)/kernel-linux.bin $(X64BUILD)/linux-probe.elf $(X64BUILD)/linux-bad-stack.elf $(X64BUILD)/linux-pie.elf $(X64BUILD)/linux-files.elf $(X64BUILD)/linux-mmap.elf $(X64BUILD)/linux-socket.elf $(X64BUILD)/linux-pipe.elf $(X64BUILD)/linux-poll.elf $(X64BUILD)/linux-fork.elf $(X64BUILD)/linux-pthread.elf $(X64BUILD)/linux-userns.elf $(X64BUILD)/linux-pidns.elf $(X64BUILD)/linux-netns.elf $(X64BUILD)/linux-shared-fs.elf $(X64BUILD)/linux-vfork.elf $(X64BUILD)/linux-exec.elf $(X64BUILD)/linux-exec-target.elf
 	python3 tests/kernel_x64_linux_smoke.py
 
 WAYLAND_SCANNER ?= wayland-scanner
