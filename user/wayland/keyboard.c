@@ -22,8 +22,9 @@ struct keyboard_client {
 
 struct wayland_keyboard {
     struct wl_display *display;
-    struct wl_global *seat;
     struct wl_event_source *input;
+    void (*changed)(void *);
+    void *data;
     struct wl_resource *focus;
     struct wl_listener focus_destroy;
     struct wl_list clients;
@@ -125,6 +126,7 @@ static int read_input(int fd, uint32_t mask, void *data) {
         wl_event_source_remove(keyboard->input);
         keyboard->input = NULL;
         wayland_keyboard_focus(keyboard, NULL);
+        keyboard->changed(keyboard->data);
         return 0;
     }
     struct timespec now = {0};
@@ -159,10 +161,9 @@ static void keyboard_destroyed(struct wl_resource *resource) {
 
 static const struct wl_keyboard_interface keyboard_requests = { .release = release_request };
 
-static void get_keyboard(struct wl_client *client, struct wl_resource *seat, uint32_t id) {
-    struct wayland_keyboard *keyboard = wl_resource_get_user_data(seat);
+void wayland_keyboard_bind(struct wayland_keyboard *keyboard, struct wl_client *client, int version, uint32_t id) {
     struct keyboard_client *entry = calloc(1, sizeof(*entry));
-    if (entry) entry->resource = wl_resource_create(client, &wl_keyboard_interface, wl_resource_get_version(seat), id);
+    if (entry) entry->resource = wl_resource_create(client, &wl_keyboard_interface, version, id);
     if (!entry || !entry->resource) {
         free(entry);
         wl_client_post_no_memory(client);
@@ -177,29 +178,8 @@ static void get_keyboard(struct wl_client *client, struct wl_resource *seat, uin
     if (client_owns(resource, keyboard->focus)) send_enter(keyboard, resource, wl_display_next_serial(keyboard->display));
 }
 
-static void missing_capability(struct wl_client *client, struct wl_resource *seat, uint32_t id) {
-    (void)client;
-    (void)id;
-    wl_resource_post_error(seat, WL_SEAT_ERROR_MISSING_CAPABILITY, "Seat has only a keyboard");
-}
-
-static const struct wl_seat_interface seat_requests = {
-    .get_pointer = missing_capability,
-    .get_keyboard = get_keyboard,
-    .get_touch = missing_capability,
-    .release = release_request,
-};
-
-static void bind_seat(struct wl_client *client, void *data, uint32_t version, uint32_t id) {
-    struct wl_resource *seat = wl_resource_create(client, &wl_seat_interface, version, id);
-    if (!seat) {
-        wl_client_post_no_memory(client);
-        return;
-    }
-    wl_resource_set_implementation(seat, &seat_requests, data, NULL);
-    struct wayland_keyboard *keyboard = data;
-    wl_seat_send_capabilities(seat, keyboard->input ? WL_SEAT_CAPABILITY_KEYBOARD : 0);
-    if (version >= WL_SEAT_NAME_SINCE_VERSION) wl_seat_send_name(seat, "MyOS");
+bool wayland_keyboard_available(const struct wayland_keyboard *keyboard) {
+    return keyboard && keyboard->input;
 }
 
 static bool load_keymap(struct wayland_keyboard *keyboard, const char *path) {
@@ -225,7 +205,8 @@ static bool load_keymap(struct wayland_keyboard *keyboard, const char *path) {
 }
 
 bool wayland_keyboard_init(struct wayland_keyboard **result, struct wl_display *display,
-                           const char *keymap_path) {
+                           const char *keymap_path, void (*changed)(void *), void *data) {
+    if (!keymap_path) return true;
     int fd = open("/dev/input/event0", O_RDONLY | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0) {
         if (errno == ENOENT || errno == ENODEV) return true;
@@ -238,6 +219,8 @@ bool wayland_keyboard_init(struct wayland_keyboard **result, struct wl_display *
         return false;
     }
     keyboard->display = display;
+    keyboard->changed = changed;
+    keyboard->data = data;
     keyboard->fd = fd;
     keyboard->keymap_fd = -1;
     keyboard->focus_destroy.notify = focus_destroyed;
@@ -249,8 +232,7 @@ bool wayland_keyboard_init(struct wayland_keyboard **result, struct wl_display *
     }
     keyboard->input = wl_event_loop_add_fd(wl_display_get_event_loop(display), fd, WL_EVENT_READABLE,
                                           read_input, keyboard);
-    if (keyboard->input) keyboard->seat = wl_global_create(display, &wl_seat_interface, 7, keyboard, bind_seat);
-    if (!keyboard->seat) {
+    if (!keyboard->input) {
         wayland_keyboard_destroy(keyboard);
         return false;
     }
@@ -261,7 +243,6 @@ bool wayland_keyboard_init(struct wayland_keyboard **result, struct wl_display *
 void wayland_keyboard_destroy(struct wayland_keyboard *keyboard) {
     if (!keyboard) return;
     if (keyboard->focus) wl_list_remove(&keyboard->focus_destroy.link);
-    if (keyboard->seat) wl_global_destroy(keyboard->seat);
     if (keyboard->input) wl_event_source_remove(keyboard->input);
     if (keyboard->keymap_fd >= 0) close(keyboard->keymap_fd);
     xkb_state_unref(keyboard->state);

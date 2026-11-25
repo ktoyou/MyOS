@@ -1765,7 +1765,7 @@ $(WAYLAND_BUILD)/wayland-keymap: user/wayland/keymap.c | $(WAYLAND_BUILD)
 $(WAYLAND_BUILD)/keyboard.xkb: $(WAYLAND_BUILD)/wayland-keymap
 	$< >$@.tmp
 	mv $@.tmp $@
-$(WAYLAND_BUILD)/wayland-compositor: user/wayland/compositor.c user/wayland/keyboard.c user/wayland/keyboard.h $(WAYLAND_BUILD)/xdg-shell-protocol.c $(WAYLAND_BUILD)/xdg-shell-server-protocol.h
+$(WAYLAND_BUILD)/wayland-compositor: user/wayland/compositor.c user/wayland/seat.c user/wayland/seat.h user/wayland/keyboard.c user/wayland/keyboard.h user/wayland/pointer.c user/wayland/pointer.h $(WAYLAND_BUILD)/xdg-shell-protocol.c $(WAYLAND_BUILD)/xdg-shell-server-protocol.h
 	$(CC) -m64 -O2 -Wall -Wextra $(WAYLAND_CFLAGS) $(WAYLAND_XKB_CFLAGS) -I$(WAYLAND_BUILD) $(filter %.c,$^) $(WAYLAND_SERVER_LIBS) $(WAYLAND_XKB_LIBS) -o $@
 $(WAYLAND_BUILD)/wayland-client: tests/linux_x64_wayland.c $(WAYLAND_BUILD)/xdg-shell-protocol.c $(WAYLAND_BUILD)/xdg-shell-client-protocol.h
 	$(CC) -m64 -O2 -Wall -Wextra $(WAYLAND_CFLAGS) -I$(WAYLAND_BUILD) $(filter %.c,$^) $(WAYLAND_CLIENT_LIBS) -o $@
