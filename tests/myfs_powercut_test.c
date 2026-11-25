@@ -9,7 +9,7 @@ static u8 stable[N][512],drive[N][512],baseline[N][512],after[N][512];
 static void *jump[5];
 static unsigned events,cut,policy;
 static bool armed,fail_flush,fail_write,capture_commit;
-static u32 file;
+static u32 file, after_resize;
 #define CHECK(x) do{if(!(x)){printf("POWER FAIL %d policy=%u cut=%u events=%u: %s\n",__LINE__,policy,cut,events,#x);exit(1);}}while(0)
 void mutex_lock(struct mutex *m){(void)m;}void mutex_unlock(struct mutex *m){(void)m;}
 u32 ata_sectors(void){return N;}
@@ -36,6 +36,15 @@ static int operation(unsigned op){
  case 5:r=fs_truncate(file);break;
  case 6:r=fs_chmod(file,0600);break;
  case 7:r=fs_symlink(FS_ROOT,"/data","/link");break;
+ case 8:r=myfs_resize(file,509);break;
+ case 9:r=myfs_resize(file,2495);break;
+ case 10:{
+  u8 replacement[512];
+  memset(replacement,0xa7,sizeof(replacement));
+  r=myfs_resize(file,509);
+  if(!r && fs_write(after_resize,0,replacement,sizeof(replacement))!=sizeof(replacement))r=-1;
+  break;
+ }
  default:r=-1;break;
  }
  return r?r:fs_sync();
@@ -65,10 +74,11 @@ int main(void){
  static u8 data[2048];memset(data,0x5a,sizeof(data));CHECK(fs_write(file,0,data,sizeof(data))==sizeof(data));
  CHECK(fs_create(1,"/a",FS_TYPE_DIR,0)==0 && fs_create(1,"/b",FS_TYPE_DIR,0)==0);
  CHECK(fs_create(1,"/a/child",FS_TYPE_DIR,0)==0);
+ CHECK(fs_create(1,"/after-resize",FS_TYPE_FILE,&after_resize)==0);
  CHECK(fs_sync()==0);memcpy(baseline,stable,sizeof(stable));
  struct snap base_snap;fill_snap(&base_snap);
  unsigned crashes=0;
- for(unsigned op=0;op<8;op++){
+ for(unsigned op=0;op<11;op++){
   policy=0;reset();CHECK(operation(op)==0);unsigned count=events;CHECK(fs_sync()==0);memcpy(after,stable,sizeof(after));
   struct snap after_snap;fill_snap(&after_snap);
   for(policy=0;policy<3;policy++)for(cut=1;cut<=count;cut++){
