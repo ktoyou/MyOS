@@ -1600,7 +1600,7 @@ X64_LINUX_RUNTIME := $(X64BUILD)/linux_elf.o \
     $(X64BUILD)/linux_time.o $(X64BUILD)/linux_signal.o $(X64BUILD)/linux_socket.o \
     $(X64BUILD)/linux_pipe.o $(X64BUILD)/linux_userns.o $(X64BUILD)/linux_pidns.o \
     $(X64BUILD)/linux_vfs.o $(X64BUILD)/linux_seccomp.o $(X64BUILD)/linux_seccomp_bpf.o \
-    $(X64BUILD)/linux_task.o $(X64BUILD)/linux-entry.o $(X64BUILD)/linux_myfs.o
+    $(X64BUILD)/linux_task.o $(X64BUILD)/linux-entry.o $(X64BUILD)/linux_myfs.o $(X64BUILD)/linux-myfs-mmap.o
 X64_PAGING_TESTS := $(addprefix $(X64BUILD)/kernel-paging-,$(addsuffix .bin,0 1 2 3))
 X64_RING3_TESTS := $(addprefix $(X64BUILD)/kernel-ring3-,$(addsuffix .bin,0 1 2 3))
 X64CFLAGS := -m64 -mno-red-zone -mgeneral-regs-only -ffreestanding -fno-pie -fno-pic \
@@ -1704,7 +1704,9 @@ $(X64BUILD)/linux_elf.o $(X64BUILD)/linux_syscall.o $(X64BUILD)/linux_file.o $(X
 	$(CC) $(X64CFLAGS) -c $< -o $@
 $(X64BUILD)/linux_myfs.o: kernel/x86_64/linux_myfs.c kernel/x86_64/linux_myfs.h kernel/x86_64/linux_task.h kernel/x86_64/linux.h kernel/myfs.h kernel/fs.h kernel/block.h kernel/nvme.h $(X64_HEADERS) | $(X64BUILD)
 	$(CC) $(X64CFLAGS) -c $< -o $@
-$(X64BUILD)/linux_file.o $(X64BUILD)/linux_vfs.o $(X64BUILD)/linux_elf.o: kernel/x86_64/linux_myfs.h
+$(X64BUILD)/linux-myfs-mmap.o: kernel/x86_64/linux_myfs_mmap.c kernel/x86_64/linux_myfs.h kernel/x86_64/linux.h $(X64_HEADERS) | $(X64BUILD)
+	$(CC) $(X64CFLAGS) -c $< -o $@
+$(X64BUILD)/linux_file.o $(X64BUILD)/linux_vfs.o $(X64BUILD)/linux_elf.o $(X64BUILD)/linux_mmap.o: kernel/x86_64/linux_myfs.h
 $(X64BUILD)/linux_syscall.o: X64CFLAGS += -I$(BUILD)
 $(X64BUILD)/linux_syscall.o: $(BUILD)/build_info.h
 $(X64BUILD)/linux-entry.o: kernel/x86_64/linux_syscall.asm | $(X64BUILD)

@@ -51,7 +51,9 @@ struct paging64_mmap_file {
     uptr length, offset;
     uptr (*frame)(const void *object, uptr offset);
     const void *object;
+    bool cached;
 };
+void paging64_set_cached_file_release(void (*release)(uptr));
 bool paging64_map_mmap(uptr start, uptr end, const struct paging64_mmap_file *file,
                        bool accessible, bool writable, bool executable,
                        bool shared, bool no_write);

@@ -30,6 +30,12 @@ long linux64_myfs_truncate(u32 ino, uptr size);
 long linux64_myfs_sync(void);
 long linux64_myfs_retain(u32 ino);
 void linux64_myfs_release(u32 ino);
+
+long linux64_myfs_map_prepare(u32 ino, uptr offset, uptr length);
+void linux64_myfs_map_finish(u32 ino, uptr offset, uptr length);
+uptr linux64_myfs_map_frame(const void *object, uptr offset);
+void linux64_myfs_map_update(u32 ino, uptr offset, const void *data, uptr length);
+bool linux64_myfs_has_mapping(u32 ino);
 struct linux64_inode_locks *linux64_myfs_lock_state(u32 ino);
 
 #endif
