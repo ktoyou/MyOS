@@ -22,14 +22,39 @@ static void print_text(const char *text) {
     while (*text) kernel64_serial_char(*text++);
 }
 
-static void print_address(u32 address) {
+static char *format_address(u32 address, char *buffer) {
     for (int shift = 24; shift >= 0; shift -= 8) {
         unsigned octet = (address >> shift) & 255;
-        if (octet >= 100) kernel64_serial_char('0' + octet / 100);
-        if (octet >= 10) kernel64_serial_char('0' + octet / 10 % 10);
-        kernel64_serial_char('0' + octet % 10);
-        if (shift) kernel64_serial_char('.');
+        if (octet >= 100) *buffer++ = '0' + octet / 100;
+        if (octet >= 10) *buffer++ = '0' + octet / 10 % 10;
+        *buffer++ = '0' + octet % 10;
+        if (shift) *buffer++ = '.';
     }
+    return buffer;
+}
+
+static void print_address(u32 address) {
+    char buffer[16];
+    *format_address(address, buffer) = 0;
+    print_text(buffer);
+}
+
+u32 linux64_net_dns_server(void) {
+    struct dhcp64_lease lease;
+    return dhcp64_get_lease(&lease) ? lease.dns : 0;
+}
+
+uptr linux64_net_resolver_config(u32 server, char *buffer) {
+    static const char nameserver[] = "nameserver ";
+    /* glibc иначе объединяет запросы A и AAAA в sendmmsg, которого пока нет. */
+    static const char options[] = "\noptions single-request\n";
+    _Static_assert(sizeof(nameserver) - 1 + 15 + sizeof(options) - 1 <= LINUX64_RESOLVER_CONFIG_MAX,
+                   "Linux x86-64 resolver config");
+    char *next = buffer;
+    for (unsigned i = 0; i < sizeof(nameserver) - 1; ++i) *next++ = nameserver[i];
+    next = format_address(server, next);
+    for (unsigned i = 0; i < sizeof(options) - 1; ++i) *next++ = options[i];
+    return (uptr)(next - buffer);
 }
 
 static void report_lease(void) {

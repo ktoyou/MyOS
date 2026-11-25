@@ -123,6 +123,7 @@ struct epoll_watch {
 
 static struct file_handle {
     struct linux64_file file;
+    char resolver_config[LINUX64_RESOLVER_CONFIG_MAX];
     struct memfd *memfd;
     struct linux64_socket *socket;
     struct linux64_pipe *pipe;
@@ -967,7 +968,15 @@ static long new_handle(const struct linux64_file *file, struct memfd *memfd, u32
         if (description->references) continue;
         *description = (struct file_handle){.memfd = memfd, .flags = flags & ~O_CLOEXEC,
                                             .references = 1};
-        if (file) description->file = *file;
+        if (file) {
+            description->file = *file;
+            if (file->dns_server) {
+                /* Действующая аренда может измениться, пока дескриптор открыт. */
+                description->file.size = linux64_net_resolver_config(file->dns_server,
+                                                                      description->resolver_config);
+                description->file.bytes = (const u8 *)description->resolver_config;
+            }
+        }
         if (memfd) ++memfd->references;
         linux64_current->process->fds[fd] = (struct linux64_fd_slot){description, (flags & O_CLOEXEC) != 0};
         return fd;
@@ -2220,12 +2229,13 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
         return file_stat(&file, memfd, kind_of(file_at(fd)), arg1);
     case 8: /* lseek */
         if (!open_file(fd)) return -EBADF;
-        if (file_at(fd)->file.backing) {
+        if (file_at(fd)->file.backing || file_at(fd)->file.dns_server) {
             struct file_handle *handle = file_at(fd);
             long offset = (long)arg1;
             u32 whence = (u32)arg2;
             if (whence > 2) return -EINVAL;
-            uptr base = whence == 2 ? handle->file.backing->size : whence == 1 ? handle->offset : 0;
+            uptr size = handle->file.backing ? handle->file.backing->size : handle->file.size;
+            uptr base = whence == 2 ? size : whence == 1 ? handle->offset : 0;
             if (__builtin_add_overflow((long)base, offset, &offset) || offset < 0) return -EINVAL;
             handle->offset = (uptr)offset;
             return offset;
