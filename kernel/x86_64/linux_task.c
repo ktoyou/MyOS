@@ -8,7 +8,7 @@
 enum {
     EPERM = 1, ESRCH = 3, EIO = 5, ECHILD = 10, EAGAIN = 11, ENOMEM = 12, EFAULT = 14,
     EINVAL = 22, ENOSYS = 38, ETIMEDOUT = 110,
-    SIGCHLD = 17, CLONE_VM = 0x100, CLONE_FS = 0x200, CLONE_FILES = 0x400,
+    SIGCHLD = LINUX64_SIGCHLD, CLONE_VM = 0x100, CLONE_FS = 0x200, CLONE_FILES = 0x400,
     CLONE_SIGHAND = 0x800, CLONE_VFORK = 0x4000, CLONE_PARENT = 0x8000, CLONE_THREAD = 0x10000,
     CLONE_SYSVSEM = 0x40000, CLONE_SETTLS = 0x80000, CLONE_PARENT_SETTID = 0x100000,
     CLONE_NEWUSER = 0x10000000, CLONE_NEWPID = 0x20000000, CLONE_NEWNET = 0x40000000,
@@ -20,7 +20,7 @@ enum {
     PR_GET_SECCOMP = 21, PR_SET_SECCOMP = 22, PR_SET_NO_NEW_PRIVS = 38, PR_GET_NO_NEW_PRIVS = 39,
     SECCOMP_MODE_FILTER = 2, SECCOMP_SET_MODE_FILTER = 1, SECCOMP_GET_ACTION_AVAIL = 2,
     SECCOMP_TSYNC = 1, SECCOMP_TSYNC_ESRCH = 0x10, SIGSEGV = 11, SIGSYS = 31,
-    SIGSYS_FRAME_LIMIT = 8,
+    SIGNAL_FRAME_LIMIT = 8, SYS_SECCOMP = 1,
     SA_NOCLDWAIT = 2, SIG_IGN = 1,
     WNOHANG = 1, WUNTRACED = 2, WEXITED = 4, WCONTINUED = 8, WNOWAIT = 0x01000000,
     P_ALL = 0, P_PID = 1, P_PGID = 2,
@@ -150,21 +150,21 @@ static void restore_xstate(const void *state) {
     }
 }
 
-struct linux64_sigsys_state {
-    struct linux64_sigsys_state *previous;
+struct linux64_signal_state {
+    struct linux64_signal_state *previous;
     uptr physical, user_frame;
     u32 references, pages, depth;
     u8 xstate[] __attribute__((aligned(64)));
 };
 
-static struct linux64_sigsys_state *retain_sigsys(struct linux64_sigsys_state *state) {
+static struct linux64_signal_state *retain_signal_state(struct linux64_signal_state *state) {
     if (state) ++state->references;
     return state;
 }
 
-static void release_sigsys(struct linux64_sigsys_state *state) {
+static void release_signal_state(struct linux64_signal_state *state) {
     while (state && !--state->references) {
-        struct linux64_sigsys_state *previous = state->previous;
+        struct linux64_signal_state *previous = state->previous;
         uptr physical = state->physical;
         u32 pages = state->pages;
         for (u32 i = 0; i < pages; ++i) pmm64_free(physical + (uptr)i * PMM_PAGE_SIZE);
@@ -172,38 +172,38 @@ static void release_sigsys(struct linux64_sigsys_state *state) {
     }
 }
 
-static bool deliver_sigsys(struct linux64_frame *frame, u16 trap) {
+static bool deliver_signal(struct linux64_frame *frame, const struct linux64_siginfo *info, u64 return_mask) {
     struct linux64_task *task = linux64_current;
-    struct linux64_sigsys_state *previous = task->sigsys;
+    struct linux64_signal_state *previous = task->signal_state;
     u32 depth = previous ? previous->depth + 1 : 1;
-    if (depth > SIGSYS_FRAME_LIMIT) return false;
-    u32 pages = (__builtin_offsetof(struct linux64_sigsys_state, xstate) +
+    if (depth > SIGNAL_FRAME_LIMIT) return false;
+    u32 pages = (__builtin_offsetof(struct linux64_signal_state, xstate) +
                  xstate_bytes + PMM_PAGE_SIZE - 1) / PMM_PAGE_SIZE;
     uptr physical = pmm64_alloc_contiguous(pages);
     if (!physical) return false;
-    struct linux64_sigsys_state *state = pmm64_pointer(physical);
-    *state = (struct linux64_sigsys_state){.physical = physical, .references = 1, .pages = pages, .depth = depth};
-    if (!linux64_deliver_seccomp_sigsys(frame, trap, LINUX64_SECCOMP_ARCH_X86_64, &state->user_frame)) {
-        release_sigsys(state);
+    struct linux64_signal_state *state = pmm64_pointer(physical);
+    *state = (struct linux64_signal_state){.physical = physical, .references = 1, .pages = pages, .depth = depth};
+    if (!linux64_build_signal_frame(frame, info, return_mask, &state->user_frame)) {
+        release_signal_state(state);
         return false;
     }
     /* XRSTOR читает только копию ядра, недоступную обработчику сигнала. */
     save_xstate(state->xstate);
     state->previous = previous;
-    task->sigsys = state;
+    task->signal_state = state;
     return true;
 }
 
-static void return_sigsys(struct linux64_frame *frame) {
+static void return_signal(struct linux64_frame *frame) {
     struct linux64_task *task = linux64_current;
-    struct linux64_sigsys_state *state = task->sigsys;
+    struct linux64_signal_state *state = task->signal_state;
     if (!state || !linux64_rt_sigreturn(frame, state->user_frame)) {
         finish_task(SIGSEGV, true);
         return;
     }
     restore_xstate(state->xstate);
-    task->sigsys = retain_sigsys(state->previous);
-    release_sigsys(state);
+    task->signal_state = retain_signal_state(state->previous);
+    release_signal_state(state);
 }
 
 static void save_state(struct linux64_task *task) {
@@ -381,13 +381,15 @@ static long clone_task(struct linux64_frame *frame, uptr flags, uptr stack, uptr
     child->finish_wait = false;
     child->vfork_child = 0;
     child->signal_mask = parent->signal_mask;
+    child->poll.interrupted = child->signal_frame_ready = false;
     child->no_new_privs = parent->no_new_privs;
     child->seccomp = linux64_seccomp_retain(parent->seccomp);
-    child->sigsys = thread ? NULL : retain_sigsys(parent->sigsys);
+    child->signal_state = thread ? NULL : retain_signal_state(parent->signal_state);
     child->caps = parent->caps;
     if (new_user) linux64_userns_caps(child);
     if (!thread) {
         *process = *parent->process;
+        process->child_signal = (struct linux64_child_signal){0};
         process->pid = child->tid;
         process->ppid = parent->process->pid;
         process->threads = 0;
@@ -527,12 +529,27 @@ static void publish_child_exit(struct linux64_process *child) {
         if (parent->pid != child->ppid) continue;
         const struct linux64_sigaction *action = &parent->actions[SIGCHLD - 1];
         bool auto_reap = action->handler == SIG_IGN || (action->flags & SA_NOCLDWAIT);
+        bool notify = action->handler > SIG_IGN;
         for (unsigned j = 0; j < LINUX64_TASK_COUNT; ++j) {
             struct linux64_task *waiter = &tasks[j];
+            if (!action->handler && waiter->tid == parent->pid && waiter->process == parent &&
+                waiter->state != TASK_FREE && waiter->state != TASK_DEAD &&
+                (waiter->signal_mask & LINUX64_SIGCHLD_MASK))
+                notify = true;
             if (waiter->state != TASK_WAITING || waiter->process != parent ||
                 !wait_matches(parent, child, &waiter->wait)) continue;
             waiter->finish_wait = true;
             waiter->state = TASK_RUNNABLE;
+        }
+        /* Обычный сигнал хранит первое уведомление даже после wait4. */
+        if (notify && !parent->child_signal.code) {
+            i32 signal = child->exit_status & 0x7f;
+            parent->child_signal = (struct linux64_child_signal){
+                .pid = linux64_pid_number(child->pid_identity, parent->pid_ns),
+                .uid = linux64_visible_id(parent->userns, false, LINUX64_UID),
+                .status = signal ? signal : child->exit_status >> 8,
+                .code = signal ? CLD_KILLED : CLD_EXITED,
+            };
         }
         if (auto_reap) reap_process(child);
         return;
@@ -568,8 +585,8 @@ bool linux64_commit_exec(struct linux64_frame *frame, uptr root, uptr entry, upt
     task->memory = memory;
 
     linux64_close_on_exec(process);
-    release_sigsys(task->sigsys);
-    task->sigsys = NULL;
+    release_signal_state(task->signal_state);
+    task->signal_state = NULL;
     for (unsigned i = 0; i < LINUX64_SIGNAL_COUNT; ++i) {
         u64 handler = process->actions[i].handler;
         process->actions[i] = (struct linux64_sigaction){.handler = handler == SIG_IGN ? handler : 0};
@@ -697,8 +714,8 @@ static void stop_task(struct linux64_task *task) {
     linux64_input_wait_finish(task);
     linux64_seccomp_release(task->seccomp);
     task->seccomp = NULL;
-    release_sigsys(task->sigsys);
-    task->sigsys = NULL;
+    release_signal_state(task->signal_state);
+    task->signal_state = NULL;
     release_xstate(task);
     task->state = TASK_DEAD;
     --task->process->threads;
@@ -916,7 +933,7 @@ static void resume_wait(struct linux64_task *task) {
 
 u64 linux64_user_rflags = 2;
 
-static void schedule(struct linux64_frame *frame) {
+static void schedule_next(struct linux64_frame *frame) {
     linux64_scm_collect_pending();
     struct linux64_task *old = linux64_current;
     /* Поиск готовой задачи может ждать тайм-аут даже при возврате к той же задаче. */
@@ -960,6 +977,48 @@ static void schedule(struct linux64_frame *frame) {
     }
     *frame = next->frame;
     linux64_task_clock_resume();
+}
+
+bool linux64_sigchld_pending(const struct linux64_task *task) {
+    return task->process->child_signal.code && task->process->actions[SIGCHLD - 1].handler > SIG_IGN &&
+           !(task->signal_mask & LINUX64_SIGCHLD_MASK);
+}
+
+static bool deliver_pending_child_signal(struct linux64_frame *frame) {
+    struct linux64_task *task = linux64_current;
+    if (task->signal_frame_ready) {
+        task->signal_frame_ready = false;
+        return true;
+    }
+
+    u64 restore = task->poll.interrupted ? task->poll.saved_mask : task->signal_mask;
+    task->poll.interrupted = false;
+    if (task->process->child_signal.code && !(task->signal_mask & LINUX64_SIGCHLD_MASK)) {
+        const struct linux64_child_signal signal = task->process->child_signal;
+        const struct linux64_siginfo info = {
+            .signal = SIGCHLD, .code = signal.code,
+            .child = {.pid = signal.pid, .uid = signal.uid, .status = signal.status},
+        };
+        task->process->child_signal = (struct linux64_child_signal){0};
+        if (task->process->actions[SIGCHLD - 1].handler > SIG_IGN)
+            return deliver_signal(frame, &info, restore);
+    }
+    task->signal_mask = restore;
+    return true;
+}
+
+static void schedule(struct linux64_frame *frame) {
+    /* Немедленный EINTR и его сигнал принадлежат одному потоку. */
+    if (linux64_current->poll.interrupted) {
+        if (deliver_pending_child_signal(frame)) linux64_current->signal_frame_ready = true;
+        else finish_task(SIGSEGV, true);
+    }
+    for (;;) {
+        schedule_next(frame);
+        /* xstate уже принадлежит потоку, который вернётся в ring 3. */
+        if (deliver_pending_child_signal(frame)) return;
+        finish_task(SIGSEGV, true);
+    }
 }
 
 void linux64_task_timer(struct linux64_frame *frame) {
@@ -1046,9 +1105,15 @@ static bool seccomp_allows(struct linux64_frame *frame) {
         frame->rax = (u64)-(long)(error > 4095 ? 4095 : error);
         break;
     }
-    case LINUX64_SECCOMP_TRAP:
-        if (!deliver_sigsys(frame, (u16)(decision & LINUX64_SECCOMP_DATA))) finish_task(SIGSYS, true);
+    case LINUX64_SECCOMP_TRAP: {
+        const struct linux64_siginfo info = {
+            .signal = SIGSYS, .error = (u16)(decision & LINUX64_SECCOMP_DATA), .code = SYS_SECCOMP,
+            .syscall = {.address = frame->rip, .number = (i32)frame->rax, .arch = LINUX64_SECCOMP_ARCH_X86_64},
+        };
+        if (!deliver_signal(frame, &info, linux64_current->signal_mask)) finish_task(SIGSYS, true);
+        else linux64_current->signal_frame_ready = true;
         break;
+    }
     case LINUX64_SECCOMP_TRACE:
     case LINUX64_SECCOMP_USER_NOTIF:
         frame->rax = (u64)-ENOSYS;
@@ -1088,7 +1153,7 @@ void linux64_task_syscall(struct linux64_frame *frame) {
     uptr number = frame->rax;
     switch (number) {
     case 15: /* rt_sigreturn */
-        return_sigsys(frame);
+        return_signal(frame);
         break;
     case 24: /* sched_yield */
         frame->rax = 0;

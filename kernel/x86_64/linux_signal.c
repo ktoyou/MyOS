@@ -18,20 +18,11 @@
 
 enum {
     SIG_BLOCK = 0, SIG_UNBLOCK = 1, SIG_SETMASK = 2,
-    SYS_SECCOMP = 1, SS_DISABLE = 2, UC_SIGCONTEXT_SS = 2, UC_STRICT_RESTORE_SS = 4,
+    SS_DISABLE = 2, UC_SIGCONTEXT_SS = 2, UC_STRICT_RESTORE_SS = 4,
     USER_RED_ZONE = 128,
 };
 
 _Static_assert(sizeof(struct linux64_sigaction) == 32, "Linux x86-64 sigaction size");
-
-struct linux64_sigsys_info {
-    i32 signal, error, code;
-    u32 padding;
-    u64 call_address;
-    i32 syscall;
-    u32 arch;
-    u8 reserved[96];
-};
 
 struct linux64_sigcontext {
     u64 r8, r9, r10, r11, r12, r13, r14, r15;
@@ -56,13 +47,16 @@ struct linux64_ucontext {
 struct linux64_rt_sigframe {
     u64 restorer;
     struct linux64_ucontext context;
-    struct linux64_sigsys_info info;
+    struct linux64_siginfo info;
 };
 
-_Static_assert(sizeof(struct linux64_sigsys_info) == 128 &&
-               __builtin_offsetof(struct linux64_sigsys_info, call_address) == 16 &&
-               __builtin_offsetof(struct linux64_sigsys_info, syscall) == 24 &&
-               __builtin_offsetof(struct linux64_sigsys_info, arch) == 28, "Linux x86-64 SIGSYS siginfo");
+_Static_assert(sizeof(struct linux64_siginfo) == 128 &&
+               __builtin_offsetof(struct linux64_siginfo, syscall.address) == 16 &&
+               __builtin_offsetof(struct linux64_siginfo, syscall.number) == 24 &&
+               __builtin_offsetof(struct linux64_siginfo, syscall.arch) == 28 &&
+               __builtin_offsetof(struct linux64_siginfo, child.pid) == 16 &&
+               __builtin_offsetof(struct linux64_siginfo, child.uid) == 20 &&
+               __builtin_offsetof(struct linux64_siginfo, child.status) == 24, "Linux x86-64 siginfo");
 _Static_assert(sizeof(struct linux64_sigcontext) == 256 &&
                __builtin_offsetof(struct linux64_sigcontext, rax) == 104 &&
                __builtin_offsetof(struct linux64_sigcontext, rip) == 128, "Linux x86-64 sigcontext");
@@ -76,12 +70,14 @@ static bool user_register_address(u64 address) {
     return address >= 0x400000ul && address < X64_USER_TOP;
 }
 
-bool linux64_deliver_seccomp_sigsys(struct linux64_frame *frame, u16 trap, u32 arch, uptr *user_frame) {
+bool linux64_build_signal_frame(struct linux64_frame *frame, const struct linux64_siginfo *info,
+                                u64 return_mask, uptr *user_frame) {
     struct linux64_task *task = linux64_current;
-    struct linux64_sigaction *slot = &task->process->actions[SIGSYS - 1];
+    struct linux64_sigaction *slot = &task->process->actions[info->signal - 1];
     const struct linux64_sigaction action = *slot;
-    const u64 sigsys_bit = 1ull << (SIGSYS - 1);
-    if ((task->signal_mask & sigsys_bit) || !(action.flags & SA_SIGINFO) || !(action.flags & SA_RESTORER) ||
+    const u64 signal_bit = 1ull << (info->signal - 1);
+    if ((task->signal_mask & signal_bit) || (info->signal == SIGSYS && !(action.flags & SA_SIGINFO)) ||
+        !(action.flags & SA_RESTORER) ||
         !user_register_address(action.handler) || !user_register_address(action.restorer) ||
         !user_register_address(frame->rsp) || frame->rsp < USER_RED_ZONE + sizeof(struct linux64_rt_sigframe) + 16)
         return false;
@@ -99,21 +95,22 @@ bool linux64_deliver_seccomp_sigsys(struct linux64_frame *frame, u16 trap, u32 a
                 .rdi = frame->rdi, .rsi = frame->rsi, .rbp = frame->rbp, .rbx = frame->rbx,
                 .rdx = frame->rdx, .rax = frame->rax, .rcx = frame->rcx, .rsp = frame->rsp,
                 .rip = frame->rip, .rflags = frame->rflags, .cs = USER_CS, .ss = USER_SS,
-                .old_mask = task->signal_mask,
+                .old_mask = return_mask,
             },
-            .signal_mask = task->signal_mask,
+            .signal_mask = return_mask,
         },
-        .info = {.signal = SIGSYS, .error = trap, .code = SYS_SECCOMP, .call_address = frame->rip,
-                 .syscall = (i32)frame->rax, .arch = arch},
+        .info = {.signal = info->signal, .error = info->error, .code = info->code, .storage = {0}},
     };
+    if (info->signal == SIGSYS) user.info.syscall = info->syscall;
+    else user.info.child = info->child;
     if (paging64_copy_to_user(address, &user, sizeof(user)) != sizeof(user)) return false;
 
     task->signal_mask |= action.mask;
-    if (!(action.flags & SA_NODEFER)) task->signal_mask |= sigsys_bit;
+    if (!(action.flags & SA_NODEFER)) task->signal_mask |= signal_bit;
     if (action.flags & SA_RESETHAND) *slot = (struct linux64_sigaction){0};
     frame->rsp = address;
     frame->rip = action.handler;
-    frame->rdi = SIGSYS;
+    frame->rdi = (u32)info->signal;
     frame->rsi = address + __builtin_offsetof(struct linux64_rt_sigframe, info);
     frame->rdx = address + __builtin_offsetof(struct linux64_rt_sigframe, context);
     frame->rax = 0;
@@ -164,6 +161,8 @@ long linux64_rt_sigaction(i32 signal, uptr action, uptr previous, uptr sigset_si
         input.flags &= SA_USER_FLAGS;
         input.mask &= ~UNBLOCKABLE_SIGNALS;
         *slot = input;
+        if (signal == LINUX64_SIGCHLD && input.handler <= 1)
+            linux64_current->process->child_signal = (struct linux64_child_signal){0};
     }
     /* Ошибка при копировании прежнего действия не отменяет установку нового. */
     if (previous && paging64_copy_to_user(previous, &old, sizeof(old)) != sizeof(old))
