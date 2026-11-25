@@ -1586,6 +1586,31 @@ uefi-loader:
 uefi-x64-smoke:
 	python3 tests/uefi_x64_smoke.py
 
+RTL8125_EFI_BUILD := $(BUILD)/uefi-rtl8125
+RTL8125_EFI_APP := $(RTL8125_EFI_BUILD)/RTL8125.EFI
+RTL8125_EFI_CFLAGS := -m64 -Os -ffreestanding -fno-builtin -fpic -fshort-wchar -mno-red-zone \
+                    -fno-stack-protector -fno-strict-aliasing -DGNU_EFI_USE_MS_ABI -Wall -Wextra \
+                    -I/usr/include/efi -I/usr/include/efi/x86_64
+
+$(RTL8125_EFI_BUILD):
+	mkdir -p $@
+$(RTL8125_EFI_BUILD)/%.o: tools/%.c tools/rtl8125_probe.h | $(RTL8125_EFI_BUILD)
+	$(CC) $(RTL8125_EFI_CFLAGS) -c $< -o $@
+$(RTL8125_EFI_BUILD)/probe.so: $(RTL8125_EFI_BUILD)/uefi_rtl8125_probe.o $(RTL8125_EFI_BUILD)/rtl8125_probe.o
+	$(LD) -nostdlib -znocombreloc -T /usr/lib/elf_x86_64_efi.lds -shared -Bsymbolic \
+		/usr/lib/crt0-efi-x86_64.o $^ -L/usr/lib -lefi -lgnuefi -o $@
+$(RTL8125_EFI_APP): $(RTL8125_EFI_BUILD)/probe.so
+	$(OBJCOPY) -j .text -j .sdata -j .data -j .rodata -j .dynamic -j .dynsym \
+		-j .rel -j .rela -j .reloc -O pei-x86-64 --subsystem=10 $< $@
+$(RTL8125_EFI_BUILD)/probe-test: tests/rtl8125_probe_test.c tools/rtl8125_probe.c tools/rtl8125_probe.h | $(RTL8125_EFI_BUILD)
+	$(HOSTCC) -O2 -Wall -Wextra -Werror $(filter %.c,$^) -o $@
+
+.PHONY: uefi-rtl8125-probe uefi-rtl8125-probe-smoke
+uefi-rtl8125-probe: $(RTL8125_EFI_APP)
+uefi-rtl8125-probe-smoke: $(RTL8125_EFI_APP) $(RTL8125_EFI_BUILD)/probe-test
+	$(RTL8125_EFI_BUILD)/probe-test
+	python3 tests/uefi_rtl8125_probe_smoke.py $(RTL8125_EFI_APP)
+
 X64BUILD := $(BUILD)/x86_64
 X64_HEADERS := kernel/x86_64/paging.h kernel/x86_64/pmm.h kernel/x86_64/segments.h kernel/x86_64/framebuffer.h kernel/bootinfo.h kernel/types.h
 X64_CORE := $(X64BUILD)/entry.o $(X64BUILD)/paging.o $(X64BUILD)/pmm.o $(X64BUILD)/segments.o $(X64BUILD)/framebuffer.o
