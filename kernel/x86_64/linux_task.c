@@ -581,6 +581,7 @@ static void stop_task(struct linux64_task *task) {
     linux64_eventfd_wait_finish(task);
     linux64_epoll_wait_finish(task);
     linux64_flock_wait_finish(task);
+    linux64_keyboard_wait_finish(task);
     release_xstate(task);
     task->state = TASK_DEAD;
     --task->process->threads;
@@ -699,7 +700,11 @@ static struct linux64_task *pick_task(const struct linux64_task *current) {
                 return candidate;
             if (candidate->state == TASK_POLL_WAIT) {
                 if (linux64_poll_ready(candidate)) return candidate;
-                if (candidate->poll.deadline) timed = true;
+                if (candidate->poll.deadline || candidate->poll.keyboard) timed = true;
+            }
+            if (candidate->state == TASK_KEYBOARD_WAIT) {
+                if (linux64_keyboard_wait_ready(&candidate->keyboard_wait)) return candidate;
+                timed = true;
             }
             if (candidate->state == TASK_FUTEX_WAIT && candidate->futex.timed) {
                 if (futex_expired(&candidate->futex)) return candidate;
@@ -707,7 +712,8 @@ static struct linux64_task *pick_task(const struct linux64_task *current) {
             }
             if (candidate->state == TASK_EPOLL_WAIT) {
                 if (linux64_epoll_wait_ready(&candidate->epoll_wait)) return candidate;
-                if (candidate->epoll_wait.deadline) timed = true;
+                if (candidate->epoll_wait.deadline || linux64_epoll_waits_for_keyboard(&candidate->epoll_wait))
+                    timed = true;
             }
         }
         /* Таймерных прерываний в этом режиме пока нет. */
@@ -754,6 +760,11 @@ static void resume_wait(struct linux64_task *task) {
         task->frame.rax = (u64)linux64_flock_resume();
         if (task->state == TASK_RUNNABLE) linux64_flock_wait_finish(task);
     }
+    if (task->state == TASK_KEYBOARD_WAIT) {
+        task->state = TASK_RUNNABLE;
+        task->frame.rax = (u64)linux64_keyboard_wait_resume();
+        if (task->state == TASK_RUNNABLE) linux64_keyboard_wait_finish(task);
+    }
     if (task->finish_wait) {
         task->finish_wait = false;
         task->frame.rax = (u64)wait_child(task->wait);
@@ -768,7 +779,7 @@ static void schedule(struct linux64_frame *frame) {
     task_clock_running = false;
     struct linux64_task *next = pick_task(old);
     if (next == old && old->state != TASK_SOCKET_WAIT && old->state != TASK_EVENTFD_WAIT &&
-        old->state != TASK_EPOLL_WAIT && old->state != TASK_FLOCK_WAIT) {
+        old->state != TASK_EPOLL_WAIT && old->state != TASK_FLOCK_WAIT && old->state != TASK_KEYBOARD_WAIT) {
         if (old->state == TASK_FUTEX_WAIT) resume_futex_timeout(old, frame);
         if (old->state == TASK_POLL_WAIT) {
             frame->rax = (u64)linux64_poll_resume(old);
