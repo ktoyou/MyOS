@@ -132,7 +132,7 @@ static void restore_cursor(struct compositor *server) {
     server->cursor_rows = 0;
 }
 
-static bool redraw(struct compositor *server);
+static bool present_output(struct compositor *server);
 static bool shown(const struct surface *surface);
 static void orphan_subsurface(struct surface *surface);
 
@@ -172,12 +172,16 @@ static void hide_surface(struct surface *surface) {
     detach_pointer_tree(surface);
     if (server->visible == surface) {
         server->visible = NULL;
-        wayland_seat_keyboard_focus(server->seat, NULL);
+        struct surface *candidate;
+        wl_list_for_each(candidate, &server->shell_surfaces, shell_link) {
+            if (candidate->toplevel && candidate->mapped) {
+                server->visible = candidate;
+                break;
+            }
+        }
+        wayland_seat_keyboard_focus(server->seat, server->visible ? server->visible->resource : NULL);
     }
-    if (repaint) {
-        if (!redraw(server)) perror("Redraw framebuffer");
-        wayland_seat_pointer_update(server->seat);
-    }
+    if (repaint && !present_output(server)) perror("Redraw framebuffer");
 }
 
 static void destroy_request(struct wl_client *client, struct wl_resource *resource) {
@@ -799,11 +803,8 @@ static uint32_t frame_time(void) {
     return (uint32_t)time.tv_sec * 1000 + (uint32_t)(time.tv_nsec / 1000000);
 }
 
-static bool present_changes(struct wl_client *client, struct compositor *server) {
-    if (!redraw(server)) {
-        wl_client_post_implementation_error(client, "Could not redraw shared memory buffers");
-        return false;
-    }
+static bool present_output(struct compositor *server) {
+    if (!redraw(server)) return false;
     wayland_seat_pointer_update(server->seat);
     uint32_t ms = frame_time();
     if (server->visible) complete_child_frames(server->visible, ms);
@@ -811,6 +812,12 @@ static bool present_changes(struct wl_client *client, struct compositor *server)
     wl_list_for_each(popup, &server->popups, popup_link)
         if (shown(popup)) complete_child_frames(popup, ms);
     return true;
+}
+
+static bool present_changes(struct wl_client *client, struct compositor *server) {
+    if (present_output(server)) return true;
+    wl_client_post_implementation_error(client, "Could not redraw shared memory buffers");
+    return false;
 }
 
 static void commit_subsurface(struct wl_client *client, struct surface *surface,
@@ -925,6 +932,9 @@ static void surface_commit(struct wl_client *client, struct wl_resource *resourc
                 return;
             }
             if (surface->toplevel && (!surface->mapped || !server->visible)) {
+                /* Среди отображённых окон первыми идут недавно показанные. */
+                wl_list_remove(&surface->shell_link);
+                wl_list_insert(&server->shell_surfaces, &surface->shell_link);
                 server->visible = surface;
                 wayland_seat_keyboard_focus(server->seat, resource);
             }
@@ -963,10 +973,11 @@ static void surface_commit(struct wl_client *client, struct wl_resource *resourc
         recomposite |= shown(surface);
     }
     if (apply_child_commits(surface, false)) recomposite |= shown(surface);
+    move_frames(&surface->frames, &surface->presented_frames);
     if (recomposite && !present_changes(client, server)) return;
     if (repaint && !recomposite) wayland_seat_pointer_update(server->seat);
     if (shown(surface) || surface->role == SURFACE_CURSOR)
-        complete_frames(&surface->frames, frame_time());
+        complete_frames(&surface->presented_frames, frame_time());
 }
 
 static const struct wl_surface_interface surface_requests = {
