@@ -4,6 +4,8 @@
 #ifdef X64_TEST_LINUX
 #include "linux_fb.h"
 #include "linux.h"
+#include "ethernet.h"
+#include "e1000.h"
 #endif
 
 #define COM1              0x3f8
@@ -437,7 +439,11 @@ __attribute__((noreturn)) void kernel64_main(const struct boot_info *boot, u32 e
     halt();
 #endif
 #ifdef X64_TEST_LINUX
-    if (linux64_net_init()) serial_puts("MyOS x86-64: e1000 Ethernet ready\n");
+    if (ethernet64_attach(&e1000_driver) && linux64_net_init()) {
+        serial_puts("MyOS x86-64: ");
+        serial_puts(ethernet64_name());
+        serial_puts(" Ethernet ready\n");
+    }
     linux64_fb_init(&fb.surface);
     linux_test_boot(boot);
     serial_puts("Linux x86-64 ELF rejected\n");

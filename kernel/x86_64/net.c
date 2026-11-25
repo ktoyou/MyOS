@@ -1,5 +1,5 @@
 #include "net.h"
-#include "e1000.h"
+#include "ethernet.h"
 #include "net_bytes.h"
 
 #define NS_PER_SECOND 1000000000ull
@@ -89,7 +89,7 @@ u32 net64_address(void) {
 
 bool net64_enable_dhcp(net64_receiver receive) {
     u8 mac[MAC_BYTES];
-    e1000_mac(mac);
+    ethernet64_mac(mac);
     if (!unicast_mac(mac)) return false;
     copy_bytes(local_mac, mac, MAC_BYTES);
     dhcp_receiver = receive;
@@ -103,7 +103,7 @@ bool net64_configure(struct net64_config settings) {
     if (settings.gateway && (settings.gateway == settings.address ||
         !same_subnet(&settings, settings.gateway) || !subnet_host(settings.gateway, settings.mask))) return false;
     u8 mac[MAC_BYTES];
-    e1000_mac(mac);
+    ethernet64_mac(mac);
     if (!unicast_mac(mac)) return false;
     config = settings;
     copy_bytes(local_mac, mac, MAC_BYTES);
@@ -125,7 +125,7 @@ static bool ethernet_send(const u8 *mac, u16 type, u32 size) {
     copy_bytes(tx_frame, mac, MAC_BYTES);
     copy_bytes(tx_frame + MAC_BYTES, local_mac, MAC_BYTES);
     net_write16(tx_frame + 2 * MAC_BYTES, type);
-    return e1000_send(tx_frame, ETH_HEADER + size);
+    return ethernet64_send(tx_frame, ETH_HEADER + size);
 }
 
 static bool arp_send(u16 opcode, const u8 *mac, u32 address) {
@@ -238,7 +238,7 @@ enum net64_tx net64_send(u64 now, u32 dst, u8 protocol, const void *data, u32 le
     if (!protocol || (length && !data) || length > IP_MTU - IP_HEADER) return NET64_INVALID;
     u32 hop = next_hop(dst);
     if (!hop) return NET64_NO_ROUTE;
-    if (!e1000_link()) {
+    if (!ethernet64_link()) {
         clear_neighbors();
         return NET64_LINK_DOWN;
     }
@@ -298,12 +298,12 @@ static void ipv4_receive(const u8 *frame, u32 length, net64_receiver receive, vo
 
 void net64_poll(u64 now, net64_receiver receive, void *context) {
     if (!config.address && !dhcp_receiver) return;
-    if (!e1000_link()) {
+    if (!ethernet64_link()) {
         clear_neighbors();
         return;
     }
     for (unsigned i = 0; i < RX_BUDGET; ++i) {
-        u32 length = e1000_receive(rx_frame, sizeof(rx_frame));
+        u32 length = ethernet64_receive(rx_frame, sizeof(rx_frame));
         if (!length) break;
         if (length < ETH_HEADER || !unicast_mac(rx_frame + MAC_BYTES)) continue;
         u16 type = net_read16(rx_frame + 2 * MAC_BYTES);

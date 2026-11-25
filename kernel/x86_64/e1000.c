@@ -212,3 +212,12 @@ u32 e1000_receive(void *frame, u32 capacity) {
     }
     return 0;
 }
+
+const struct ethernet64_driver e1000_driver = {
+    .name = "e1000",
+    .init = e1000_init,
+    .link = e1000_link,
+    .mac = e1000_mac,
+    .send = e1000_send,
+    .receive = e1000_receive,
+};

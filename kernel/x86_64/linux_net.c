@@ -1,6 +1,6 @@
 #include "linux.h"
 #include "dhcp.h"
-#include "e1000.h"
+#include "ethernet.h"
 #include "net_bytes.h"
 #include "tcp.h"
 
@@ -11,7 +11,7 @@ static u64 next_poll;
 static struct dhcp64_lease reported;
 
 bool linux64_net_init(void) {
-    if (!e1000_init()) return false;
+    if (!ethernet64_name()) return false;
     u32 seed;
     if (linux64_random_bytes(&seed, sizeof(seed)) == sizeof(seed))
         started = dhcp64_start(seed);
