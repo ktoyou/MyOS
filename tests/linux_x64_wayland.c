@@ -419,9 +419,9 @@ static void configured_popup_surface(void *data, struct xdg_surface *surface, ui
 static const struct xdg_surface_listener popup_surface_events = { .configure = configured_popup_surface };
 
 static void frame_done(void *data, struct wl_callback *callback, uint32_t time) {
-    (void)data;
     (void)time;
-    presented = true;
+    bool *done = data ? data : &presented;
+    *done = true;
     wl_callback_destroy(callback);
 }
 
@@ -814,6 +814,14 @@ static void read_clipboard(struct wl_display *owner, struct wl_display *reader,
 }
 
 static void check_clipboard(struct wl_display *owner, struct wl_surface *owner_surface, struct wl_buffer *owner_buffer) {
+    static const uint32_t front_color = 0x2365a7;
+    const uint32_t front_colors[2][2] = {{front_color, front_color}, {front_color, front_color}};
+    int fb = open("/dev/fb0", O_RDONLY | O_CLOEXEC);
+    struct fb_fix_screeninfo layout;
+    struct fb_var_screeninfo mode;
+    if (fb < 0 || ioctl(fb, FBIOGET_FSCREENINFO, &layout) || ioctl(fb, FBIOGET_VSCREENINFO, &mode))
+        fail("framebuffer for window restoration");
+
     struct wl_display *display = wl_display_connect(socket_path);
     if (!display) fail("connect clipboard receiver");
     struct clipboard_receiver receiver = {0};
@@ -835,14 +843,20 @@ static void check_clipboard(struct wl_display *owner, struct wl_surface *owner_s
     if (wl_display_roundtrip(display) < 0 || !receiver.configured || receiver.focused || receiver.selection.current)
         fail("clipboard exposed before receiver focus");
 
-    struct wl_buffer *frame = create_buffer(receiver.shm, width, height, window_colors);
+    struct wl_buffer *frame = create_buffer(receiver.shm, width, height, front_colors);
     commit_frame(display, receiver.surface, frame, width, height);
     if (wl_display_roundtrip(owner) < 0 || focused || !receiver.focused || !receiver.selection.current)
         fail("clipboard offer after keyboard focus change");
+    presented = false;
     wl_surface_attach(owner_surface, owner_buffer, 0, 0);
     wl_surface_damage_buffer(owner_surface, 0, 0, width, height);
+    wl_callback_add_listener(wl_surface_frame(owner_surface), &frame_events, NULL);
     wl_surface_commit(owner_surface);
-    if (wl_display_roundtrip(owner) < 0 || wl_display_roundtrip(display) < 0 || focused || !receiver.focused)
+    bool uncommitted_frame_done = false;
+    wl_callback_add_listener(wl_surface_frame(owner_surface), &frame_events, &uncommitted_frame_done);
+    if (wl_display_roundtrip(owner) < 0 || wl_display_roundtrip(display) < 0 || presented ||
+        uncommitted_frame_done || focused || !receiver.focused ||
+        framebuffer_color(fb, &layout, &mode, 0, 0) != front_color)
         fail("clipboard keyboard focus after background repaint");
     if (!owner_selection.current) fail("missing stale clipboard offer");
     read_clipboard(owner, owner, owner_selection.current, false);
@@ -859,13 +873,37 @@ static void check_clipboard(struct wl_display *owner, struct wl_surface *owner_s
     if (wl_display_roundtrip(owner) < 0 || wl_display_roundtrip(display) < 0 || receiver.selection.current ||
         receiver.selection.updates == updates) fail("clear clipboard after source destruction");
 
-    wl_keyboard_release(reader_keyboard);
+    /* Нижний клиент получает свой кадр и фокус без нового commit. */
+    wl_surface_attach(receiver.surface, NULL, 0, 0);
+    wl_surface_commit(receiver.surface);
+    if (wl_display_roundtrip(display) < 0 || receiver.focused || wl_display_roundtrip(owner) < 0 || !focused || !presented ||
+        uncommitted_frame_done || framebuffer_color(fb, &layout, &mode, 0, 0) != window_colors[0][0])
+        fail("restore previous window after detach");
+
+    receiver.configured = false;
+    wl_surface_commit(receiver.surface);
+    if (wl_display_roundtrip(display) < 0 || !receiver.configured) fail("configure remapped foreground window");
+    commit_frame(display, receiver.surface, frame, width, height);
+    if (wl_display_roundtrip(owner) < 0 || focused || !receiver.focused ||
+        framebuffer_color(fb, &layout, &mode, 0, 0) != front_color)
+        fail("focus remapped foreground window");
+
     xdg_toplevel_destroy(toplevel);
+    if (wl_display_roundtrip(display) < 0 || receiver.focused || wl_display_roundtrip(owner) < 0 || !focused ||
+        uncommitted_frame_done || framebuffer_color(fb, &layout, &mode, 0, 0) != window_colors[0][0])
+        fail("restore previous window after close");
+    wl_surface_commit(owner_surface);
+    if (wl_display_roundtrip(owner) < 0 || !uncommitted_frame_done)
+        fail("frame callback after first owner commit");
+    wl_keyboard_release(reader_keyboard);
     xdg_surface_destroy(role);
     wl_surface_destroy(receiver.surface);
     wl_buffer_destroy(frame);
     if (wl_display_roundtrip(display) < 0) fail("close clipboard receiver");
     wl_display_disconnect(display);
+    if (close(fb)) fail("close framebuffer after window restoration");
+    static const char restored[] = "Wayland previous window and focus restored\n";
+    if (write(1, restored, sizeof(restored) - 1) != sizeof(restored) - 1) fail("window restoration marker");
 }
 
 int main(void) {
@@ -963,14 +1001,6 @@ int main(void) {
     static const char clipboard_marker[] = "Wayland clipboard received and cleared\n";
     if (write(1, clipboard_marker, sizeof(clipboard_marker) - 1) != sizeof(clipboard_marker) - 1)
         fail("clipboard completion marker");
-    wl_surface_attach(surface, NULL, 0, 0);
-    wl_surface_commit(surface);
-    if (wl_display_roundtrip(display) < 0) fail("detach clipboard owner");
-    configured = false;
-    wl_surface_commit(surface);
-    if (wl_display_roundtrip(display) < 0 || !configured) fail("configure clipboard owner again");
-    commit_frame(display, surface, buffer, width, height);
-
     /* Выход исходного процесса останавливает гостя с последним кадром для QMP. */
     static const char marker[] = "Wayland shared memory frame presented\n";
     if (write(1, marker, sizeof(marker) - 1) != sizeof(marker) - 1) fail("serial marker");

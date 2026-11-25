@@ -165,6 +165,7 @@ def main():
         serial = boot_x64(directory, name, payload, kernel_end,
                           ['Wayland popup configured, presented and restored',
                            'Wayland subsurface synchronized, presented and restored',
+                           'Wayland previous window and focus restored',
                            'Wayland clipboard received and cleared',
                            'Wayland shared memory frame presented', 'Linux x86-64 exit status=0x00'],
                           live_root_header=root, screenshot=shot, extra=qemu, interact=input_events)
