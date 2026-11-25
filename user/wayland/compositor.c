@@ -1727,6 +1727,7 @@ int main(int argc, char **argv) {
     struct wl_event_loop *loop = wl_display_get_event_loop(server.display);
     int status = 0;
     while (!stopping) {
+        wayland_seat_probe_input(server.seat);
         wl_display_flush_clients(server.display);
         if (wl_event_loop_dispatch(loop, 250) < 0 && errno != EINTR) {
             perror("Wayland event loop");

@@ -1959,6 +1959,7 @@ $(WAYLAND_BUILD)/wayland-client: tests/linux_x64_wayland.c $(WAYLAND_BUILD)/xdg-
 .PHONY: kernel-x64-wayland-smoke
 kernel-x64-wayland-smoke: $(X64BUILD)/kernel-linux.bin $(WAYLAND_BUILD)/wayland-compositor $(WAYLAND_BUILD)/wayland-client $(WAYLAND_BUILD)/keyboard.xkb
 	python3 tests/kernel_x64_wayland_smoke.py $(WAYLAND_BUILD)
+	python3 tests/kernel_x64_wayland_smoke.py $(WAYLAND_BUILD) --late-usb
 
 CHROME_BIN ?= /opt/google/chrome/chrome
 CHROME_URL ?= https://www.kernel.org/
