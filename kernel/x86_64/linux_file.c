@@ -1,6 +1,7 @@
 #include "linux_task.h"
 #include "linux_fb.h"
 #include "linux_input.h"
+#include "linux_myfs.h"
 #include "paging.h"
 
 #define NS_PER_SECOND 1000000000ul
@@ -8,7 +9,7 @@
 enum {
     EPERM = 1, ENOENT = 2, EIO = 5, EBADF = 9, EAGAIN = 11, ENOMEM = 12, EACCES = 13, EFAULT = 14,
     EBUSY = 16, EEXIST = 17, ENOTDIR = 20, EISDIR = 21, EINVAL = 22, ENFILE = 23, EMFILE = 24,
-    ENOTTY = 25, EFBIG = 27, EROFS = 30, ENOLCK = 37, EOVERFLOW = 75,
+    ENOTTY = 25, EFBIG = 27, EROFS = 30, ERANGE = 34, ENOLCK = 37, EOVERFLOW = 75,
     ENODEV = 19, ENXIO = 6, ESPIPE = 29, ENAMETOOLONG = 36, ENOSYS = 38, ELOOP = 40, ENOTSOCK = 88,
     EOPNOTSUPP = 95, EADDRINUSE = 98, ECONNREFUSED = 111, EINPROGRESS = 115, AF_UNIX = 1, MSG_DONTWAIT = 0x40,
     SOCK_TYPE_MASK = 0xf,
@@ -412,6 +413,7 @@ static void destroy_file(struct file_handle *file) {
     if (file->pipe) linux64_pipe_close(file->pipe, (file->flags & O_ACCMODE) == O_WRONLY);
     linux64_userns_release(file->proc_ns);
     linux64_pidns_release(file->proc_pid_ns);
+    if (file->file.myfs_ino) linux64_myfs_release(file->file.myfs_ino);
     if (file->directory_path) pmm64_free(file->directory_path);
     struct memfd *memfd = file->memfd;
     if (memfd) {
@@ -732,6 +734,8 @@ long linux64_get_file(i32 fd, struct linux64_fd_view *view) {
     if (!open_file(fd)) return -EBADF;
     if (kind_of(file_at(fd)) != FILE_REGULAR) return -ENODEV;
     if ((file_at(fd)->flags & O_ACCMODE) == O_WRONLY) return -EACCES;
+    /* Для mmap нужен постоянный источник страниц, которого у дискового файла пока нет. */
+    if (file_at(fd)->file.myfs_ino) return -ENODEV;
     const struct memfd *memfd = file_at(fd)->memfd;
     *view = (struct linux64_fd_view){.file = file_at(fd)->file};
     if (memfd) {
@@ -966,6 +970,10 @@ static long new_handle(const struct linux64_file *file, struct memfd *memfd, u32
     for (unsigned i = 0; i < OPEN_FILE_COUNT; ++i) {
         struct file_handle *description = &open_files[i];
         if (description->references) continue;
+        if (file && file->myfs_ino) {
+            long result = linux64_myfs_retain(file->myfs_ino);
+            if (result) return result;
+        }
         *description = (struct file_handle){.memfd = memfd, .flags = flags & ~O_CLOEXEC,
                                             .references = 1};
         if (file) {
@@ -1355,8 +1363,9 @@ static long linux_ftruncate(i32 fd, uptr size) {
     if ((long)size < 0) return -EINVAL;
     if (!open_file(fd)) return -EBADF;
     const struct file_handle *handle = file_at(fd);
-    if (!handle->memfd || !(handle->flags & O_ACCMODE)) return -EINVAL;
-    return resize_backing(handle->memfd, size);
+    if (!(handle->flags & O_ACCMODE)) return -EINVAL;
+    if (handle->file.myfs_ino) return linux64_myfs_truncate(handle->file.myfs_ino, size);
+    return handle->memfd ? resize_backing(handle->memfd, size) : -EINVAL;
 }
 
 static long record_range(const struct file_handle *file, const struct linux_flock_record *request,
@@ -1598,6 +1607,36 @@ static long lookup(i32 dirfd, uptr address, u32 flags, struct linux64_file *file
     return 0;
 }
 
+static long myfs_transfer(u32 inode, bool write, uptr address, uptr count, uptr offset) {
+    if (!count) return 0;
+    if (count > 0x7ffff000u) count = 0x7ffff000u;
+    if (address >= X64_USER_TOP || count > X64_USER_TOP - address) return -EFAULT;
+    uptr frame = pmm64_alloc();
+    if (!frame) return -ENOMEM;
+    u8 *bytes = pmm64_pointer(frame);
+    uptr done = 0;
+    long result = 0;
+    while (done < count) {
+        uptr chunk = count - done;
+        if (chunk > PMM_PAGE_SIZE) chunk = PMM_PAGE_SIZE;
+        if (write) {
+            uptr available = paging64_copy_from_user(bytes, address + done, chunk);
+            result = available ? linux64_myfs_write(inode, offset + done, bytes, available) : -EFAULT;
+        } else {
+            result = linux64_myfs_read(inode, offset + done, bytes, chunk);
+            if (result > 0) {
+                uptr copied = paging64_copy_to_user(address + done, bytes, (uptr)result);
+                result = copied ? (long)copied : -EFAULT;
+            }
+        }
+        if (result <= 0) break;
+        done += (uptr)result;
+        if ((uptr)result < chunk) break;
+    }
+    pmm64_free(frame);
+    return done ? (long)done : result;
+}
+
 static long linux_readlink(i32 dirfd, uptr path_address, uptr destination, i32 size) {
     if (size <= 0) return -EINVAL;
     char path[LINUX64_PATH_LIMIT];
@@ -1624,6 +1663,10 @@ static long linux_readlink(i32 dirfd, uptr path_address, uptr destination, i32 s
     } else if ((file.mode & LINUX64_S_IFMT) != LINUX64_S_IFLNK) return -EINVAL;
     if (!length) return -ENOENT;
     if (length > (uptr)size) length = (uptr)size;
+    if (file.myfs_ino) {
+        result = myfs_transfer(file.myfs_ino, false, destination, length, 0);
+        return result < 0 || (uptr)result == length ? result : -EFAULT;
+    }
     return paging64_copy_to_user(destination, target, length) == length ? (long)length : -EFAULT;
 }
 
@@ -1644,7 +1687,7 @@ static long open_named(const struct linux64_file *file, u32 flags) {
     if (needed & ~linux64_file_permissions(file)) return -EACCES;
     long fd = new_handle(file, file->backing, regular_status_flags(flags));
     if (fd >= 0 && (flags & O_TRUNC)) {
-        long result = resize_backing(file->backing, 0);
+        long result = file->myfs_ino ? linux64_myfs_truncate(file->myfs_ino, 0) : resize_backing(file->backing, 0);
         if (result) {
             close_file((i32)fd);
             return result;
@@ -1676,10 +1719,17 @@ static long linux_open(i32 dirfd, uptr address, u32 flags, u32 mode) {
             close_file((i32)fd);
             return result;
         }
+        if (file.myfs_ino) {
+            result = linux64_myfs_retain(file.myfs_ino);
+            if (result) {
+                close_file((i32)fd);
+                return result;
+            }
+        }
         struct file_handle *handle = file_at((i32)fd);
         handle->file = file;
         handle->memfd = file.backing;
-        ++file.backing->references;
+        if (file.backing) ++file.backing->references;
         return fd;
     }
     if (result) return result;
@@ -1691,8 +1741,9 @@ static long linux_open(i32 dirfd, uptr address, u32 flags, u32 mode) {
         if (file.proc_fd_owner != linux64_current->process->pid) return -EACCES;
         const struct file_handle *target = file_at(file.proc_fd_number);
         if ((flags & O_DIRECTORY) && !file.proc_fd_directory) return -ENOTDIR;
+        if (target->file.backing || (target->file.myfs_ino && (target->file.mode & LINUX64_S_IFMT) == LINUX64_S_IFREG))
+            return open_named(&target->file, flags);
         if (!target->memfd) return -ENOSYS;
-        if (target->file.backing) return open_named(&target->file, flags);
         if (flags & ~(O_CLOEXEC | O_LARGEFILE | O_NONBLOCK)) return -EINVAL;
         return new_handle(NULL, target->memfd, flags | O_LARGEFILE);
     }
@@ -1704,7 +1755,8 @@ static long linux_open(i32 dirfd, uptr address, u32 flags, u32 mode) {
         if (flags & O_DIRECTORY) return -ENOTDIR;
         return exclusive ? -EEXIST : -ENXIO;
     }
-    if (file.backing) return exclusive ? -EEXIST : open_named(&file, flags);
+    if (file.backing || (file.myfs_ino && type == LINUX64_S_IFREG))
+        return exclusive ? -EEXIST : open_named(&file, flags);
     enum file_kind device = device_node(absolute, &file);
     if (device) {
         if (flags & O_DIRECTORY) return -ENOTDIR;
@@ -1820,13 +1872,59 @@ static long change_directory(uptr address, bool chroot) {
     if (chroot && !(linux64_current->caps.effective & LINUX64_CAP_SYS_CHROOT)) return -EPERM;
     uptr page = pmm64_alloc();
     if (!page) return -ENOMEM;
+    if (file.myfs_ino) {
+        result = linux64_myfs_retain(file.myfs_ino);
+        if (result) {
+            pmm64_free(page);
+            return result;
+        }
+    }
     char *name = pmm64_pointer(page);
     for (uptr i = 0; (name[i] = path[i]); ++i) {}
     struct linux64_fs *fs = linux64_current->process->fs;
     struct linux64_directory *anchor = chroot ? &fs->root : &fs->cwd;
-    if (anchor->page) pmm64_free(anchor->page);
+    const struct linux64_directory old = *anchor;
     *anchor = (struct linux64_directory){.path = name, .page = page, .file = file};
+    if (old.file.myfs_ino) linux64_myfs_release(old.file.myfs_ino);
+    if (old.page) pmm64_free(old.page);
     return 0;
+}
+
+static long linux_getcwd(uptr address, uptr size) {
+    if (!size) return -EINVAL;
+    const struct linux64_fs *fs = linux64_current->process->fs;
+    const char *root = fs->root.path, *cwd = fs->cwd.path;
+    char root_name[LINUX64_PATH_LIMIT];
+    if (fs->root.file.myfs_ino) {
+        long result = linux64_myfs_path(fs->root.file.myfs_ino, root_name);
+        if (result) return result;
+        root = root_name;
+    }
+    uptr frame = 0;
+    long result;
+    if (fs->cwd.file.myfs_ino) {
+        frame = pmm64_alloc();
+        if (!frame) return -ENOMEM;
+        char *name = pmm64_pointer(frame);
+        result = linux64_myfs_path(fs->cwd.file.myfs_ino, name);
+        if (result) goto done;
+        cwd = name;
+    }
+    const char *visible = root[0] == '/' && !root[1] ? cwd : path_tail(cwd, root);
+    if (!visible || (*visible && *visible != '/')) {
+        result = -ENOENT;
+        goto done;
+    }
+    if (!*visible) visible = "/";
+    uptr length = 1;
+    while (visible[length - 1]) ++length;
+    if (length > size) result = -ERANGE;
+    else if (address >= X64_USER_TOP || length > X64_USER_TOP - address ||
+             paging64_copy_to_user(address, visible, length) != length) result = -EFAULT;
+    else result = (long)length;
+done:
+    if (frame) pmm64_free(frame);
+    return result;
 }
 
 static long linux_mkdir(i32 dirfd, uptr address, u32 mode) {
@@ -1922,10 +2020,29 @@ static long framebuffer_io(struct file_handle *handle, bool write, uptr buffer, 
     return copied;
 }
 
+static long myfs_io(struct file_handle *handle, bool write, uptr buffer, uptr count,
+                    uptr offset, bool positioned) {
+    if (kind_of(handle) == FILE_DIRECTORY) return write ? -EBADF : -EISDIR;
+    u32 access = handle->flags & O_ACCMODE;
+    if (write ? !access : access == O_WRONLY) return -EBADF;
+    if (!positioned) offset = handle->offset;
+    if ((long)offset < 0) return -EINVAL;
+    if (write && count && (handle->flags & O_APPEND)) {
+        struct linux64_file file;
+        long result = linux64_myfs_stat(handle->file.myfs_ino, &file);
+        if (result) return result;
+        offset = file.size;
+    }
+    long result = myfs_transfer(handle->file.myfs_ino, write, buffer, count, offset);
+    if (!positioned && result > 0) handle->offset = offset + (uptr)result;
+    return result;
+}
+
 static long linux_read(i32 fd, uptr buffer, uptr count, uptr offset, bool positioned) {
     if (!open_file(fd)) return -EBADF;
     struct file_handle *handle = file_at(fd);
     if (handle->directory_path) return -EISDIR;
+    if (handle->file.myfs_ino) return myfs_io(handle, false, buffer, count, offset, positioned);
     if (handle->device == FILE_FRAMEBUFFER)
         return framebuffer_io(handle, false, buffer, count, offset, positioned);
     if (is_input(handle->device)) return positioned ? -ESPIPE : input_read(handle, buffer, count);
@@ -2028,9 +2145,19 @@ static long file_stat(const struct linux64_file *file, const struct memfd *memfd
         long result = proc_fd_table(file->proc_fd_owner, &owner);
         if (result) return result;
     }
+    struct linux64_file disk;
+    if (file->myfs_ino) {
+        long result = linux64_myfs_stat(file->myfs_ino, &disk);
+        if (result) return result;
+        file = &disk;
+    }
     u32 mode = 0100444, device = 1, links = !memfd;
     u64 rdev = 0;
-    if (kind == FILE_SOCKET) {
+    if (file->myfs_ino) {
+        mode = file->mode;
+        device = 11;
+        links = file->myfs_links;
+    } else if (kind == FILE_SOCKET) {
         mode = 0140777;
         device = 3;
     } else if (kind == FILE_PIPE) {
@@ -2080,15 +2207,17 @@ static long file_stat(const struct linux64_file *file, const struct memfd *memfd
     bool owned = kind == FILE_SOCKET || kind == FILE_PIPE || kind == FILE_PROC_MAP ||
                  kind == FILE_PROC_LINK || memfd;
     bool named = kind == FILE_DIRECTORY || kind == FILE_SYMLINK || kind == FILE_NAMED_SOCKET ||
-                 kind == FILE_FRAMEBUFFER || is_input(kind) || file->backing;
+                 kind == FILE_FRAMEBUFFER || is_input(kind) || file->backing || file->myfs_ino;
     uptr size = file->backing ? file->backing->size : file->size;
-    const struct linux_stat stat = {
+    struct linux_stat stat = {
         .dev = device, .ino = file->inode, .nlink = links, .mode = mode,
         .uid = linux64_visible_id(ns, false, named ? file->uid : owned ? LINUX64_UID : 0),
         .gid = linux64_visible_id(ns, true, named ? file->gid : owned ? LINUX64_GID : 0),
         .rdev = rdev, .size = size, .blksize = PMM_PAGE_SIZE,
-        .blocks = kind == FILE_SYMLINK ? 0 : (size + 511) / 512,
+        .blocks = file->myfs_ino ? file->myfs_blocks : kind == FILE_SYMLINK ? 0 : (size + 511) / 512,
     };
+    if (file->myfs_ino)
+        for (unsigned i = 0; i < 3; ++i) stat.times[i * 2] = file->myfs_times[i];
     return paging64_copy_to_user(stat_address, &stat, sizeof(stat)) == sizeof(stat) ? 0 : -EFAULT;
 }
 
@@ -2119,7 +2248,8 @@ static long linux_directory_getdents(struct file_handle *handle, uptr address, u
         entry = (__typeof__(entry)){0};
         uptr position = handle->offset;
         struct linux64_file file;
-        if (!linux64_vfs_next_entry(&dir, &position, entry.name, &file)) return (long)copied;
+        long result = linux64_vfs_next_entry(&dir, &position, entry.name, &file);
+        if (result <= 0) return copied ? (long)copied : result;
         uptr name_length = 0;
         while (entry.name[name_length]) ++name_length;
         entry.length = (u16)((__builtin_offsetof(__typeof__(entry), name) + name_length + 8) & ~7u);
@@ -2194,6 +2324,7 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
         return linux_read(fd, arg1, arg2, 0, false);
     case 1: /* write */
         if (!open_file(fd)) return -EBADF;
+        if (file_at(fd)->file.myfs_ino) return myfs_io(file_at(fd), true, arg1, arg2, 0, false);
         if (file_at(fd)->file.backing) return named_write(file_at(fd), arg1, arg2, 0, false);
         if (file_at(fd)->serial) return serial_write(arg1, arg2);
         if (file_at(fd)->device == FILE_FRAMEBUFFER)
@@ -2229,12 +2360,18 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
         return file_stat(&file, memfd, kind_of(file_at(fd)), arg1);
     case 8: /* lseek */
         if (!open_file(fd)) return -EBADF;
-        if (file_at(fd)->file.backing || file_at(fd)->file.dns_server) {
+        if (file_at(fd)->file.backing || file_at(fd)->file.dns_server ||
+            (file_at(fd)->file.myfs_ino && !file_at(fd)->directory_path)) {
             struct file_handle *handle = file_at(fd);
             long offset = (long)arg1;
             u32 whence = (u32)arg2;
             if (whence > 2) return -EINVAL;
             uptr size = handle->file.backing ? handle->file.backing->size : handle->file.size;
+            if (whence == 2 && handle->file.myfs_ino) {
+                result = linux64_myfs_stat(handle->file.myfs_ino, &file);
+                if (result) return result;
+                size = file.size;
+            }
             uptr base = whence == 2 ? size : whence == 1 ? handle->offset : 0;
             if (__builtin_add_overflow((long)base, offset, &offset) || offset < 0) return -EINVAL;
             handle->offset = (uptr)offset;
@@ -2271,6 +2408,7 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
     case 18: /* pwrite64 */
         if ((long)arg3 < 0) return -EINVAL;
         if (!open_file(fd)) return -EBADF;
+        if (file_at(fd)->file.myfs_ino) return myfs_io(file_at(fd), true, arg1, arg2, arg3, true);
         if (file_at(fd)->file.backing) return named_write(file_at(fd), arg1, arg2, arg3, true);
         if (file_at(fd)->device == FILE_FRAMEBUFFER)
             return framebuffer_io(file_at(fd), true, arg1, arg2, arg3, true);
@@ -2283,7 +2421,7 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
         result = lookup(AT_FDCWD, arg0, 0, &file, &memfd, &kind);
         if (result) return result;
         if (kind == FILE_NULL || kind == FILE_URANDOM) return (arg1 & 1u) ? -EACCES : 0;
-        if (file.backing) return (arg1 & ~linux64_file_permissions(&file)) ? -EACCES : 0;
+        if (file.backing || file.myfs_ino) return (arg1 & ~linux64_file_permissions(&file)) ? -EACCES : 0;
         if (kind == FILE_FRAMEBUFFER || is_input(kind))
             return (arg1 & ~linux64_file_permissions(&file)) ? -EACCES : 0;
         if (kind == FILE_NAMESPACE) {
@@ -2346,11 +2484,14 @@ long linux64_file_syscall(uptr number, uptr arg0, uptr arg1, uptr arg2, uptr arg
     case 75: /* fdatasync */ {
         if (!open_file(fd)) return -EBADF;
         const struct file_handle *file = file_at(fd);
+        if (file->file.myfs_ino) return linux64_myfs_sync();
         /* Страницы и метаданные временных файлов уже обновлены в памяти. */
         return file->memfd || (file->directory_path && file->file.writable_directory) ? 0 : -EINVAL;
     }
     case 77: /* ftruncate */
         return linux_ftruncate(fd, arg1);
+    case 79: /* getcwd */
+        return linux_getcwd(arg0, arg1);
     case 80: /* chdir */
     case 161: /* chroot */
         return change_directory(arg0, number == 161);

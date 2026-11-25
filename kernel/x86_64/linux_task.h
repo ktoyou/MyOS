@@ -307,7 +307,7 @@ long linux64_vfs_create_file(const struct linux64_directory *base, const char *p
                              u32 mode, bool follow_final, struct linux64_file *file);
 struct memfd *linux64_tmp_alloc(void);
 void linux64_tmp_unlink(struct memfd *backing);
-bool linux64_vfs_next_entry(const struct linux64_directory *dir, uptr *position,
+long linux64_vfs_next_entry(const struct linux64_directory *dir, uptr *position,
                             char name[256], struct linux64_file *file);
 u32 linux64_file_permissions(const struct linux64_file *file);
 bool linux64_special_node(const char *path, struct linux64_file *file);

@@ -1,10 +1,11 @@
 #include "linux_task.h"
 #include "pmm.h"
+#include "linux_myfs.h"
 
 enum {
-    EPERM = 1, ENOENT = 2, EACCES = 13, EBUSY = 16, EEXIST = 17, ENOTDIR = 20, EISDIR = 21,
+    EPERM = 1, ENOENT = 2, EIO = 5, ENOMEM = 12, EACCES = 13, EBUSY = 16, EEXIST = 17, EXDEV = 18, ENOTDIR = 20, EISDIR = 21,
     ENOSPC = 28, EROFS = 30, ENAMETOOLONG = 36, ELOOP = 40, EOPNOTSUPP = 95,
-    NAME_LIMIT = 255, LINK_LIMIT = 40, TEMP_NODES = 256, LIVE_ENTRY_OFFSET = TEMP_NODES + 3,
+    NAME_LIMIT = 255, LINK_LIMIT = 40, TEMP_NODES = 256, PROFILE_ENTRY_OFFSET = TEMP_NODES + 3, LIVE_ENTRY_OFFSET = TEMP_NODES + 4,
 };
 
 enum walk_action { WALK_FOLLOW, WALK_NOFOLLOW, WALK_CREATE, WALK_CREATE_FOLLOW, WALK_UNLINK, WALK_RENAME };
@@ -18,6 +19,7 @@ struct temporary_node {
 struct rename_entry {
     struct linux64_file parent, child;
     struct temporary_node *node;
+    char leaf[NAME_LIMIT + 1];
     bool found, trailing;
 };
 
@@ -42,6 +44,15 @@ struct linux64_fs *linux64_fs_copy(const struct linux64_fs *source) {
     *fs = *source;
     fs->page = page;
     fs->references = 1;
+    if (linux64_myfs_retain(fs->root.file.myfs_ino)) {
+        pmm64_free(page);
+        return NULL;
+    }
+    if (linux64_myfs_retain(fs->cwd.file.myfs_ino)) {
+        linux64_myfs_release(fs->root.file.myfs_ino);
+        pmm64_free(page);
+        return NULL;
+    }
     if (fs->root.page) pmm64_retain(fs->root.page);
     if (fs->cwd.page) pmm64_retain(fs->cwd.page);
     return fs;
@@ -53,6 +64,8 @@ void linux64_fs_retain(struct linux64_fs *fs) {
 
 void linux64_fs_release(struct linux64_fs *fs) {
     if (!fs || --fs->references) return;
+    linux64_myfs_release(fs->root.file.myfs_ino);
+    linux64_myfs_release(fs->cwd.file.myfs_ino);
     if (fs->root.page) pmm64_free(fs->root.page);
     if (fs->cwd.page) pmm64_free(fs->cwd.page);
     if (fs->page) pmm64_free(fs->page);
@@ -71,6 +84,8 @@ static struct temporary_node *temporary_node(const char *path) {
 
 static bool find_node(const struct linux64_file_source *source, const char *path,
                       struct linux64_file *file) {
+    if (linux64_myfs_mounted() && same_path(path, LINUX64_MYFS_MOUNT))
+        return !linux64_myfs_stat(LINUX64_MYFS_ROOT, file);
     if (linux64_special_node(path, file)) return true;
     if (same_path(path, "/")) {
         *file = (struct linux64_file){.mode = LINUX64_S_IFDIR | 0555, .inode = 1};
@@ -151,10 +166,35 @@ static bool live_child(const struct linux64_file_source *source, const char *par
     return false;
 }
 
-bool linux64_vfs_next_entry(const struct linux64_directory *dir, uptr *position,
+long linux64_vfs_next_entry(const struct linux64_directory *dir, uptr *position,
                             char name[256], struct linux64_file *file) {
     const struct linux64_file_source *source = linux64_file_source();
     const struct linux64_directory *root = &linux64_current->process->fs->root;
+    if (dir->file.myfs_ino) {
+        if (*position < 2) {
+            bool parent = *position == 1;
+            u32 ino = dir->file.myfs_ino;
+            if (parent && ino != root->file.myfs_ino) {
+                if (ino == LINUX64_MYFS_ROOT) find_node(source, "/", file);
+                else {
+                    long result = linux64_myfs_lookup(ino, "..", file);
+                    if (result) return result;
+                }
+            } else {
+                long result = linux64_myfs_stat(ino, file);
+                if (result) return result;
+            }
+            name[0] = '.';
+            name[1] = parent ? '.' : 0;
+            name[2] = 0;
+            ++*position;
+            return 1;
+        }
+        uptr cursor = *position - 2;
+        long result = linux64_myfs_next(dir->file.myfs_ino, &cursor, name, file);
+        if (result > 0) *position = cursor + 2;
+        return result;
+    }
     char path[LINUX64_PATH_LIMIT];
     uptr length = 0;
     while ((path[length] = dir->path[length])) ++length;
@@ -186,7 +226,7 @@ bool linux64_vfs_next_entry(const struct linux64_directory *dir, uptr *position,
         }
         child = NULL;
     }
-    if (!child && *position == LIVE_ENTRY_OFFSET - 1) {
+    if (!child && *position == PROFILE_ENTRY_OFFSET - 1) {
         ++*position;
         if (same_path(dir->path, "/") && find_node(source, "/etc", file) && file->inode == etc_inode) {
             child = "etc";
@@ -200,6 +240,14 @@ bool linux64_vfs_next_entry(const struct linux64_directory *dir, uptr *position,
             size = sizeof("shm") - 1;
         }
     }
+    if (!child && *position == PROFILE_ENTRY_OFFSET) {
+        ++*position;
+        if (linux64_myfs_mounted() && same_path(dir->path, "/") &&
+            find_node(source, LINUX64_MYFS_MOUNT, file)) {
+            child = LINUX64_MYFS_MOUNT + 1;
+            size = sizeof(LINUX64_MYFS_MOUNT) - 2;
+        }
+    }
     if (!child) {
         if (!source->entry_path) return false;
         uptr index = *position - LIVE_ENTRY_OFFSET;
@@ -208,7 +256,9 @@ bool linux64_vfs_next_entry(const struct linux64_directory *dir, uptr *position,
             for (uptr i = 0; i < size; ++i) path[length + i] = child[i];
             path[length + size] = 0;
             /* /dev/shm уже перечислен в зарезервированной позиции. */
-            if (!same_path(path, "/dev/shm") && find_node(source, path, file)) break;
+            if (!same_path(path, "/dev/shm") &&
+                !(linux64_myfs_mounted() && same_path(path, LINUX64_MYFS_MOUNT)) &&
+                find_node(source, path, file)) break;
             child = NULL;
         }
         if (!child) return false;
@@ -287,23 +337,61 @@ static long unlink_node(const struct linux64_file *parent, const struct linux64_
     return 0;
 }
 
-static uptr start_at(char *path, const struct linux64_directory *anchor, struct linux64_file *file) {
+static uptr path_length(const char *path) {
     uptr length = 0;
-    while ((path[length] = anchor->path[length])) ++length;
-    *file = anchor->file;
+    while (path[length]) ++length;
     return length;
 }
 
-static long walk(const struct linux64_directory *base, const char *input,
-                 struct linux64_file *file, char *resolved, enum walk_action action,
-                 const struct linux64_file *create, struct rename_entry *entry) {
+static long start_at(char *path, const struct linux64_directory *anchor, struct linux64_file *file) {
+    *file = anchor->file;
+    if (file->myfs_ino) {
+        long result = linux64_myfs_stat(file->myfs_ino, file);
+        if (result) return result;
+        result = linux64_myfs_path(file->myfs_ino, path);
+        if (!result) return (long)path_length(path);
+        if (result != -ENOENT) return result;
+    }
+    uptr length = 0;
+    while ((path[length] = anchor->path[length])) ++length;
+    return (long)length;
+}
+
+struct link_scratch {
+    uptr pages[LINK_LIMIT];
+    unsigned count;
+};
+
+static long read_link(struct link_scratch *scratch, const struct linux64_file *link,
+                      const char **absolute) {
+    if (!link->size) return -ENOENT;
+    if (link->size >= LINUX64_PATH_LIMIT) return -ENAMETOOLONG;
+    uptr page = pmm64_alloc();
+    if (!page) return -ENOMEM;
+    scratch->pages[scratch->count++] = page;
+    char *target = pmm64_pointer(page);
+    long count = linux64_myfs_read(link->myfs_ino, 0, target, link->size);
+    if (count < 0) return count;
+    if ((uptr)count != link->size) return -EIO;
+    for (uptr i = 0; i < link->size; ++i) if (!target[i]) return -EIO;
+    target[link->size] = 0;
+    *absolute = target;
+    return 0;
+}
+
+static long walk_inner(const struct linux64_directory *base, const char *input,
+                       struct linux64_file *file, char *resolved, enum walk_action action,
+                       const struct linux64_file *create, struct rename_entry *entry,
+                       struct link_scratch *scratch) {
     const struct linux64_fs *fs = linux64_current->process->fs;
     const struct linux64_directory *root = &fs->root;
     const struct linux64_file_source *source = linux64_file_source();
     const char *absolute = input;
     bool creating = action == WALK_CREATE || action == WALK_CREATE_FOLLOW;
     char path[LINUX64_PATH_LIMIT];
-    uptr length = start_at(path, *input == '/' ? root : base ? base : &fs->cwd, file);
+    long position = start_at(path, *input == '/' ? root : base ? base : &fs->cwd, file);
+    if (position < 0) return position;
+    uptr length = (uptr)position;
     /* Обход не уступает CPU, поэтому указатели на цели действуют до его конца. */
     const char *suffixes[LINK_LIMIT];
     unsigned depth = 0, links = 0;
@@ -333,6 +421,21 @@ static long walk(const struct linux64_directory *base, const char *input,
         }
         if (count == 2 && start[0] == '.' && start[1] == '.') {
             if (entry && final) return -EBUSY;
+            if (file->myfs_ino) {
+                if (file->myfs_ino == root->file.myfs_ino) continue;
+                if (file->myfs_ino == LINUX64_MYFS_ROOT) {
+                    if (!find_node(source, "/", file)) return -ENOENT;
+                    path[1] = 0;
+                    length = 1;
+                } else {
+                    long result = linux64_myfs_lookup(file->myfs_ino, "..", file);
+                    if (result) return result;
+                    result = linux64_myfs_path(file->myfs_ino, path);
+                    if (result) return result;
+                    length = path_length(path);
+                }
+                continue;
+            }
             if (length == 1 || same_path(path, root->path)) continue;
             if (file->proc_fd_owner && file->proc_fd_owner != linux64_current->process->pid)
                 return -EACCES;
@@ -349,8 +452,13 @@ static long walk(const struct linux64_directory *base, const char *input,
         path[length] = 0;
         if (final && action == WALK_UNLINK && !file->writable_directory) return -EROFS;
         struct linux64_file child;
+        const char *name = path + length - count;
         bool found;
-        if (file->proc_fd_owner && file->proc_fd_number < 0) {
+        if (file->myfs_ino) {
+            long result = linux64_myfs_lookup(file->myfs_ino, name, &child);
+            if (result && result != -ENOENT) return result;
+            found = !result;
+        } else if (file->proc_fd_owner && file->proc_fd_number < 0) {
             long result = linux64_proc_fd_entry(file->proc_fd_owner, start, count, &child);
             if (result && result != -ENOENT) return result;
             found = !result;
@@ -362,6 +470,7 @@ static long walk(const struct linux64_directory *base, const char *input,
             entry->trailing = trailing;
             entry->node = found && !file->proc_fd_owner ? temporary_node(path) : NULL;
             if (found) entry->child = child;
+            for (uptr i = 0; i <= count; ++i) entry->leaf[i] = name[i];
             if (resolved)
                 for (uptr i = 0; i <= length; ++i) resolved[i] = path[i];
             return 0;
@@ -371,11 +480,21 @@ static long walk(const struct linux64_directory *base, const char *input,
                 (trailing && (create->mode & LINUX64_S_IFMT) != LINUX64_S_IFDIR)) return -ENOENT;
             if (!file->writable_directory) return -EROFS;
             if (!(linux64_file_permissions(file) & 2u)) return -EACCES;
+            if (file->myfs_ino) {
+                if (!file->myfs_links) return -ENOENT;
+                return linux64_myfs_create(file->myfs_ino, name, create, file);
+            }
             return create_node(path, length, *create, file);
         }
         if (final && creating && (action == WALK_CREATE || (child.mode & LINUX64_S_IFMT) != LINUX64_S_IFLNK))
             return -EEXIST;
-        if (final && action == WALK_UNLINK) return unlink_node(file, &child, path, trailing);
+        if (final && action == WALK_UNLINK) {
+            if (!file->myfs_ino) return unlink_node(file, &child, path, trailing);
+            if ((child.mode & LINUX64_S_IFMT) == LINUX64_S_IFDIR) return -EISDIR;
+            if (trailing) return -ENOTDIR;
+            long result = may_remove(file, &child);
+            return result ? result : linux64_myfs_remove(file->myfs_ino, name, child.myfs_ino);
+        }
         if (child.proc_fd_owner && child.proc_fd_number >= 0) {
             /* Ссылка ведёт к объекту дескриптора, а не к текстовому пути. */
             if (!final) return -ENOTDIR;
@@ -389,9 +508,16 @@ static long walk(const struct linux64_directory *base, const char *input,
             if (++links > LINK_LIMIT) return -ELOOP;
             /* Пустой хвост сохраняет завершающий '/', который требует каталог. */
             if (trailing) suffixes[depth++] = absolute;
-            absolute = (const char *)child.bytes;
+            if (child.myfs_ino) {
+                long result = read_link(scratch, &child, &absolute);
+                if (result) return result;
+            } else {
+                absolute = (const char *)child.bytes;
+            }
             if (*absolute == '/') {
-                length = start_at(path, root, file);
+                position = start_at(path, root, file);
+                if (position < 0) return position;
+                length = (uptr)position;
             } else {
                 length = parent_length;
                 path[length] = 0;
@@ -407,6 +533,15 @@ static long walk(const struct linux64_directory *base, const char *input,
     if (resolved)
         for (uptr i = 0; i <= length; ++i) resolved[i] = path[i];
     return 0;
+}
+
+static long walk(const struct linux64_directory *base, const char *input,
+                 struct linux64_file *file, char *resolved, enum walk_action action,
+                 const struct linux64_file *create, struct rename_entry *entry) {
+    struct link_scratch scratch = {0};
+    long result = walk_inner(base, input, file, resolved, action, create, entry, &scratch);
+    for (unsigned i = 0; i < scratch.count; ++i) pmm64_free(scratch.pages[i]);
+    return result;
 }
 
 long linux64_vfs_walk(const struct linux64_directory *base, const char *path,
@@ -455,16 +590,19 @@ long linux64_vfs_rename(const struct linux64_directory *old_base, const char *ol
     long result = walk(old_base, old_path, &old.parent, NULL, WALK_RENAME, NULL, &old);
     if (result) return result;
     if (!old.found) return -ENOENT;
-    if (!old.parent.writable_directory || !old.node) return -EROFS;
-    if ((old.child.mode & LINUX64_S_IFMT) == LINUX64_S_IFDIR) return -EOPNOTSUPP;
-    if (old.trailing) return -ENOTDIR;
+    bool disk = old.parent.myfs_ino != 0;
+    if (!old.parent.writable_directory || (!disk && !old.node)) return -EROFS;
+    bool old_directory = (old.child.mode & LINUX64_S_IFMT) == LINUX64_S_IFDIR;
+    if (old_directory && !disk) return -EOPNOTSUPP;
+    if (old.trailing && !old_directory) return -ENOTDIR;
 
     result = walk(new_base, new_path, &new.parent, new_path, WALK_RENAME, NULL, &new);
     if (result) return result;
-    if (new.trailing) return -ENOTDIR;
-    if (!new.parent.writable_directory || (new.found && !new.node)) return -EROFS;
-    if (old.node == new.node) return 0;
-    if (new.found && (new.child.mode & LINUX64_S_IFMT) == LINUX64_S_IFDIR) return -EISDIR;
+    if (disk != (new.parent.myfs_ino != 0)) return -EXDEV;
+    if (new.trailing && !old_directory) return -ENOTDIR;
+    if (!new.parent.writable_directory || (!disk && new.found && !new.node)) return -EROFS;
+    if (new.found && old.child.inode == new.child.inode) return 0;
+    if (new.found && !old_directory && (new.child.mode & LINUX64_S_IFMT) == LINUX64_S_IFDIR) return -EISDIR;
     result = may_remove(&old.parent, &old.child);
     if (result) return result;
     if (new.found) {
@@ -473,6 +611,9 @@ long linux64_vfs_rename(const struct linux64_directory *old_base, const char *ol
     } else if (!(linux64_file_permissions(&new.parent) & 2u)) {
         return -EACCES;
     }
+
+    if (disk) return linux64_myfs_rename(old.parent.myfs_ino, old.leaf, new.parent.myfs_ino, new.leaf,
+                                         new.found ? new.child.myfs_ino : 0);
 
     /* После проверок меняются только имена. Открытые описания удерживают данные. */
     if (new.node) remove_temporary_node(new.node);

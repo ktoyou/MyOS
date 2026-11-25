@@ -71,7 +71,8 @@ section .bss
 alignb 16
 user_rsp: resq 1
 alignb 16
-kernel_stack: resb 16384
+; На одном стеке остаются пути renameat и вложенные буферы MyFS.
+kernel_stack: resb 32768
 kernel_stack_end:
 
 section .note.GNU-stack noalloc noexec nowrite progbits
