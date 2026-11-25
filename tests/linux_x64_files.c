@@ -1021,7 +1021,7 @@ static long check_limits(void) {
     }
     if (call(97, NPROC, address, 0, 0)) return 102;
     word nproc_soft = out.values[0], nproc_hard = out.values[1];
-    if (system[0] == 'M' && (nproc_soft != 256 || nproc_hard != 256)) return 102;
+    if (system[0] == 'M' && (nproc_soft != 512 || nproc_hard != 512)) return 102;
     out.values[0] = out.values[1] = 0;
     if (call(302, 0, NPROC, 0, address) || call(302, 0, NPROC, 0, 0) ||
         out.values[0] != nproc_soft || out.values[1] != nproc_hard) return 102;

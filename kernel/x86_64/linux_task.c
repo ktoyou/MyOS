@@ -28,15 +28,16 @@ enum {
 };
 
 /* Таблицы занимают страницы PMM вне низкой области загрузки ELF. */
-struct linux64_process_tables {
+struct linux64_task_tables {
+    struct linux64_task tasks[LINUX64_TASK_COUNT];
     struct linux64_process processes[LINUX64_PROCESS_COUNT];
     struct linux64_address_space address_spaces[LINUX64_PROCESS_COUNT];
 };
 
-static struct linux64_task tasks[LINUX64_TASK_COUNT];
+static struct linux64_task *tasks;
 static struct linux64_process *processes;
 static struct linux64_address_space *address_spaces;
-struct linux64_task *linux64_current = &tasks[0];
+struct linux64_task *linux64_current;
 static i32 next_pid = LINUX64_PID + 1;
 static u64 xfeatures;
 static u32 xstate_bytes, xstate_pages;
@@ -95,16 +96,20 @@ static void release_xstate(struct linux64_task *task) {
 bool linux64_task_init(uptr data_bytes) {
     init_xstate();
     xstate_pages = (xstate_bytes + PMM_PAGE_SIZE - 1) / PMM_PAGE_SIZE;
-    if (!xstate_pages || !allocate_xstate(linux64_current)) return false;
-    const u32 pages = (sizeof(struct linux64_process_tables) + PMM_PAGE_SIZE - 1) / PMM_PAGE_SIZE;
+    if (!xstate_pages) return false;
+    const u32 pages = (sizeof(struct linux64_task_tables) + PMM_PAGE_SIZE - 1) / PMM_PAGE_SIZE;
     uptr physical = pmm64_alloc_contiguous(pages);
-    if (!physical) {
-        release_xstate(linux64_current);
+    if (!physical) return false;
+    struct linux64_task_tables *tables = pmm64_pointer(physical);
+    if (!allocate_xstate(&tables->tasks[0])) {
+        for (u32 page = 0; page < pages; ++page)
+            pmm64_free(physical + (uptr)page * PMM_PAGE_SIZE);
         return false;
     }
-    struct linux64_process_tables *tables = pmm64_pointer(physical);
+    tasks = tables->tasks;
     processes = tables->processes;
     address_spaces = tables->address_spaces;
+    linux64_current = &tasks[0];
     processes[0] = (struct linux64_process){
         .pid = LINUX64_PID, .sid = LINUX64_PID, .pgid = LINUX64_PID, .threads = 1,
         .net_ns = linux64_netns_init(), .pid_ns = linux64_pidns_init(), .pid_identity = linux64_pid_init(),
